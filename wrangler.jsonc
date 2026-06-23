@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "switchboard",
+  "main": "src/index.js",
+  "compatibility_date": "2025-01-01",
+
+  // Frontend (xterm.js page) is served as static assets. The platform serves a
+  // matching file (e.g. "/" -> index.html) before invoking the Worker, so the
+  // Worker only ever handles "/ws" and "/healthz".
+  "assets": {
+    "directory": "./public"
+  },
+
+  // One Durable Object class — the per-token relay room.
+  "durable_objects": {
+    "bindings": [
+      { "name": "CIRCUIT", "class_name": "Circuit" }
+    ]
+  },
+
+  // SQLite-backed DO so this also runs on the free Workers plan. The relay keeps
+  // no persistent storage; it only needs the DO for in-memory WebSocket coordination.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Circuit"] }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}
