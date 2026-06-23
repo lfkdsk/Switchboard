@@ -33,6 +33,12 @@
     { "tag": "v1", "new_sqlite_classes": ["Circuit"] }
   ],
 
+  // Serve the relay at shell.lfkdsk.org (Cloudflare provisions the custom domain
+  // since lfkdsk.org is a zone on this account).
+  "routes": [
+    { "pattern": "shell.lfkdsk.org", "custom_domain": true }
+  ],
+
   "observability": {
     "enabled": true
   }
