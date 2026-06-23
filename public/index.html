@@ -7,86 +7,66 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
 <style>
   :root {
-    --bg: #0b0e14;
-    --panel: #11151f;
-    --border: #1e2430;
-    --fg: #c9d1d9;
-    --muted: #6b7785;
-    --accent: #2f81f7;
-    --ok: #2ea043;
-    --warn: #d29922;
-    --err: #f85149;
+    --bg: #0b0e14; --panel: #11151f; --border: #1e2430; --fg: #c9d1d9;
+    --muted: #6b7785; --accent: #2f81f7; --ok: #2ea043; --warn: #d29922; --err: #f85149;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg);
-    color: var(--fg);
-    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    display: flex;
-    flex-direction: column;
-  }
-  header {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 8px 14px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    flex-wrap: wrap;
-  }
-  header .brand { font-weight: 600; letter-spacing: 0.3px; }
-  header .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
-  header .dot.on { background: var(--ok); }
-  header .dot.off { background: var(--err); }
-  header .dot.wait { background: var(--warn); }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display: flex; flex-direction: column; }
+  a { color: var(--accent); }
+  header { display: flex; align-items: center; gap: 14px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header .brand { font-weight: 600; letter-spacing: .3px; cursor: pointer; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--ok); } .dot.off { background: var(--err); } .dot.wait { background: var(--warn); }
   .stats { display: flex; gap: 14px; color: var(--muted); flex-wrap: wrap; }
   .stats b { color: var(--fg); font-weight: 600; }
   .spacer { flex: 1; }
-  .toolbar { display: flex; gap: 8px; }
-  button {
-    background: #1b2230; color: var(--fg); border: 1px solid var(--border);
-    border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer;
-  }
+  .row { display: flex; gap: 8px; align-items: center; }
+  button { background: #1b2230; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
   button:hover { border-color: var(--accent); }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 9px 11px; font: inherit; }
+  input:focus { outline: none; border-color: var(--accent); }
+  .muted { color: var(--muted); }
+  /* views */
+  .view { display: none; flex: 1; min-height: 0; }
+  .view.active { display: flex; flex-direction: column; }
+  /* centered card layout (landing / cli) */
+  .center { align-items: center; justify-content: center; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 28px 26px; width: min(460px, 92vw); }
+  .card h1 { font-size: 18px; margin: 0 0 6px; }
+  .card p { color: var(--muted); margin: 0 0 18px; }
+  .or { text-align: center; color: var(--muted); margin: 16px 0 12px; font-size: 12px; }
+  .err { color: var(--err); font-size: 12px; min-height: 16px; margin-top: 10px; }
+  /* dashboard */
+  #view-dashboard { padding: 24px; overflow: auto; }
+  .dash-wrap { width: min(720px, 100%); margin: 0 auto; }
+  .dash-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  .dash-head h1 { font-size: 18px; margin: 0; }
+  .machine { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 10px; }
+  .machine .name { font-weight: 600; }
+  .machine .meta { color: var(--muted); font-size: 12px; }
+  .machine .spacer { flex: 1; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 8px; }
+  code { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
+  /* terminal */
   #term { flex: 1; min-height: 0; padding: 6px 8px; }
-  /* Token gate */
-  #gate {
-    position: fixed; inset: 0; background: var(--bg);
-    display: flex; align-items: center; justify-content: center; z-index: 10;
-  }
-  #gate .card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    padding: 28px 26px; width: min(440px, 92vw);
-  }
-  #gate h1 { font-size: 18px; margin: 0 0 6px; }
-  #gate p { color: var(--muted); margin: 0 0 18px; }
-  #gate .row { display: flex; gap: 8px; }
-  #gate input {
-    flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-    border-radius: 6px; padding: 9px 11px; font: inherit;
-  }
-  #gate input:focus { outline: none; border-color: var(--accent); }
-  #gate .err { color: var(--err); font-size: 12px; min-height: 16px; margin-top: 10px; }
-  /* Toast */
+  /* toast + drop */
   #toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
-  .toast {
-    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
-    border-radius: 6px; padding: 9px 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
-  }
-  .toast.err { border-left-color: var(--err); }
-  .toast.ok { border-left-color: var(--ok); }
-  /* Drag overlay */
-  #drop { position: fixed; inset: 0; background: rgba(47,129,247,.12); border: 2px dashed var(--accent);
-    display: none; align-items: center; justify-content: center; font-size: 16px; color: var(--accent); z-index: 30; }
+  .toast { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 9px 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+  .toast.err { border-left-color: var(--err); } .toast.ok { border-left-color: var(--ok); }
+  #drop { position: fixed; inset: 0; background: rgba(47,129,247,.12); border: 2px dashed var(--accent); display: none; align-items: center; justify-content: center; font-size: 16px; color: var(--accent); z-index: 30; }
   #drop.show { display: flex; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
   <header>
-    <span class="brand">Switchboard</span>
-    <span id="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
+    <span class="brand" id="brand">Switchboard</span>
+    <!-- terminal-only header bits -->
+    <button id="backBtn" hidden>← Machines</button>
+    <span id="conn" hidden><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
     <div class="stats" id="stats" hidden>
       <span><b id="sHost">—</b> <span id="sPlatform"></span></span>
       <span>cpu <b id="sCpu">—</b></span>
@@ -94,24 +74,60 @@
       <span>ip <b id="sIp">—</b></span>
     </div>
     <span class="spacer"></span>
-    <div class="toolbar">
-      <button id="btnUpload" title="Upload a file into the shell's current directory">Upload</button>
+    <div class="row" id="termTools" hidden>
+      <button id="btnUpload" title="Upload into the shell's current directory">Upload</button>
       <button id="btnDownload" title="Download a file from the host">Download</button>
+    </div>
+    <div class="row" id="userBox" hidden>
+      <span class="muted">@<b id="userLogin"></b></span>
+      <button id="signOutBtn">Sign out</button>
     </div>
     <input type="file" id="fileInput" hidden multiple />
   </header>
 
-  <div id="term"></div>
-
-  <div id="gate">
+  <!-- LANDING -->
+  <div class="view center" id="view-landing">
     <div class="card">
-      <h1>Connect to a host</h1>
-      <p>Paste the token printed by <code>npx&nbsp;@elsetech/webterm</code>.</p>
+      <h1>Switchboard</h1>
+      <p>Sign in to see the machines bound to your account and open a shell on any of them.</p>
+      <button class="primary" id="githubBtn" style="width:100%">Sign in with GitHub</button>
+      <div class="or">— or connect to one machine with a token —</div>
       <div class="row">
-        <input id="tokenInput" type="text" placeholder="token (min 24 chars)" autocomplete="off" spellcheck="false" />
-        <button id="connectBtn">Connect</button>
+        <input id="tokenInput" style="flex:1" type="text" placeholder="token (min 24 chars)" autocomplete="off" spellcheck="false" />
+        <button id="tokenBtn">Connect</button>
       </div>
-      <div class="err" id="gateErr"></div>
+      <div class="err" id="landingErr"></div>
+    </div>
+  </div>
+
+  <!-- DASHBOARD -->
+  <div class="view" id="view-dashboard">
+    <div class="dash-wrap">
+      <div class="dash-head">
+        <h1>Your machines</h1>
+        <span class="spacer"></span>
+        <button id="refreshBtn">Refresh</button>
+      </div>
+      <div id="machineList"></div>
+      <div class="card" style="width:auto;margin-top:18px">
+        <h1 style="font-size:15px">Add a machine</h1>
+        <p style="margin-bottom:8px">On the host you want to reach, run:</p>
+        <div><code>npx @switchboard/cli login</code></div>
+        <p class="muted" style="margin-top:8px;margin-bottom:0">Authorize in the browser, then run <code>switchboard</code> to expose its shell. It appears here.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- TERMINAL -->
+  <div class="view" id="view-terminal">
+    <div id="term"></div>
+  </div>
+
+  <!-- CLI AUTHORIZED -->
+  <div class="view center" id="view-cli">
+    <div class="card" style="text-align:center">
+      <h1 id="cliMsg">Authorizing…</h1>
+      <p id="cliSub" class="muted"></p>
     </div>
   </div>
 
@@ -123,294 +139,220 @@
   <script>
   (function () {
     "use strict";
-
-    // ---- session identity --------------------------------------------------
-    // sid is stable per browser tab across reloads (sessionStorage), so a reload
-    // resumes the same shell within the daemon's grace window; a new tab gets a
-    // fresh sid and an independent shell.
-    let sid = sessionStorage.getItem("webterm-sid");
-    if (!sid) { sid = crypto.randomUUID(); sessionStorage.setItem("webterm-sid", sid); }
-
-    const params = new URLSearchParams(location.search);
-    let token = (params.get("token") || "").trim();
-
-    // ---- elements ----------------------------------------------------------
     const $ = (id) => document.getElementById(id);
-    const connDot = $("connDot"), connText = $("connText"), statsBox = $("stats");
-    const gate = $("gate"), gateErr = $("gateErr"), tokenInput = $("tokenInput");
+    const api = (path, opts) => fetch(path, { credentials: "same-origin", ...opts });
 
-    // ---- terminal ----------------------------------------------------------
-    const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 13,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-      theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" },
-      scrollback: 10000,
-    });
-    const fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open($("term"));
+    // ---- view router -------------------------------------------------------
+    let session = null; // { id, login } when signed in
+    function showView(name) {
+      for (const v of document.querySelectorAll(".view")) v.classList.toggle("active", v.id === "view-" + name);
+      const inTerm = name === "terminal";
+      $("backBtn").hidden = !(inTerm && session);
+      $("conn").hidden = !inTerm;
+      $("termTools").hidden = !inTerm;
+      $("stats").hidden = true;
+      $("userBox").hidden = !(name === "dashboard" && session);
+      if (session) $("userLogin").textContent = session.login;
+    }
 
-    function doFit() {
-      try { fit.fit(); } catch {}
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        sendJson({ type: "resize", sid, cols: term.cols, rows: term.rows });
+    $("brand").onclick = () => { if (session) goDashboard(); else showView("landing"); };
+    $("githubBtn").onclick = () => { location.href = "/auth/login"; };
+    $("signOutBtn").onclick = async () => { await api("/auth/logout", { method: "POST" }); session = null; cleanUrl(); showView("landing"); };
+    $("refreshBtn").onclick = () => renderDashboard();
+    $("backBtn").onclick = () => { closeTerminal(); goDashboard(); };
+    $("tokenBtn").onclick = () => {
+      const t = $("tokenInput").value.trim();
+      if (t.length < 24) { $("landingErr").textContent = "Token must be at least 24 characters."; return; }
+      openTerminal({ mode: "token", token: t });
+    };
+    $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenBtn").click(); });
+
+    function cleanUrl() { history.replaceState(null, "", location.pathname); }
+
+    // ---- init / OAuth return ----------------------------------------------
+    async function init() {
+      const hash = new URLSearchParams(location.hash.slice(1));
+      const query = new URLSearchParams(location.search);
+
+      // OAuth return from lfkdsk-auth (token in fragment).
+      if (hash.get("oauth_token")) {
+        const ghToken = hash.get("oauth_token");
+        const state = hash.get("state") || "";
+        history.replaceState(null, "", location.pathname);
+        const r = await api("/auth/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ github_token: ghToken }) });
+        if (!r.ok) { showView("landing"); $("landingErr").textContent = "Sign-in failed."; return; }
+        session = await r.json();
+        if (state.startsWith("cli:")) return completeCli(state.slice(4));
+        return goDashboard();
+      }
+      if (hash.get("oauth_error")) { showView("landing"); $("landingErr").textContent = "GitHub: " + hash.get("oauth_error"); history.replaceState(null, "", location.pathname); return; }
+
+      // Direct anonymous token link.
+      const token = (query.get("token") || "").trim();
+      if (token.length >= 24) return openTerminal({ mode: "token", token });
+
+      // Who am I?
+      try { const me = await (await api("/auth/me")).json(); if (me.login) session = me; } catch {}
+
+      // Direct bound-machine link.
+      const machine = query.get("machine");
+      if (machine) {
+        if (session) return openTerminal({ mode: "machine", machineId: machine });
+        showView("landing"); $("landingErr").textContent = "Sign in to open this machine."; return;
+      }
+      return session ? goDashboard() : showView("landing");
+    }
+
+    async function completeCli(state) {
+      showView("cli"); $("cliMsg").textContent = "Authorizing the CLI…";
+      const r = await api("/cli/complete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state }) });
+      if (r.ok) { $("cliMsg").textContent = "✓ CLI authorized"; $("cliSub").textContent = "You can return to your terminal — it will continue automatically."; }
+      else { $("cliMsg").textContent = "Authorization failed"; $("cliSub").textContent = "The login link may have expired. Run `switchboard login` again."; }
+    }
+
+    // ---- dashboard ---------------------------------------------------------
+    function goDashboard() { showView("dashboard"); renderDashboard(); }
+    function fmtAgo(ts) {
+      const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (s < 60) return s + "s ago"; if (s < 3600) return Math.floor(s / 60) + "m ago";
+      if (s < 86400) return Math.floor(s / 3600) + "h ago"; return Math.floor(s / 86400) + "d ago";
+    }
+    async function renderDashboard() {
+      const list = $("machineList");
+      list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
+      let machines = [];
+      try { machines = (await (await api("/api/machines")).json()).machines || []; }
+      catch { list.innerHTML = '<div class="empty">Could not load machines.</div>'; return; }
+      if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switchboard/cli login</code> on a host to bind it.</div>'; return; }
+      list.innerHTML = "";
+      for (const m of machines) {
+        const el = document.createElement("div");
+        el.className = "machine";
+        el.innerHTML =
+          `<span class="dot ${m.online ? "on" : "off"}"></span>` +
+          `<div><div class="name"></div><div class="meta">${m.online ? "online" : "offline · " + fmtAgo(m.last_seen)}</div></div>` +
+          `<span class="spacer"></span><button class="primary">Open shell</button>`;
+        el.querySelector(".name").textContent = m.name || m.machine_id.slice(0, 8);
+        el.querySelector("button").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        list.appendChild(el);
       }
     }
-    window.addEventListener("resize", doFit);
 
-    // ---- websocket plumbing ------------------------------------------------
-    let ws = null;
-    let reconnectDelay = 1000;
-    let manualClose = false;
+    // ===================== TERMINAL =========================================
+    let term = null, fit = null, ws = null, sid = null, conn = null;
+    let reconnectDelay = 1000, manualClose = false, pingTimer = null;
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    const uploads = new Map(), downloads = new Map();
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      return `${proto}//${location.host}/ws?role=browser&token=${encodeURIComponent(token)}`;
+      const base = `${proto}//${location.host}/ws?role=browser`;
+      return conn.mode === "machine"
+        ? `${base}&machine=${encodeURIComponent(conn.machineId)}`
+        : `${base}&token=${encodeURIComponent(conn.token)}`;
     }
+    function setConn(state, text) { $("connDot").className = "dot " + state; $("connText").textContent = text; }
 
-    function setConn(state, text) {
-      connDot.className = "dot " + state; // on | off | wait | ""
-      connText.textContent = text;
+    function openTerminal(c) {
+      conn = c;
+      const key = c.mode === "machine" ? "sid:m:" + c.machineId : "sid:t:" + c.token;
+      sid = sessionStorage.getItem(key) || crypto.randomUUID();
+      sessionStorage.setItem(key, sid);
+      // shareable / reload-resumable URL
+      const u = new URL(location.href); u.search = ""; u.hash = "";
+      u.searchParams.set(c.mode === "machine" ? "machine" : "token", c.mode === "machine" ? c.machineId : c.token);
+      history.replaceState(null, "", u);
+
+      showView("terminal");
+      if (term) { try { term.dispose(); } catch {} }
+      term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" }, scrollback: 10000 });
+      fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open($("term"));
+      term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(encodeFrame(sid, d)); });
+      setTimeout(() => { try { fit.fit(); } catch {} term.focus(); }, 30);
+      reconnectDelay = 1000;
+      connect();
+    }
+    function closeTerminal() {
+      manualClose = true; stopPing();
+      try { ws && ws.close(); } catch {} ws = null;
+      try { term && term.dispose(); } catch {} term = null;
+      $("stats").hidden = true;
     }
 
     function connect() {
-      manualClose = false;
-      setConn("wait", "connecting…");
-      ws = new WebSocket(wsUrl());
-      ws.binaryType = "arraybuffer";
-
-      ws.onopen = () => {
-        reconnectDelay = 1000;
-        setConn("wait", "waiting for host…");
-        // Tell the daemon to open/resume our session. Output starts flowing once
-        // the daemon spawns (or reattaches to) the shell for this sid.
-        fit.fit();
-        sendJson({ type: "open", sid, cols: term.cols, rows: term.rows });
-        startPing();
-      };
-
-      ws.onmessage = (ev) => {
-        if (typeof ev.data === "string") {
-          if (ev.data === "pong") return; // keepalive
-          handleJson(ev.data);
-        } else {
-          handleBinary(ev.data);
-        }
-      };
-
-      ws.onclose = () => {
-        stopPing();
-        if (manualClose) return;
-        setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`);
-        setTimeout(connect, reconnectDelay);
-        reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-      };
-
+      manualClose = false; setConn("wait", "connecting…");
+      ws = new WebSocket(wsUrl()); ws.binaryType = "arraybuffer";
+      ws.onopen = () => { reconnectDelay = 1000; setConn("wait", "waiting for host…"); try { fit.fit(); } catch {} sendJson({ type: "open", sid, cols: term.cols, rows: term.rows }); startPing(); };
+      ws.onmessage = (ev) => { if (typeof ev.data === "string") { if (ev.data === "pong") return; handleJson(ev.data); } else handleBinary(ev.data); };
+      ws.onclose = () => { stopPing(); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); setTimeout(() => { if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
       ws.onerror = () => { try { ws.close(); } catch {} };
     }
-
-    function sendJson(obj) {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-    }
-
-    // Keepalive: plain "ping" string, auto-answered by the relay without waking
-    // its Durable Object. Never collides with keystrokes (those are binary).
-    let pingTimer = null;
+    function sendJson(o) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); }
     function startPing() { stopPing(); pingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send("ping"); }, 30000); }
     function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } }
 
-    // ---- binary frames: [1-byte sid length][sid][payload] ------------------
-    const enc = new TextEncoder();
-    const dec = new TextDecoder();
-
     function encodeFrame(sidStr, payloadStr) {
-      const sidBuf = enc.encode(sidStr);
-      const payBuf = enc.encode(payloadStr);
-      const out = new Uint8Array(1 + sidBuf.length + payBuf.length);
-      out[0] = sidBuf.length;
-      out.set(sidBuf, 1);
-      out.set(payBuf, 1 + sidBuf.length);
-      return out.buffer;
+      const s = enc.encode(sidStr), p = enc.encode(payloadStr);
+      const out = new Uint8Array(1 + s.length + p.length); out[0] = s.length; out.set(s, 1); out.set(p, 1 + s.length); return out.buffer;
     }
+    function handleBinary(buf) { const a = new Uint8Array(buf); if (dec.decode(a.subarray(1, 1 + a[0])) !== sid) return; term.write(a.subarray(1 + a[0])); }
 
-    function handleBinary(buf) {
-      const arr = new Uint8Array(buf);
-      const sidLen = arr[0];
-      const frameSid = dec.decode(arr.subarray(1, 1 + sidLen));
-      if (frameSid !== sid) return; // output for another window
-      term.write(arr.subarray(1 + sidLen));
-    }
-
-    // Keystrokes → daemon.
-    term.onData((d) => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(encodeFrame(sid, d));
-    });
-
-    // ---- JSON control messages from the daemon / relay ---------------------
     function handleJson(str) {
-      let msg;
-      try { msg = JSON.parse(str); } catch { return; }
-      switch (msg.type) {
-        case "stats": updateStats(msg); break;
-        case "exit":
-          if (msg.sid === sid) term.write(`\r\n\x1b[33m[session exited (code ${msg.code})]\x1b[0m\r\n`);
-          break;
-        case "_relay":
-          if (msg.event === "daemon-online") setConn("on", "connected");
-          else if (msg.event === "daemon-offline") setConn("off", "host offline");
-          break;
-        case "dl-meta": dlMeta(msg); break;
-        case "dl-chunk": dlChunk(msg); break;
-        case "dl-end": dlEnd(msg); break;
-        case "dl-error": dlError(msg); break;
-        case "ul-ready": ulReady(msg); break;
-        case "ul-done": ulDone(msg); break;
-        case "ul-error": ulError(msg); break;
+      let m; try { m = JSON.parse(str); } catch { return; }
+      switch (m.type) {
+        case "stats": updateStats(m); break;
+        case "exit": if (m.sid === sid) term.write(`\r\n\x1b[33m[session exited (code ${m.code})]\x1b[0m\r\n`); break;
+        case "_relay": setConn(m.event === "daemon-online" ? "on" : "off", m.event === "daemon-online" ? "connected" : "host offline"); break;
+        case "dl-meta": { const d = downloads.get(m.id); if (d) d.name = m.name || "download"; break; }
+        case "dl-chunk": { const d = downloads.get(m.id); if (d) d.parts.push(b64ToBytes(m.data)); break; }
+        case "dl-end": dlEnd(m); break;
+        case "dl-error": downloads.delete(m.id); toast("Download failed: " + m.message, "err"); break;
+        case "ul-ready": uploads.get(m.id)?.resolveReady?.(); break;
+        case "ul-done": uploads.delete(m.id); toast("Uploaded " + m.name, "ok"); break;
+        case "ul-error": uploads.delete(m.id); toast("Upload failed: " + m.message, "err"); break;
       }
     }
-
     function updateStats(s) {
-      statsBox.hidden = false;
-      setConn("on", "connected");
-      $("sHost").textContent = s.host || "—";
-      $("sPlatform").textContent = s.platform ? `(${s.platform})` : "";
+      $("stats").hidden = false; setConn("on", "connected");
+      $("sHost").textContent = s.host || "—"; $("sPlatform").textContent = s.platform ? `(${s.platform})` : "";
       $("sCpu").textContent = s.cpu != null ? Math.round(s.cpu * 100) + "%" : "—";
-      $("sMem").textContent = (s.memUsed != null && s.memTotal)
-        ? `${fmtBytes(s.memUsed)} / ${fmtBytes(s.memTotal)}` : "—";
+      $("sMem").textContent = (s.memUsed != null && s.memTotal) ? `${fmtBytes(s.memUsed)} / ${fmtBytes(s.memTotal)}` : "—";
       $("sIp").textContent = s.ip || "—";
     }
+    function fmtBytes(n) { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
 
-    function fmtBytes(n) {
-      const u = ["B", "KB", "MB", "GB", "TB"];
-      let i = 0;
-      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-      return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
-    }
-
-    // ---- file upload (browser → host) --------------------------------------
-    // ul-open → wait ul-ready → ul-chunk* (base64) → ul-end → ul-done
-    const uploads = new Map(); // id -> { name, resolveReady }
-
+    // upload / download
     $("btnUpload").onclick = () => $("fileInput").click();
     $("fileInput").onchange = (e) => { for (const f of e.target.files) uploadFile(f); e.target.value = ""; };
-
     async function uploadFile(file) {
       if (!ws || ws.readyState !== WebSocket.OPEN) { toast("Not connected", "err"); return; }
       const id = crypto.randomUUID();
       const ready = new Promise((res) => uploads.set(id, { name: file.name, resolveReady: res }));
-      sendJson({ type: "ul-open", id, sid, name: file.name });
-      await ready;
+      sendJson({ type: "ul-open", id, sid, name: file.name }); await ready;
       const CHUNK = 64 * 1024;
-      for (let off = 0; off < file.size; off += CHUNK) {
-        const slice = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer());
-        sendJson({ type: "ul-chunk", id, data: bytesToB64(slice) });
-        await drainBackpressure();
-      }
+      for (let off = 0; off < file.size; off += CHUNK) { const slice = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer()); sendJson({ type: "ul-chunk", id, data: bytesToB64(slice) }); await drain(); }
       sendJson({ type: "ul-end", id });
     }
-
-    // Don't outrun a slow link: pause when the socket's send buffer is large.
-    function drainBackpressure() {
-      return new Promise((res) => {
-        const check = () => {
-          if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < 1 << 20) res();
-          else setTimeout(check, 20);
-        };
-        check();
-      });
-    }
-
-    function ulReady(msg) { uploads.get(msg.id)?.resolveReady?.(); }
-    function ulDone(msg) { uploads.delete(msg.id); toast(`Uploaded ${msg.name}`, "ok"); }
-    function ulError(msg) { uploads.delete(msg.id); toast(`Upload failed: ${msg.message}`, "err"); }
-
-    // ---- file download (host → browser) ------------------------------------
-    // dl-open → dl-meta → dl-chunk* (base64) → dl-end ; then save a Blob.
-    const downloads = new Map(); // id -> { name, parts: [] }
-
+    function drain() { return new Promise((res) => { const c = () => { if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < 1 << 20) res(); else setTimeout(c, 20); }; c(); }); }
     $("btnDownload").onclick = () => {
-      const path = prompt("Host file path to download (e.g. ~/notes.txt or /var/log/syslog):");
-      if (!path) return;
-      const id = crypto.randomUUID();
-      downloads.set(id, { name: "download", parts: [] });
-      sendJson({ type: "dl-open", id, path });
+      const path = prompt("Host file path to download (e.g. ~/notes.txt):"); if (!path) return;
+      const id = crypto.randomUUID(); downloads.set(id, { name: "download", parts: [] }); sendJson({ type: "dl-open", id, path });
     };
+    function dlEnd(m) { const d = downloads.get(m.id); if (!d) return; downloads.delete(m.id); const blob = new Blob(d.parts, { type: "application/octet-stream" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = d.name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000); toast("Downloaded " + d.name, "ok"); }
+    function bytesToB64(u8) { let s = ""; const STEP = 0x8000; for (let i = 0; i < u8.length; i += STEP) s += String.fromCharCode.apply(null, u8.subarray(i, i + STEP)); return btoa(s); }
+    function b64ToBytes(b64) { const bin = atob(b64); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); return u8; }
 
-    function dlMeta(msg) { const d = downloads.get(msg.id); if (d) d.name = msg.name || "download"; }
-    function dlChunk(msg) { const d = downloads.get(msg.id); if (d) d.parts.push(b64ToBytes(msg.data)); }
-    function dlEnd(msg) {
-      const d = downloads.get(msg.id);
-      if (!d) return;
-      downloads.delete(msg.id);
-      const blob = new Blob(d.parts, { type: "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = d.name;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-      toast(`Downloaded ${d.name}`, "ok");
-    }
-    function dlError(msg) { downloads.delete(msg.id); toast(`Download failed: ${msg.message}`, "err"); }
-
-    // ---- base64 helpers (chunked to stay off the call-stack limit) ---------
-    function bytesToB64(u8) {
-      let s = "";
-      const STEP = 0x8000;
-      for (let i = 0; i < u8.length; i += STEP) s += String.fromCharCode.apply(null, u8.subarray(i, i + STEP));
-      return btoa(s);
-    }
-    function b64ToBytes(b64) {
-      const bin = atob(b64);
-      const u8 = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-      return u8;
-    }
-
-    // ---- drag-and-drop upload ----------------------------------------------
-    const dropEl = $("drop");
-    let dragDepth = 0;
-    window.addEventListener("dragenter", (e) => { e.preventDefault(); if (++dragDepth === 1) dropEl.classList.add("show"); });
-    window.addEventListener("dragover", (e) => e.preventDefault());
+    // drag-drop + toasts + resize
+    const dropEl = $("drop"); let dragDepth = 0;
+    window.addEventListener("dragenter", (e) => { if (!ws) return; e.preventDefault(); if (++dragDepth === 1) dropEl.classList.add("show"); });
+    window.addEventListener("dragover", (e) => { if (ws) e.preventDefault(); });
     window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); } });
-    window.addEventListener("drop", (e) => {
-      e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show");
-      for (const f of e.dataTransfer.files) uploadFile(f);
-    });
+    window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
+    window.addEventListener("resize", () => { if (ws && ws.readyState === WebSocket.OPEN) { try { fit.fit(); } catch {} sendJson({ type: "resize", sid, cols: term.cols, rows: term.rows }); } });
+    window.addEventListener("beforeunload", () => sendJson({ type: "client-gone", sid }));
+    function toast(text, kind) { const el = document.createElement("div"); el.className = "toast " + (kind || ""); el.textContent = text; $("toasts").appendChild(el); setTimeout(() => el.remove(), 4000); }
 
-    // ---- toasts ------------------------------------------------------------
-    function toast(text, kind) {
-      const el = document.createElement("div");
-      el.className = "toast " + (kind || "");
-      el.textContent = text;
-      $("toasts").appendChild(el);
-      setTimeout(() => el.remove(), 4000);
-    }
-
-    // ---- lifecycle ---------------------------------------------------------
-    window.addEventListener("beforeunload", () => { sendJson({ type: "client-gone", sid }); });
-
-    function start() {
-      gate.style.display = "none";
-      if (location.protocol !== "file:") {
-        const u = new URL(location.href); u.searchParams.set("token", token);
-        history.replaceState(null, "", u);
-      }
-      connect();
-      setTimeout(doFit, 50);
-      term.focus();
-    }
-
-    // Token gate
-    $("connectBtn").onclick = () => {
-      const t = tokenInput.value.trim();
-      if (t.length < 24) { gateErr.textContent = "Token must be at least 24 characters."; return; }
-      token = t; start();
-    };
-    tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") $("connectBtn").click(); });
-
-    if (token.length >= 24) start();
-    else { gate.style.display = "flex"; tokenInput.focus(); }
+    init();
   })();
   </script>
 </body>

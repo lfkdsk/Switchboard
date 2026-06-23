@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Switchboard — authorize CLI</title>
+<style>
+  :root { --bg:#0b0e14; --panel:#11151f; --border:#1e2430; --fg:#c9d1d9; --muted:#6b7785; --accent:#2f81f7; --err:#f85149; }
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;display:flex;align-items:center;justify-content:center}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:30px 28px;width:min(460px,92vw);text-align:center}
+  h1{font-size:18px;margin:0 0 8px}
+  p{color:var(--muted);margin:0 0 18px}
+  button{background:var(--accent);border:1px solid var(--accent);color:#fff;border-radius:6px;padding:9px 14px;font:inherit;cursor:pointer}
+  .err{color:var(--err)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="msg">Authorizing CLI…</h1>
+    <p id="sub"></p>
+    <button id="btn" hidden>Sign in with GitHub</button>
+  </div>
+  <script>
+  (function () {
+    const $ = (id) => document.getElementById(id);
+    const state = new URLSearchParams(location.search).get("state") || "";
+    if (!state) { $("msg").textContent = "Missing login state"; $("sub").textContent = "Re-run `switchboard login`."; return; }
+
+    async function complete() {
+      const r = await fetch("/cli/complete", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ state }) });
+      if (r.ok) { $("msg").textContent = "✓ CLI authorized"; $("sub").textContent = "Return to your terminal — it will continue automatically."; }
+      else { $("msg").textContent = "Authorization failed"; $("sub").className = ""; $("sub").textContent = "This link may have expired. Run `switchboard login` again."; }
+    }
+
+    (async function () {
+      let me = { login: null };
+      try { me = await (await fetch("/auth/me", { credentials: "same-origin" })).json(); } catch {}
+      if (me.login) return complete();
+      // Not signed in → GitHub OAuth, carrying the CLI state so the return can complete it.
+      $("msg").textContent = "Sign in to authorize this machine";
+      $("sub").textContent = "as " + (state.slice(0, 8)) + "…";
+      const go = () => { location.href = "/auth/login?state=" + encodeURIComponent("cli:" + state); };
+      $("btn").hidden = false; $("btn").onclick = go;
+      setTimeout(go, 400); // auto-redirect; button is the fallback
+    })();
+  })();
+  </script>
+</body>
+</html>
