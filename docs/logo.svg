@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Switchboard">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a2030"/>
+      <stop offset="1" stop-color="#0b0e14"/>
+    </linearGradient>
+    <linearGradient id="cable" x1="80" y1="60" x2="184" y2="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6cb0ff"/>
+      <stop offset="1" stop-color="#2f81f7"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="6" y="6" width="244" height="244" rx="58" fill="url(#bg)" stroke="#222a38" stroke-width="4"/>
+  <!-- the patch cord, bent into an S -->
+  <g filter="url(#glow)">
+    <path d="M164 76 C104 60 76 104 128 128 C180 152 152 196 92 180"
+          fill="none" stroke="url(#cable)" stroke-width="24" stroke-linecap="round"/>
+  </g>
+  <!-- host jack (online green) -->
+  <circle cx="164" cy="76" r="22" fill="#0b0e14"/>
+  <circle cx="164" cy="76" r="15" fill="#2ea043"/>
+  <!-- browser jack (accent blue) -->
+  <circle cx="92" cy="180" r="22" fill="#0b0e14"/>
+  <circle cx="92" cy="180" r="15" fill="#3b8eff"/>
+</svg>
