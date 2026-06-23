@@ -219,13 +219,4 @@ accepted for drop-in compatibility. Account credentials live in
 
 ---
 
-## Compatibility & credits
-
-Switchboard is a clean reimplementation of
-[`@elsetech/webterm`](https://www.npmjs.com/package/@elsetech/webterm) — **both
-ends** — verified against the `@elsetech/webterm@2.0.0` daemon protocol with a
-full end-to-end run (live commands, host stats, and file upload/download all
-round-trip). The relay is payload-agnostic, so it keeps working as long as the
-framing (1-byte sid-length prefix + JSON control messages) is unchanged.
-
 MIT licensed.
