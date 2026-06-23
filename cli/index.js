@@ -379,7 +379,16 @@ function connect() {
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code) => {
+    // 4001 = the relay handed this circuit to a newer daemon for the same
+    // machine/token. Reconnecting would just kick that one off in an endless
+    // loop, so step aside. Exit 0 so a supervisor (systemd/pm2) treats this as
+    // an intentional stop and doesn't restart us back into the fight.
+    if (code === 4001) {
+      log("[relay] replaced by a newer daemon for this " + (BOUND ? "machine" : "token") + "; exiting.");
+      for (const sid of sessions.keys()) killSession(sid);
+      process.exit(0);
+    }
     // Sessions are kept across reconnects; their onData handlers check ws state.
     for (const stream of activeDownloads.values()) stream.destroy();
     activeDownloads.clear();

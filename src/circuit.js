@@ -21,11 +21,17 @@ export class Circuit extends DurableObject {
     const machineId = url.searchParams.get("machine") || null;
 
     if (role === "daemon") {
-      const daemons = this.ctx.getWebSockets("daemon");
-      if (daemons.some((s) => s.readyState === WS_OPEN)) {
-        return new Response("circuit already has a daemon\n", { status: 409 });
+      // Last-writer-wins: a newly-arrived daemon always takes over the circuit.
+      // We can't trust readyState here — when a daemon dies ungracefully (sleep,
+      // crash, kill -9) Cloudflare leaves its socket reading OPEN for minutes
+      // until the TCP connection times out. Rejecting the newcomer in that
+      // window locks a restarted daemon out of its own (machine-keyed) circuit.
+      // Instead, close any incumbent and accept the newcomer. The 4001 code
+      // tells a still-live incumbent it was deliberately replaced so it exits
+      // cleanly instead of reconnecting and fighting for the circuit.
+      for (const s of this.ctx.getWebSockets("daemon")) {
+        try { s.close(4001, "replaced by a newer daemon"); } catch {}
       }
-      for (const s of daemons) { try { s.close(1000, "stale daemon replaced"); } catch {} }
     }
 
     const { 0: client, 1: server } = new WebSocketPair();
