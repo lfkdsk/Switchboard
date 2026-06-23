@@ -29,10 +29,10 @@
   input { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 9px 11px; font: inherit; }
   input:focus { outline: none; border-color: var(--accent); }
   .muted { color: var(--muted); }
+  #rtt b { color: var(--fg); }
   /* views */
   .view { display: none; flex: 1; min-height: 0; }
   .view.active { display: flex; flex-direction: column; }
-  /* centered card layout (landing / cli) */
   .center { align-items: center; justify-content: center; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 28px 26px; width: min(460px, 92vw); }
   .card h1 { font-size: 18px; margin: 0 0 6px; }
@@ -47,11 +47,17 @@
   .machine { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 10px; }
   .machine .name { font-weight: 600; }
   .machine .meta { color: var(--muted); font-size: 12px; }
-  .machine .spacer { flex: 1; }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 8px; }
   code { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
-  /* terminal */
-  #term { flex: 1; min-height: 0; padding: 6px 8px; }
+  /* terminal + tabs */
+  #tabbar { display: flex; align-items: center; gap: 4px; padding: 6px 8px; background: var(--panel); border-bottom: 1px solid var(--border); overflow-x: auto; }
+  .tab { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: #1b2230; cursor: pointer; white-space: nowrap; color: var(--muted); }
+  .tab.active { color: var(--fg); border-color: var(--accent); }
+  .tab .x { opacity: .55; padding: 0 3px; border-radius: 3px; }
+  .tab .x:hover { opacity: 1; background: rgba(248,81,73,.2); color: var(--err); }
+  #newTab { padding: 5px 10px; flex: none; }
+  #termHost { flex: 1; min-height: 0; position: relative; }
+  .shell-host { position: absolute; inset: 0; padding: 6px 8px; }
   /* toast + drop */
   #toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
   .toast { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 9px 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
@@ -64,9 +70,9 @@
 <body>
   <header>
     <span class="brand" id="brand">Switchboard</span>
-    <!-- terminal-only header bits -->
     <button id="backBtn" hidden>← Machines</button>
     <span id="conn" hidden><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
+    <span id="rtt" class="muted" hidden>↔ <b id="rttVal">—</b></span>
     <div class="stats" id="stats" hidden>
       <span><b id="sHost">—</b> <span id="sPlatform"></span></span>
       <span>cpu <b id="sCpu">—</b></span>
@@ -75,7 +81,7 @@
     </div>
     <span class="spacer"></span>
     <div class="row" id="termTools" hidden>
-      <button id="btnUpload" title="Upload into the shell's current directory">Upload</button>
+      <button id="btnUpload" title="Upload into the active shell's directory">Upload</button>
       <button id="btnDownload" title="Download a file from the host">Download</button>
     </div>
     <div class="row" id="userBox" hidden>
@@ -89,9 +95,9 @@
   <div class="view center" id="view-landing">
     <div class="card">
       <h1>Switchboard</h1>
-      <p>Sign in to see the machines bound to your account and open a shell on any of them.</p>
+      <p>Sign in to see your machines and open a shell on any of them, right from the browser.</p>
       <button class="primary" id="githubBtn" style="width:100%">Sign in with GitHub</button>
-      <div class="or">— or connect to one machine with a token —</div>
+      <div class="or">— or paste a one-off token —</div>
       <div class="row">
         <input id="tokenInput" style="flex:1" type="text" placeholder="token (min 24 chars)" autocomplete="off" spellcheck="false" />
         <button id="tokenBtn">Connect</button>
@@ -113,14 +119,15 @@
         <h1 style="font-size:15px">Add a machine</h1>
         <p style="margin-bottom:8px">On the host you want to reach, run:</p>
         <div><code>npx @switch-board/cli login</code></div>
-        <p class="muted" style="margin-top:8px;margin-bottom:0">Authorize in the browser, then run <code>switchboard</code> to expose its shell. It appears here.</p>
+        <p class="muted" style="margin-top:8px;margin-bottom:0">Authorize once in the browser — the machine stays online here, and you can open multiple shells on it.</p>
       </div>
     </div>
   </div>
 
   <!-- TERMINAL -->
   <div class="view" id="view-terminal">
-    <div id="term"></div>
+    <div id="tabbar"><button id="newTab" title="Open a new shell">+ shell</button></div>
+    <div id="termHost"></div>
   </div>
 
   <!-- CLI AUTHORIZED -->
@@ -141,18 +148,21 @@
     "use strict";
     const $ = (id) => document.getElementById(id);
     const api = (path, opts) => fetch(path, { credentials: "same-origin", ...opts });
+    const enc = new TextEncoder(), dec = new TextDecoder();
 
     // ---- view router -------------------------------------------------------
-    let session = null; // { id, login } when signed in
+    let session = null, dashTimer = null;
     function showView(name) {
       for (const v of document.querySelectorAll(".view")) v.classList.toggle("active", v.id === "view-" + name);
       const inTerm = name === "terminal";
       $("backBtn").hidden = !(inTerm && session);
       $("conn").hidden = !inTerm;
+      $("rtt").hidden = !inTerm;
       $("termTools").hidden = !inTerm;
       $("stats").hidden = true;
       $("userBox").hidden = !(name === "dashboard" && session);
       if (session) $("userLogin").textContent = session.login;
+      if (name !== "dashboard" && dashTimer) { clearInterval(dashTimer); dashTimer = null; }
     }
 
     $("brand").onclick = () => { if (session) goDashboard(); else showView("landing"); };
@@ -166,18 +176,14 @@
       openTerminal({ mode: "token", token: t });
     };
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenBtn").click(); });
-
     function cleanUrl() { history.replaceState(null, "", location.pathname); }
 
     // ---- init / OAuth return ----------------------------------------------
     async function init() {
       const hash = new URLSearchParams(location.hash.slice(1));
       const query = new URLSearchParams(location.search);
-
-      // OAuth return from lfkdsk-auth (token in fragment).
       if (hash.get("oauth_token")) {
-        const ghToken = hash.get("oauth_token");
-        const state = hash.get("state") || "";
+        const ghToken = hash.get("oauth_token"), state = hash.get("state") || "";
         history.replaceState(null, "", location.pathname);
         const r = await api("/auth/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ github_token: ghToken }) });
         if (!r.ok) { showView("landing"); $("landingErr").textContent = "Sign-in failed."; return; }
@@ -186,15 +192,9 @@
         return goDashboard();
       }
       if (hash.get("oauth_error")) { showView("landing"); $("landingErr").textContent = "GitHub: " + hash.get("oauth_error"); history.replaceState(null, "", location.pathname); return; }
-
-      // Direct anonymous token link.
       const token = (query.get("token") || "").trim();
       if (token.length >= 24) return openTerminal({ mode: "token", token });
-
-      // Who am I?
       try { const me = await (await api("/auth/me")).json(); if (me.login) session = me; } catch {}
-
-      // Direct bound-machine link.
       const machine = query.get("machine");
       if (machine) {
         if (session) return openTerminal({ mode: "machine", machineId: machine });
@@ -202,106 +202,154 @@
       }
       return session ? goDashboard() : showView("landing");
     }
-
     async function completeCli(state) {
       showView("cli"); $("cliMsg").textContent = "Authorizing the CLI…";
       const r = await api("/cli/complete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ state }) });
-      if (r.ok) { $("cliMsg").textContent = "✓ CLI authorized"; $("cliSub").textContent = "You can return to your terminal — it will continue automatically."; }
+      if (r.ok) { $("cliMsg").textContent = "✓ CLI authorized"; $("cliSub").textContent = "Return to your terminal — it will continue automatically."; }
       else { $("cliMsg").textContent = "Authorization failed"; $("cliSub").textContent = "The login link may have expired. Run `switchboard login` again."; }
     }
 
     // ---- dashboard ---------------------------------------------------------
-    function goDashboard() { showView("dashboard"); renderDashboard(); }
+    function goDashboard() {
+      cleanUrl(); // drop ?machine=/?token= when returning to the machines list
+      showView("dashboard"); renderDashboard();
+      if (!dashTimer) dashTimer = setInterval(() => renderDashboard(true), 3000); // live status/latency
+    }
     function fmtAgo(ts) {
       const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
       if (s < 60) return s + "s ago"; if (s < 3600) return Math.floor(s / 60) + "m ago";
       if (s < 86400) return Math.floor(s / 3600) + "h ago"; return Math.floor(s / 86400) + "d ago";
     }
-    async function renderDashboard() {
+    function fmtBytes(n) { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
+    async function renderDashboard(silent) {
       const list = $("machineList");
-      list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
+      if (!silent && !list.children.length) list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
       let machines = [];
       try { machines = (await (await api("/api/machines")).json()).machines || []; }
-      catch { list.innerHTML = '<div class="empty">Could not load machines.</div>'; return; }
+      catch { if (!silent) list.innerHTML = '<div class="empty">Could not load machines.</div>'; return; }
       if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switch-board/cli login</code> on a host to bind it.</div>'; return; }
       list.innerHTML = "";
       for (const m of machines) {
+        const online = Date.now() - m.last_seen < 6000; // heartbeat freshness
+        const meta = online
+          ? `online · ${m.rtt != null ? m.rtt + "ms" : "—"}${m.cpu != null ? " · cpu " + Math.round(m.cpu * 100) + "%" : ""}${m.mem_used != null && m.mem_total ? " · mem " + fmtBytes(m.mem_used) + "/" + fmtBytes(m.mem_total) : ""}`
+          : "offline · last seen " + fmtAgo(m.last_seen);
         const el = document.createElement("div");
         el.className = "machine";
-        el.innerHTML =
-          `<span class="dot ${m.online ? "on" : "off"}"></span>` +
-          `<div><div class="name"></div><div class="meta">${m.online ? "online" : "offline · " + fmtAgo(m.last_seen)}</div></div>` +
-          `<span class="spacer"></span><button class="primary">Open shell</button>`;
+        el.innerHTML = `<span class="dot ${online ? "on" : "off"}"></span><div><div class="name"></div><div class="meta">${meta}</div></div><span class="spacer"></span><button class="primary">Open shell</button>`;
         el.querySelector(".name").textContent = m.name || m.machine_id.slice(0, 8);
         el.querySelector("button").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
         list.appendChild(el);
       }
     }
 
-    // ===================== TERMINAL =========================================
-    let term = null, fit = null, ws = null, sid = null, conn = null;
-    let reconnectDelay = 1000, manualClose = false, pingTimer = null;
-    const enc = new TextEncoder(), dec = new TextDecoder();
+    // ===================== TERMINAL (multi-shell) ===========================
+    let ws = null, conn = null, reconnectDelay = 1000, manualClose = false;
+    let pingTimer = null, lastPingT = 0;
+    const shells = new Map(); // sid -> { term, fit, host, tab, label, opened }
+    let activeSid = null, bootstrapped = false;
     const uploads = new Map(), downloads = new Map();
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       const base = `${proto}//${location.host}/ws?role=browser`;
-      return conn.mode === "machine"
-        ? `${base}&machine=${encodeURIComponent(conn.machineId)}`
-        : `${base}&token=${encodeURIComponent(conn.token)}`;
+      return conn.mode === "machine" ? `${base}&machine=${encodeURIComponent(conn.machineId)}` : `${base}&token=${encodeURIComponent(conn.token)}`;
     }
     function setConn(state, text) { $("connDot").className = "dot " + state; $("connText").textContent = text; }
+    function frame(sid, payload) { const s = enc.encode(sid), p = enc.encode(payload); const o = new Uint8Array(1 + s.length + p.length); o[0] = s.length; o.set(s, 1); o.set(p, 1 + s.length); return o.buffer; }
 
     function openTerminal(c) {
       conn = c;
-      const key = c.mode === "machine" ? "sid:m:" + c.machineId : "sid:t:" + c.token;
-      sid = sessionStorage.getItem(key) || crypto.randomUUID();
-      sessionStorage.setItem(key, sid);
-      // shareable / reload-resumable URL
       const u = new URL(location.href); u.search = ""; u.hash = "";
       u.searchParams.set(c.mode === "machine" ? "machine" : "token", c.mode === "machine" ? c.machineId : c.token);
       history.replaceState(null, "", u);
-
+      // reset shells
+      for (const s of shells.values()) { try { s.term.dispose(); } catch {} s.host.remove(); s.tab.remove(); }
+      shells.clear(); activeSid = null; bootstrapped = false;
+      $("rttVal").textContent = "—";
       showView("terminal");
-      if (term) { try { term.dispose(); } catch {} }
-      term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" }, scrollback: 10000 });
-      fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open($("term"));
-      term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(encodeFrame(sid, d)); });
-      setTimeout(() => { try { fit.fit(); } catch {} term.focus(); }, 30);
       reconnectDelay = 1000;
       connect();
     }
     function closeTerminal() {
       manualClose = true; stopPing();
       try { ws && ws.close(); } catch {} ws = null;
-      try { term && term.dispose(); } catch {} term = null;
+      for (const s of shells.values()) { try { s.term.dispose(); } catch {} s.host.remove(); s.tab.remove(); }
+      shells.clear(); activeSid = null;
       $("stats").hidden = true;
+    }
+
+    function ensureShell(sid) {
+      if (shells.has(sid)) return shells.get(sid);
+      const host = document.createElement("div"); host.className = "shell-host"; host.hidden = true; $("termHost").appendChild(host);
+      const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" }, scrollback: 10000 });
+      const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
+      term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(frame(sid, d)); });
+      const tab = document.createElement("div"); tab.className = "tab";
+      const lbl = document.createElement("span"); lbl.textContent = "shell";
+      const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
+      tab.append(lbl, x); tab.onclick = (e) => { if (e.target === x) closeShell(sid); else activate(sid); };
+      $("tabbar").insertBefore(tab, $("newTab"));
+      const sh = { term, fit, host, tab, label: lbl, opened: false };
+      shells.set(sid, sh);
+      return sh;
+    }
+    function removeShell(sid) {
+      const sh = shells.get(sid); if (!sh) return;
+      try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); shells.delete(sid);
+      if (activeSid === sid) { activeSid = null; const next = shells.keys().next().value; if (next) activate(next); }
+    }
+    function activate(sid) {
+      const sh = shells.get(sid); if (!sh) return;
+      activeSid = sid;
+      for (const [id, s] of shells) { s.host.hidden = id !== sid; s.tab.classList.toggle("active", id === sid); }
+      try { sh.fit.fit(); } catch {}
+      if (!sh.opened && ws && ws.readyState === WebSocket.OPEN) { sh.opened = true; sendJson({ type: "open", sid, cols: sh.term.cols, rows: sh.term.rows }); }
+      sh.term.focus();
+    }
+    function newShell() { const sid = crypto.randomUUID(); ensureShell(sid); activate(sid); }
+    function closeShell(sid) { sendJson({ type: "close", sid }); } // daemon broadcasts the new list → removeShell
+    $("newTab").onclick = newShell;
+
+    function syncSessions(listArr) {
+      const ids = new Set();
+      for (const e of listArr) {
+        ids.add(e.sid);
+        const sh = ensureShell(e.sid);
+        sh.label.textContent = e.cwd ? e.cwd.split("/").filter(Boolean).pop() || "/" : "shell";
+        sh.tab.title = e.cwd || "";
+      }
+      for (const sid of [...shells.keys()]) if (!ids.has(sid)) removeShell(sid);
+      if (!activeSid && shells.size) activate(shells.keys().next().value);
+      if (!bootstrapped) { bootstrapped = true; if (!shells.size) newShell(); }
     }
 
     function connect() {
       manualClose = false; setConn("wait", "connecting…");
       ws = new WebSocket(wsUrl()); ws.binaryType = "arraybuffer";
-      ws.onopen = () => { reconnectDelay = 1000; setConn("wait", "waiting for host…"); try { fit.fit(); } catch {} sendJson({ type: "open", sid, cols: term.cols, rows: term.rows }); startPing(); };
-      ws.onmessage = (ev) => { if (typeof ev.data === "string") { if (ev.data === "pong") return; handleJson(ev.data); } else handleBinary(ev.data); };
+      ws.onopen = () => {
+        reconnectDelay = 1000; setConn("wait", "waiting for host…");
+        for (const s of shells.values()) s.opened = false; // re-attach after reconnect
+        sendJson({ type: "list-sessions" });
+        if (activeSid) activate(activeSid);
+        startPing();
+      };
+      ws.onmessage = (ev) => { if (typeof ev.data === "string") handleJson(ev.data); else handleBinary(ev.data); };
       ws.onclose = () => { stopPing(); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); setTimeout(() => { if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
       ws.onerror = () => { try { ws.close(); } catch {} };
     }
     function sendJson(o) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); }
-    function startPing() { stopPing(); pingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send("ping"); }, 30000); }
+    function startPing() { stopPing(); const probe = () => { if (ws && ws.readyState === WebSocket.OPEN) { lastPingT = Date.now(); sendJson({ type: "ping", t: lastPingT }); } }; probe(); pingTimer = setInterval(probe, 4000); }
     function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } }
 
-    function encodeFrame(sidStr, payloadStr) {
-      const s = enc.encode(sidStr), p = enc.encode(payloadStr);
-      const out = new Uint8Array(1 + s.length + p.length); out[0] = s.length; out.set(s, 1); out.set(p, 1 + s.length); return out.buffer;
-    }
-    function handleBinary(buf) { const a = new Uint8Array(buf); if (dec.decode(a.subarray(1, 1 + a[0])) !== sid) return; term.write(a.subarray(1 + a[0])); }
-
+    function handleBinary(buf) { const a = new Uint8Array(buf); const sh = shells.get(dec.decode(a.subarray(1, 1 + a[0]))); if (sh) sh.term.write(a.subarray(1 + a[0])); }
     function handleJson(str) {
       let m; try { m = JSON.parse(str); } catch { return; }
       switch (m.type) {
+        case "sessions": syncSessions(m.list || []); break;
+        case "pong": if (m.t === lastPingT) $("rttVal").textContent = (Date.now() - m.t) + "ms"; break;
         case "stats": updateStats(m); break;
-        case "exit": if (m.sid === sid) term.write(`\r\n\x1b[33m[session exited (code ${m.code})]\x1b[0m\r\n`); break;
+        case "exit": { const sh = shells.get(m.sid); if (sh) sh.term.write(`\r\n\x1b[33m[exited ${m.code}]\x1b[0m\r\n`); break; }
         case "_relay": setConn(m.event === "daemon-online" ? "on" : "off", m.event === "daemon-online" ? "connected" : "host offline"); break;
         case "dl-meta": { const d = downloads.get(m.id); if (d) d.name = m.name || "download"; break; }
         case "dl-chunk": { const d = downloads.get(m.id); if (d) d.parts.push(b64ToBytes(m.data)); break; }
@@ -319,37 +367,33 @@
       $("sMem").textContent = (s.memUsed != null && s.memTotal) ? `${fmtBytes(s.memUsed)} / ${fmtBytes(s.memTotal)}` : "—";
       $("sIp").textContent = s.ip || "—";
     }
-    function fmtBytes(n) { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
 
-    // upload / download
+    // ---- file transfer (active shell) --------------------------------------
     $("btnUpload").onclick = () => $("fileInput").click();
     $("fileInput").onchange = (e) => { for (const f of e.target.files) uploadFile(f); e.target.value = ""; };
     async function uploadFile(file) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) { toast("Not connected", "err"); return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN || !activeSid) { toast("Not connected", "err"); return; }
       const id = crypto.randomUUID();
       const ready = new Promise((res) => uploads.set(id, { name: file.name, resolveReady: res }));
-      sendJson({ type: "ul-open", id, sid, name: file.name }); await ready;
+      sendJson({ type: "ul-open", id, sid: activeSid, name: file.name }); await ready;
       const CHUNK = 64 * 1024;
       for (let off = 0; off < file.size; off += CHUNK) { const slice = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer()); sendJson({ type: "ul-chunk", id, data: bytesToB64(slice) }); await drain(); }
       sendJson({ type: "ul-end", id });
     }
     function drain() { return new Promise((res) => { const c = () => { if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < 1 << 20) res(); else setTimeout(c, 20); }; c(); }); }
-    $("btnDownload").onclick = () => {
-      const path = prompt("Host file path to download (e.g. ~/notes.txt):"); if (!path) return;
-      const id = crypto.randomUUID(); downloads.set(id, { name: "download", parts: [] }); sendJson({ type: "dl-open", id, path });
-    };
+    $("btnDownload").onclick = () => { const path = prompt("Host file path to download (e.g. ~/notes.txt):"); if (!path) return; const id = crypto.randomUUID(); downloads.set(id, { name: "download", parts: [] }); sendJson({ type: "dl-open", id, path }); };
     function dlEnd(m) { const d = downloads.get(m.id); if (!d) return; downloads.delete(m.id); const blob = new Blob(d.parts, { type: "application/octet-stream" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = d.name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000); toast("Downloaded " + d.name, "ok"); }
     function bytesToB64(u8) { let s = ""; const STEP = 0x8000; for (let i = 0; i < u8.length; i += STEP) s += String.fromCharCode.apply(null, u8.subarray(i, i + STEP)); return btoa(s); }
     function b64ToBytes(b64) { const bin = atob(b64); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); return u8; }
 
-    // drag-drop + toasts + resize
+    // ---- drag-drop + resize + toasts ---------------------------------------
     const dropEl = $("drop"); let dragDepth = 0;
     window.addEventListener("dragenter", (e) => { if (!ws) return; e.preventDefault(); if (++dragDepth === 1) dropEl.classList.add("show"); });
     window.addEventListener("dragover", (e) => { if (ws) e.preventDefault(); });
     window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); } });
     window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
-    window.addEventListener("resize", () => { if (ws && ws.readyState === WebSocket.OPEN) { try { fit.fit(); } catch {} sendJson({ type: "resize", sid, cols: term.cols, rows: term.rows }); } });
-    window.addEventListener("beforeunload", () => sendJson({ type: "client-gone", sid }));
+    window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh && ws && ws.readyState === WebSocket.OPEN) { try { sh.fit.fit(); } catch {} sendJson({ type: "resize", sid: activeSid, cols: sh.term.cols, rows: sh.term.rows }); } });
+    window.addEventListener("beforeunload", () => { for (const sid of shells.keys()) sendJson({ type: "client-gone", sid }); });
     function toast(text, kind) { const el = document.createElement("div"); el.className = "toast " + (kind || ""); el.textContent = text; $("toasts").appendChild(el); setTimeout(() => el.remove(), 4000); }
 
     init();
