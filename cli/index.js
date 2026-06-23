@@ -233,16 +233,28 @@ function openSession(sid, cols, rows) {
     cwd: process.env.HOME || process.cwd(),
     env: process.env,
   });
-  s = { pty: p, graceTimer: null };
+  s = { pty: p, graceTimer: null, startedAt: Date.now() };
   sessions.set(sid, s);
   p.onData((d) => sendSessionData(sid, d));
   p.onExit(({ exitCode }) => {
     sessions.delete(sid);
     sendCtl({ type: "exit", sid, code: exitCode });
+    broadcastSessions();
     log(`[session ${sid}] shell exited (${exitCode})`);
   });
+  broadcastSessions();
   log(`[session ${sid}] shell started (pid ${p.pid})`);
   return s;
+}
+
+// Report the live session list so a browser can show/attach tabs (tmux-style):
+// sessions persist for the daemon's lifetime in bound mode and are reattachable.
+function buildSessionList() {
+  return Promise.all([...sessions.entries()].map(([sid, s]) =>
+    new Promise((res) => getShellCwd(sid, (cwd) => res({ sid, startedAt: s.startedAt, cwd })))));
+}
+async function broadcastSessions() {
+  try { sendCtl({ type: "sessions", list: await buildSessionList() }); } catch {}
 }
 
 function killSession(sid) {
@@ -289,6 +301,7 @@ function banner() {
 let ws = null;
 let reconnectDelay = 1000;
 let announced = false;
+let lastRtt = null, pingSentAt = 0; // relay-edge round-trip (ms), reported in stats
 const activeDownloads = new Map(); // id -> fs.ReadStream
 const activeUploads = new Map(); // id -> { stream, finalPath }
 
@@ -337,8 +350,10 @@ function connect() {
       if (s) s.pty.write(data.subarray(1 + sidLen).toString("utf8"));
       return;
     }
+    const text = data.toString("utf8");
+    if (text === "pong") { if (pingSentAt) lastRtt = Date.now() - pingSentAt; return; } // relay-edge RTT
     let msg;
-    try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+    try { msg = JSON.parse(text); } catch { return; }
     switch (msg.type) {
       case "open":
         openSession(msg.sid, msg.cols, msg.rows);
@@ -350,7 +365,12 @@ function connect() {
         if (s) try { s.pty.resize(msg.cols, msg.rows); } catch {}
         break;
       }
-      case "client-gone": scheduleSessionCleanup(msg.sid); break;
+      // tmux-style: closing a browser window does NOT end the shell when bound
+      // to an account; only an explicit `close` (or the shell exiting) does.
+      case "client-gone": if (!BOUND) scheduleSessionCleanup(msg.sid); break;
+      case "list-sessions": broadcastSessions(); break;
+      case "close": killSession(msg.sid); broadcastSessions(); break;
+      case "ping": sendCtl({ type: "pong", t: msg.t }); break; // browser↔daemon RTT probe
       case "dl-open": startDownload(msg.id, msg.path); break;
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
@@ -558,7 +578,11 @@ function sendStats() {
       ip: primaryIp(),
       host: os.hostname(),
       platform: process.platform,
+      rtt: lastRtt, // relay-edge round-trip from the previous tick (ms)
     }));
+    // Probe the relay edge for the next tick's rtt (auto-ponged, no DO wake).
+    pingSentAt = Date.now();
+    ws.send("ping");
   } catch { /* peer gone */ }
 }
 

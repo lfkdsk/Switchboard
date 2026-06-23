@@ -11,7 +11,11 @@ CREATE TABLE IF NOT EXISTS machines (
   name          TEXT NOT NULL DEFAULT '',
   online        INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
-  last_seen     INTEGER NOT NULL
+  last_seen     INTEGER NOT NULL,   -- bumped by each daemon stats heartbeat (~2s)
+  rtt           INTEGER,            -- daemon↔relay round-trip (ms), from heartbeat
+  cpu           REAL,               -- last reported cpu fraction 0..1
+  mem_used      INTEGER,
+  mem_total     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_machines_account ON machines(account_id);
 

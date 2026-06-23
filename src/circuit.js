@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { setMachineOffline } from "./registry.js";
+import { setMachineOffline, updateMachineStats } from "./registry.js";
 
 const WS_OPEN = 1;
 
@@ -44,13 +44,27 @@ export class Circuit extends DurableObject {
   }
 
   webSocketMessage(ws, message) {
-    const { role } = ws.deserializeAttachment() || {};
-    if (role === "daemon") {
+    const att = ws.deserializeAttachment() || {};
+    if (att.role === "daemon") {
+      // Bound-machine heartbeat → D1 (small JSON stats only; skip binary + big dl-chunks).
+      if (att.machineId && typeof message === "string" && message.length < 2000) {
+        this.recordHeartbeat(att.machineId, message);
+      }
       for (const b of this.ctx.getWebSockets("browser")) this.safeSend(b, message);
     } else {
       const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);
       if (daemon) this.safeSend(daemon, message);
     }
+  }
+
+  recordHeartbeat(machineId, str) {
+    let m;
+    try { m = JSON.parse(str); } catch { return; }
+    if (m.type !== "stats") return;
+    const now = Date.now();
+    if (this._lastBeat && now - this._lastBeat < 4000) return; // throttle D1 writes
+    this._lastBeat = now;
+    this.ctx.waitUntil(updateMachineStats(this.env, machineId, m));
   }
 
   async webSocketClose(ws, code, reason) {

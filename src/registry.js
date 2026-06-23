@@ -52,13 +52,20 @@ export async function registerMachine(env, machineId, account, name) {
 export async function setMachineOffline(env, machineId) {
   await env.DB.prepare("UPDATE machines SET online=0, last_seen=? WHERE machine_id=?").bind(Date.now(), machineId).run();
 }
+// Heartbeat: each daemon `stats` message bumps last_seen (+ latency/load) so the
+// dashboard shows accurate, self-healing status (online = last_seen is fresh).
+export async function updateMachineStats(env, machineId, s) {
+  await env.DB.prepare(
+    "UPDATE machines SET online=1, last_seen=?, rtt=?, cpu=?, mem_used=?, mem_total=? WHERE machine_id=?",
+  ).bind(Date.now(), s.rtt ?? null, s.cpu ?? null, s.memUsed ?? null, s.memTotal ?? null, machineId).run();
+}
 export async function machineOwner(env, machineId) {
   const row = await env.DB.prepare("SELECT account_id FROM machines WHERE machine_id=?").bind(machineId).first();
   return row ? row.account_id : null;
 }
 export async function listMachines(env, accountId) {
   const { results } = await env.DB.prepare(
-    "SELECT machine_id, name, online, created_at, last_seen FROM machines WHERE account_id=? ORDER BY online DESC, last_seen DESC",
+    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total FROM machines WHERE account_id=? ORDER BY last_seen DESC",
   ).bind(accountId).all();
   return results || [];
 }
