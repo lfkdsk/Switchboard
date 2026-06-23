@@ -6,6 +6,11 @@
 &nbsp;[![node](https://img.shields.io/node/v/@switch-board/cli?color=2ea043)](https://www.npmjs.com/package/@switch-board/cli)
 &nbsp;![runs on Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020)
 
+<p align="center">
+  <img src="docs/terminal.png" alt="A Switchboard browser terminal: tabbed multi-shell with a live header showing RTT, CPU, memory, and IP" width="880">
+  <br><sub><em>A real shell in the browser — tabbed multi-shell, live RTT / CPU / memory, drag-and-drop file transfer.</em></sub>
+</p>
+
 Run one command on a machine and it shows up in your browser dashboard. Click it
 and you get a real interactive terminal — tabs, file transfer, live host
 stats — even when that machine sits behind NAT or a corporate firewall. Both the
@@ -39,6 +44,11 @@ npx @switch-board/cli           # prints a one-off token + URL
 Anyone you give that URL to gets a shell on the machine — handy for pairing or
 quick remote help. No sign-in required; the token *is* the key (see
 [Security](#security)).
+
+<p align="center">
+  <img src="docs/dashboard.png" alt="The Switchboard dashboard listing your machines with live online/offline status, latency, CPU, and memory" width="820">
+  <br><sub><em>Every machine you've signed in shows up here with live status — online, latency, CPU, memory.</em></sub>
+</p>
 
 ---
 
@@ -77,6 +87,10 @@ quick remote help. No sign-in required; the token *is* the key (see
 
 Both modes give you the multi-tab terminal and file transfer; they differ only in
 *who* can connect and how long shells stick around.
+
+<p align="center">
+  <img src="docs/landing.png" alt="The Switchboard landing page: sign in with GitHub, or paste a one-off token" width="720">
+</p>
 
 ---
 
