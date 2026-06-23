@@ -51,9 +51,10 @@ function printHelp() {
   console.log(`Switchboard — expose this machine's shell to a Switchboard relay.
 
 Usage:
-  switchboard [options]        Expose this shell. Bound to your account if logged in,
-                               otherwise anonymous (a one-off token).
-  switchboard login            Sign in via browser; bind this machine to your account.
+  switchboard login            Sign in via browser, then expose this machine's shell
+                               under your account — one step.
+  switchboard [options]        Expose this shell using saved credentials, or an
+                               anonymous one-off token if not signed in.
   switchboard logout           Remove the stored account credential.
 
 Options:
@@ -147,9 +148,8 @@ async function doLogin() {
       c.login = r.login;
       if (!c.machineId) c.machineId = crypto.randomUUID();
       saveConfig(c);
-      console.log(`\n\n✓ Signed in as ${r.login}. This machine is bound to your account.`);
-      console.log("  Run `switchboard` to expose its shell; see your machines at " + SERVER + "\n");
-      process.exit(0);
+      console.log(`\n\n✓ Signed in as ${r.login}. Exposing this machine's shell…\n`);
+      return; // fall through to start the daemon (login is one step: sign in + expose)
     }
     if (r.status === "denied") { console.error("\nAuthorization was denied."); process.exit(1); }
   }
@@ -163,40 +163,40 @@ function doLogout() {
   process.exit(0);
 }
 
-if (sub === "logout") doLogout();
-if (sub === "login") doLogin(); // async; the process stays alive until it resolves
-
-// ---- run mode: bound (logged in) vs anonymous (token) --------------------
-const cfg = loadConfig();
-const BOUND = !!cfg.agentToken && !args.token;
-
+// Connection state, resolved by setupConnection() at startup — after any login —
+// so it picks up freshly-saved credentials.
+let cfg = loadConfig();
+let BOUND = false;
 let TOKEN = null, MACHINE = null, AGENT = null, wsUrl, browseUrl;
-if (BOUND) {
-  MACHINE = cfg.machineId || crypto.randomUUID();
-  if (!cfg.machineId) { cfg.machineId = MACHINE; saveConfig(cfg); }
-  AGENT = cfg.agentToken;
-  wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&machine=" + encodeURIComponent(MACHINE) +
-    "&name=" + encodeURIComponent(os.hostname());
-  browseUrl = SERVER + "/";
-} else {
-  // 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
-  TOKEN = args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN ||
-    crypto.randomBytes(32).toString("base64url");
-  if (TOKEN.length < MIN_TOKEN_LEN) {
-    console.error(`ERROR: token must be at least ${MIN_TOKEN_LEN} characters (got ${TOKEN.length}).`);
-    process.exit(1);
-  }
-  wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&token=" + encodeURIComponent(TOKEN);
-  browseUrl = SERVER + "/?token=" + encodeURIComponent(TOKEN);
-}
 
 const SHELL =
   args.shell || process.env.SWITCHBOARD_SHELL || process.env.WEBTERM_SHELL || process.env.SHELL ||
   (process.platform === "win32" ? "powershell.exe" : "bash");
 
-// node-pty's macOS spawn-helper can lose its +x bit when the prebuild is
-// extracted; re-assert it right before we need it so a fresh install works.
-fixPtyPerms();
+function setupConnection() {
+  BOUND = !!cfg.agentToken && !args.token;
+  if (BOUND) {
+    MACHINE = cfg.machineId || crypto.randomUUID();
+    if (!cfg.machineId) { cfg.machineId = MACHINE; saveConfig(cfg); }
+    AGENT = cfg.agentToken;
+    wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&machine=" + encodeURIComponent(MACHINE) +
+      "&name=" + encodeURIComponent(os.hostname());
+    browseUrl = SERVER + "/";
+  } else {
+    // 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
+    TOKEN = args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN ||
+      crypto.randomBytes(32).toString("base64url");
+    if (TOKEN.length < MIN_TOKEN_LEN) {
+      console.error(`ERROR: token must be at least ${MIN_TOKEN_LEN} characters (got ${TOKEN.length}).`);
+      process.exit(1);
+    }
+    wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&token=" + encodeURIComponent(TOKEN);
+    browseUrl = SERVER + "/?token=" + encodeURIComponent(TOKEN);
+  }
+  // node-pty's macOS spawn-helper can lose its +x bit when the prebuild is
+  // extracted; re-assert it right before we need it so a fresh install works.
+  fixPtyPerms();
+}
 
 // ---- sessions ------------------------------------------------------------
 // One PTY per browser window. Each window carries a session id (sid); a reload
@@ -563,16 +563,21 @@ function sendStats() {
 }
 
 // ---- start ---------------------------------------------------------------
-// Skipped for `login`/`logout` subcommands (those run above and exit).
-if (!sub) {
+(async function main() {
+  if (sub === "logout") return doLogout(); // remove creds and exit
+  if (sub === "login") {
+    // One step: sign in, then fall through to expose this machine's shell.
+    await doLogin(); // saves config; fatal-exits on failure
+    cfg = loadConfig();
+  }
+  setupConnection();
   refreshMemAvailable();
   setInterval(sendStats, 2000);
   log(`connecting to ${SERVER} …`);
   connect();
-
   process.on("SIGINT", () => {
     log("shutting down.");
     for (const sid of sessions.keys()) killSession(sid);
     process.exit(0);
   });
-}
+})();
