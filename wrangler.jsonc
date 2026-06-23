@@ -11,12 +11,21 @@
     "directory": "./public"
   },
 
-  // One Durable Object class — the per-token relay room.
+  // One Durable Object class — the per-circuit relay (per token or per machine).
   "durable_objects": {
     "bindings": [
       { "name": "CIRCUIT", "class_name": "Circuit" }
     ]
   },
+
+  // D1 registry: accounts' machines, agent tokens, CLI-login handshake.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "switchboard_db",
+      "database_id": "1cd7072b-5e4b-49f5-88b8-1718f5d887d8"
+    }
+  ],
 
   // SQLite-backed DO so this also runs on the free Workers plan. The relay keeps
   // no persistent storage; it only needs the DO for in-memory WebSocket coordination.

@@ -43,18 +43,21 @@ function ts() {
 const log = (...a) => console.log(`[${ts()}]`, ...a);
 const logErr = (...a) => console.error(`[${ts()}]`, ...a);
 
-const DEFAULT_SERVER = "http://localhost:8787";
+const DEFAULT_SERVER = "https://shell.lfkdsk.org";
 const MIN_TOKEN_LEN = 24; // reject weak custom tokens; the generated one is ~43 chars
 
 // ---- CLI -----------------------------------------------------------------
 function printHelp() {
-  console.log(`Switchboard daemon — expose this machine's shell to a Switchboard relay.
+  console.log(`Switchboard — expose this machine's shell to a Switchboard relay.
 
 Usage:
-  switchboard [options]
+  switchboard [options]        Expose this shell. Bound to your account if logged in,
+                               otherwise anonymous (a one-off token).
+  switchboard login            Sign in via browser; bind this machine to your account.
+  switchboard logout           Remove the stored account credential.
 
 Options:
-  -t, --token <token>   Use a specific token (min ${MIN_TOKEN_LEN} chars). Default: random 256-bit.
+  -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
   -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
   -v, --version         Print version and exit.
@@ -64,8 +67,8 @@ Environment (overridden by the flags above):
   SWITCHBOARD_TOKEN, SWITCHBOARD_SERVER, SWITCHBOARD_SHELL  (WEBTERM_* also accepted)
 
 Notes:
-  The token is the credential — anyone who has it gets a shell on this host.
-  Startup aborts if the chosen token is already in use by another daemon.`);
+  Logged in → this machine shows up in your dashboard; only you can open its shell.
+  Anonymous → the token is the credential; anyone who has it gets a shell here.`);
 }
 
 function parseArgs(argv) {
@@ -90,27 +93,106 @@ function parseArgs(argv) {
   return opts;
 }
 
-const args = parseArgs(process.argv.slice(2));
+const rawArgs = process.argv.slice(2);
+const sub = rawArgs[0] === "login" || rawArgs[0] === "logout" ? rawArgs.shift() : null;
+const args = parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
 
 const SERVER = (args.server || process.env.SWITCHBOARD_SERVER || process.env.WEBTERM_SERVER || DEFAULT_SERVER)
   .replace(/\/+$/, "");
 
-// 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
-const TOKEN =
-  args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN ||
-  crypto.randomBytes(32).toString("base64url");
-if (TOKEN.length < MIN_TOKEN_LEN) {
-  console.error(`ERROR: token must be at least ${MIN_TOKEN_LEN} characters (got ${TOKEN.length}).`);
-  process.exit(1);
+// ---- account config (~/.switchboard/config.json) -------------------------
+const CONFIG_DIR = path.join(os.homedir(), ".switchboard");
+const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+function loadConfig() { try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; } }
+function saveConfig(cfg) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  } catch (e) { logErr("could not save config: " + e.message); }
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function openBrowser(url) {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? 'start ""' : "xdg-open";
+  try { exec(`${cmd} "${url}"`); } catch { /* best-effort; the URL is printed too */ }
+}
+
+// `switchboard login` — browser-redirect auth that binds this machine to your account.
+async function doLogin() {
+  const state = crypto.randomBytes(16).toString("hex");
+  const verifier = crypto.randomBytes(32).toString("hex");
+  const verifierHash = crypto.createHash("sha256").update(verifier).digest("hex");
+  try {
+    await fetch(SERVER + "/cli/start", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ state, verifier_hash: verifierHash }),
+    });
+  } catch (e) { console.error("Could not reach relay at " + SERVER + ": " + e.message); process.exit(1); }
+  const loginUrl = SERVER + "/cli-login?state=" + encodeURIComponent(state);
+  console.log("\nTo authorize this machine, open this URL and sign in:\n\n  " + loginUrl + "\n");
+  openBrowser(loginUrl);
+  process.stdout.write("Waiting for authorization");
+  const deadline = Date.now() + 300000;
+  while (Date.now() < deadline) {
+    await sleep(2000);
+    process.stdout.write(".");
+    let r;
+    try { r = await (await fetch(`${SERVER}/cli/poll?state=${encodeURIComponent(state)}&verifier=${encodeURIComponent(verifier)}`)).json(); }
+    catch { continue; }
+    if (r.status === "ready") {
+      const c = loadConfig();
+      c.server = SERVER;
+      c.agentToken = r.agentToken;
+      c.login = r.login;
+      if (!c.machineId) c.machineId = crypto.randomUUID();
+      saveConfig(c);
+      console.log(`\n\n✓ Signed in as ${r.login}. This machine is bound to your account.`);
+      console.log("  Run `switchboard` to expose its shell; see your machines at " + SERVER + "\n");
+      process.exit(0);
+    }
+    if (r.status === "denied") { console.error("\nAuthorization was denied."); process.exit(1); }
+  }
+  console.error("\nTimed out waiting for authorization."); process.exit(1);
+}
+function doLogout() {
+  const c = loadConfig();
+  delete c.agentToken; delete c.login;
+  saveConfig(c);
+  console.log("Logged out. (Account credential removed; machine id kept for re-login.)");
+  process.exit(0);
+}
+
+if (sub === "logout") doLogout();
+if (sub === "login") doLogin(); // async; the process stays alive until it resolves
+
+// ---- run mode: bound (logged in) vs anonymous (token) --------------------
+const cfg = loadConfig();
+const BOUND = !!cfg.agentToken && !args.token;
+
+let TOKEN = null, MACHINE = null, AGENT = null, wsUrl, browseUrl;
+if (BOUND) {
+  MACHINE = cfg.machineId || crypto.randomUUID();
+  if (!cfg.machineId) { cfg.machineId = MACHINE; saveConfig(cfg); }
+  AGENT = cfg.agentToken;
+  wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&machine=" + encodeURIComponent(MACHINE) +
+    "&name=" + encodeURIComponent(os.hostname());
+  browseUrl = SERVER + "/";
+} else {
+  // 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
+  TOKEN = args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN ||
+    crypto.randomBytes(32).toString("base64url");
+  if (TOKEN.length < MIN_TOKEN_LEN) {
+    console.error(`ERROR: token must be at least ${MIN_TOKEN_LEN} characters (got ${TOKEN.length}).`);
+    process.exit(1);
+  }
+  wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&token=" + encodeURIComponent(TOKEN);
+  browseUrl = SERVER + "/?token=" + encodeURIComponent(TOKEN);
+}
+
 const SHELL =
   args.shell || process.env.SWITCHBOARD_SHELL || process.env.WEBTERM_SHELL || process.env.SHELL ||
   (process.platform === "win32" ? "powershell.exe" : "bash");
-
-const wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&token=" + encodeURIComponent(TOKEN);
-const browseUrl = SERVER + "/?token=" + encodeURIComponent(TOKEN);
 
 // node-pty's macOS spawn-helper can lose its +x bit when the prebuild is
 // extracted; re-assert it right before we need it so a fresh install works.
@@ -186,12 +268,20 @@ function scheduleSessionCleanup(sid) {
 function banner() {
   const line = "─".repeat(58);
   console.log(`\n┌${line}┐`);
-  console.log("  Switchboard daemon is live on " + os.hostname());
+  console.log("  Switchboard is live on " + os.hostname());
   console.log("");
-  console.log("  Token : " + TOKEN);
-  console.log("  Open  : " + browseUrl);
-  console.log("");
-  console.log("  Anyone with this token gets a shell on this machine.");
+  if (BOUND) {
+    console.log("  Account : " + (cfg.login || "(signed in)"));
+    console.log("  Machine : " + MACHINE);
+    console.log("  Open    : " + browseUrl + "   (your dashboard)");
+    console.log("");
+    console.log("  Signed in — only you can open this machine's shell.");
+  } else {
+    console.log("  Token : " + TOKEN);
+    console.log("  Open  : " + browseUrl);
+    console.log("");
+    console.log("  Anyone with this token gets a shell on this machine.");
+  }
   console.log(`└${line}┘\n`);
 }
 
@@ -207,7 +297,7 @@ function sendCtl(obj) {
 }
 
 function connect() {
-  ws = new WebSocket(wsUrl);
+  ws = new WebSocket(wsUrl, AGENT ? { headers: { "x-switchboard-agent": AGENT } } : undefined);
 
   ws.on("open", () => {
     reconnectDelay = 1000;
@@ -215,12 +305,21 @@ function connect() {
     log("[relay] connected");
   });
 
-  // The relay rejects a second daemon on the same token with HTTP 409 — fatal.
+  // Fatal server responses: 409 (another daemon on this circuit) and, in bound
+  // mode, 401/403 (expired/invalid login). Retrying these would never succeed.
   ws.on("unexpected-response", (_req, res) => {
     if (res.statusCode === 409) {
       console.error(
-        "\nERROR: this token is already in use by another daemon on the relay.\n" +
-          "       Choose a different token (--token <value>) or stop the other one."
+        "\nERROR: this " + (BOUND ? "machine" : "token") + " already has a daemon connected on the relay.\n" +
+          "       Stop the other one" + (BOUND ? "." : ", or choose a different --token.")
+      );
+      for (const sid of sessions.keys()) killSession(sid);
+      process.exit(1);
+    }
+    if (res.statusCode === 401 || res.statusCode === 403) {
+      console.error(
+        `\nERROR: relay rejected this machine (${res.statusCode}). ` +
+          "Your login may have expired — run `switchboard login` again."
       );
       for (const sid of sessions.keys()) killSession(sid);
       process.exit(1);
@@ -464,13 +563,16 @@ function sendStats() {
 }
 
 // ---- start ---------------------------------------------------------------
-refreshMemAvailable();
-setInterval(sendStats, 2000);
-log(`connecting to ${SERVER} …`);
-connect();
+// Skipped for `login`/`logout` subcommands (those run above and exit).
+if (!sub) {
+  refreshMemAvailable();
+  setInterval(sendStats, 2000);
+  log(`connecting to ${SERVER} …`);
+  connect();
 
-process.on("SIGINT", () => {
-  log("shutting down.");
-  for (const sid of sessions.keys()) killSession(sid);
-  process.exit(0);
-});
+  process.on("SIGINT", () => {
+    log("shutting down.");
+    for (const sid of sessions.keys()) killSession(sid);
+    process.exit(0);
+  });
+}
