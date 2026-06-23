@@ -1,11 +1,11 @@
 {
-  "name": "switchboard-daemon",
+  "name": "@switchboard/cli",
   "version": "1.0.0",
   "private": true,
-  "description": "Switchboard host agent — exposes this machine's shell to a Switchboard relay.",
+  "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay.",
   "license": "MIT",
   "bin": {
-    "switchboard-daemon": "index.js"
+    "switchboard": "index.js"
   },
   "type": "commonjs",
   "engines": {

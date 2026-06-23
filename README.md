@@ -9,8 +9,8 @@ clean reimplementation of [`@elsetech/webterm`](https://www.npmjs.com/package/@e
 Two parts live in this repo:
 - **relay** (repo root) — a Cloudflare Worker + Durable Object that pairs a daemon
   with browser(s) by token; a drop-in replacement for `webterm.elsetech.app`.
-- **daemon** (`daemon/`) — the host agent that spawns your shell and dials out to
-  the relay; wire-compatible with the original `@elsetech/webterm`.
+- **cli** (`cli/`, package `@switchboard/cli`) — the host agent that spawns your
+  shell and dials out to the relay; wire-compatible with the original `@elsetech/webterm`.
 
 Think of it as an old telephone switchboard: each **token is a circuit**, and the
 operator (the Worker + Durable Object) patches the daemon's line to the browser's.
@@ -38,8 +38,8 @@ token and shovels frames between them. It never parses the terminal payloads.
 | `src/index.js` | Worker entry + `Circuit` Durable Object (the relay) |
 | `public/index.html` | The browser terminal (xterm.js, self-contained) |
 | `wrangler.jsonc` | Cloudflare config (DO binding, migration, static assets) |
-| `daemon/index.js` | Host daemon — spawns your shell, dials out to the relay |
-| `daemon/scripts/fix-pty-perms.js` | node-pty macOS spawn-helper fix (postinstall) |
+| `cli/index.js` | Host CLI (`@switchboard/cli`) — spawns your shell, dials out to the relay |
+| `cli/scripts/fix-pty-perms.js` | node-pty macOS spawn-helper fix (postinstall) |
 
 ## Deploy
 
@@ -55,7 +55,7 @@ Wrangler prints the deployed URL, e.g. `https://switchboard.<your-subdomain>.wor
 Then run the host daemon (in this repo) pointing at it:
 
 ```bash
-cd daemon && npm install
+cd cli && npm install
 node index.js --server https://switchboard.<your-subdomain>.workers.dev
 # the original is wire-compatible too:
 # npx @elsetech/webterm --server https://switchboard.<your-subdomain>.workers.dev
@@ -78,8 +78,8 @@ To serve it at `switchboard.example.com`, add a route in the Cloudflare dashboar
 
 ```bash
 npm run dev               # wrangler dev, defaults to http://localhost:8787
-# in another terminal — our daemon defaults to localhost:8787, so just:
-cd daemon && npm install && node index.js
+# in another terminal — the CLI defaults to localhost:8787, so just:
+cd cli && npm install && node index.js
 ```
 
 The daemon rewrites `http→ws` automatically, so `http://localhost:8787` works.

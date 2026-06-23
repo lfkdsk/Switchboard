@@ -32,5 +32,5 @@ module.exports = fixPtyPerms;
 
 if (require.main === module) {
   const fixed = fixPtyPerms();
-  if (fixed) console.log("[switchboard-daemon] chmod +x " + fixed);
+  if (fixed) console.log("[switchboard] chmod +x " + fixed);
 }

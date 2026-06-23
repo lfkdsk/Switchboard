@@ -51,7 +51,7 @@ function printHelp() {
   console.log(`Switchboard daemon — expose this machine's shell to a Switchboard relay.
 
 Usage:
-  switchboard-daemon [options]
+  switchboard [options]
 
 Options:
   -t, --token <token>   Use a specific token (min ${MIN_TOKEN_LEN} chars). Default: random 256-bit.
