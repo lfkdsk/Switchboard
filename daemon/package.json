@@ -1,0 +1,22 @@
+{
+  "name": "switchboard-daemon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Switchboard host agent — exposes this machine's shell to a Switchboard relay.",
+  "license": "MIT",
+  "bin": {
+    "switchboard-daemon": "index.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "node scripts/fix-pty-perms.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0"
+  }
+}

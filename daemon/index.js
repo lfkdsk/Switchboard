@@ -1,0 +1,476 @@
+#!/usr/bin/env node
+/**
+ * Switchboard daemon — run this on the host machine you want to reach.
+ *
+ * It spawns a PTY (your shell) and dials OUT over WebSocket to a Switchboard
+ * relay. A browser that opens the relay URL and presents the same token gets a
+ * full interactive terminal on this machine. Because both ends dial out, this
+ * works from behind NAT / firewalls with no inbound ports.
+ *
+ * This is a clean reimplementation of the @elsetech/webterm daemon (MIT),
+ * speaking the same wire protocol as our Switchboard relay so the two ends are
+ * developed together and protocol-level features (E2E, port-forwarding, …) can
+ * be added on both sides at once.
+ *
+ * Options (flags override env vars):
+ *   -t, --token <token>   Use a specific token (min 24 chars). Default: random 256-bit.
+ *   -s, --server <url>    Relay origin. Default: http://localhost:8787 (dev).
+ *       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
+ *   -v, --version         Print version and exit.
+ *   -h, --help            Show help and exit.
+ *
+ * Env vars: SWITCHBOARD_TOKEN, SWITCHBOARD_SERVER, SWITCHBOARD_SHELL
+ *           (WEBTERM_* are also accepted for drop-in compatibility.)
+ */
+
+const crypto = require("crypto");
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
+const { exec } = require("child_process");
+const WebSocket = require("ws");
+const pty = require("node-pty");
+const fixPtyPerms = require("./scripts/fix-pty-perms");
+const pkg = require("./package.json");
+
+// ---- logging -------------------------------------------------------------
+function ts() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+const log = (...a) => console.log(`[${ts()}]`, ...a);
+const logErr = (...a) => console.error(`[${ts()}]`, ...a);
+
+const DEFAULT_SERVER = "http://localhost:8787";
+const MIN_TOKEN_LEN = 24; // reject weak custom tokens; the generated one is ~43 chars
+
+// ---- CLI -----------------------------------------------------------------
+function printHelp() {
+  console.log(`Switchboard daemon — expose this machine's shell to a Switchboard relay.
+
+Usage:
+  switchboard-daemon [options]
+
+Options:
+  -t, --token <token>   Use a specific token (min ${MIN_TOKEN_LEN} chars). Default: random 256-bit.
+  -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
+      --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
+  -v, --version         Print version and exit.
+  -h, --help            Show this help and exit.
+
+Environment (overridden by the flags above):
+  SWITCHBOARD_TOKEN, SWITCHBOARD_SERVER, SWITCHBOARD_SHELL  (WEBTERM_* also accepted)
+
+Notes:
+  The token is the credential — anyone who has it gets a shell on this host.
+  Startup aborts if the chosen token is already in use by another daemon.`);
+}
+
+function parseArgs(argv) {
+  const opts = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const eq = a.indexOf("=");
+    const inline = eq > -1 ? a.slice(eq + 1) : null;
+    const name = eq > -1 ? a.slice(0, eq) : a;
+    switch (name) {
+      case "-h": case "--help": opts.help = true; break;
+      case "-v": case "--version": opts.version = true; break;
+      case "-t": case "--token": opts.token = inline !== null ? inline : argv[++i]; break;
+      case "-s": case "--server": opts.server = inline !== null ? inline : argv[++i]; break;
+      case "--shell": opts.shell = inline !== null ? inline : argv[++i]; break;
+      default:
+        console.error(`Unknown option: ${a}\n`);
+        printHelp();
+        process.exit(1);
+    }
+  }
+  return opts;
+}
+
+const args = parseArgs(process.argv.slice(2));
+if (args.help) { printHelp(); process.exit(0); }
+if (args.version) { console.log(pkg.version); process.exit(0); }
+
+const SERVER = (args.server || process.env.SWITCHBOARD_SERVER || process.env.WEBTERM_SERVER || DEFAULT_SERVER)
+  .replace(/\/+$/, "");
+
+// 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
+const TOKEN =
+  args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN ||
+  crypto.randomBytes(32).toString("base64url");
+if (TOKEN.length < MIN_TOKEN_LEN) {
+  console.error(`ERROR: token must be at least ${MIN_TOKEN_LEN} characters (got ${TOKEN.length}).`);
+  process.exit(1);
+}
+const SHELL =
+  args.shell || process.env.SWITCHBOARD_SHELL || process.env.WEBTERM_SHELL || process.env.SHELL ||
+  (process.platform === "win32" ? "powershell.exe" : "bash");
+
+const wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&token=" + encodeURIComponent(TOKEN);
+const browseUrl = SERVER + "/?token=" + encodeURIComponent(TOKEN);
+
+// node-pty's macOS spawn-helper can lose its +x bit when the prebuild is
+// extracted; re-assert it right before we need it so a fresh install works.
+fixPtyPerms();
+
+// ---- sessions ------------------------------------------------------------
+// One PTY per browser window. Each window carries a session id (sid); a reload
+// reuses its sid and resumes, a new window gets a fresh sid and its own shell.
+// Sessions outlive relay reconnects so a flaky link or tab reload doesn't lose
+// work.
+const sessions = new Map(); // sid -> { pty, graceTimer }
+const SESSION_GRACE_MS = 60000;
+
+// Binary frame format shared with the relay/browser:
+//   [1 byte sid length][sid utf8 bytes][payload bytes]
+function encodeFrame(sid, payloadBuf) {
+  const sidBuf = Buffer.from(sid, "utf8");
+  return Buffer.concat([Buffer.from([sidBuf.length]), sidBuf, payloadBuf]);
+}
+function sendSessionData(sid, str) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(encodeFrame(sid, Buffer.from(str, "utf8")), { binary: true });
+  }
+}
+
+function openSession(sid, cols, rows) {
+  let s = sessions.get(sid);
+  if (s) {
+    if (s.graceTimer) { clearTimeout(s.graceTimer); s.graceTimer = null; }
+    if (cols > 0 && rows > 0) { try { s.pty.resize(cols, rows); } catch {} }
+    s.pty.write("\f"); // Ctrl-L: redraw so a reattached window sees a prompt
+    return s;
+  }
+  const p = pty.spawn(SHELL, [], {
+    name: "xterm-color",
+    cols: cols > 0 ? cols : 80,
+    rows: rows > 0 ? rows : 24,
+    cwd: process.env.HOME || process.cwd(),
+    env: process.env,
+  });
+  s = { pty: p, graceTimer: null };
+  sessions.set(sid, s);
+  p.onData((d) => sendSessionData(sid, d));
+  p.onExit(({ exitCode }) => {
+    sessions.delete(sid);
+    sendCtl({ type: "exit", sid, code: exitCode });
+    log(`[session ${sid}] shell exited (${exitCode})`);
+  });
+  log(`[session ${sid}] shell started (pid ${p.pid})`);
+  return s;
+}
+
+function killSession(sid) {
+  const s = sessions.get(sid);
+  if (!s) return;
+  if (s.graceTimer) clearTimeout(s.graceTimer);
+  sessions.delete(sid);
+  try { s.pty.kill(); } catch {}
+}
+
+// A window's socket dropped: keep its shell briefly so a reload can reattach.
+function scheduleSessionCleanup(sid) {
+  const s = sessions.get(sid);
+  if (!s) return;
+  if (s.graceTimer) clearTimeout(s.graceTimer);
+  s.graceTimer = setTimeout(() => {
+    log(`[session ${sid}] no reconnect within grace window, closing`);
+    killSession(sid);
+  }, SESSION_GRACE_MS);
+}
+
+// ---- banner --------------------------------------------------------------
+function banner() {
+  const line = "─".repeat(58);
+  console.log(`\n┌${line}┐`);
+  console.log("  Switchboard daemon is live on " + os.hostname());
+  console.log("");
+  console.log("  Token : " + TOKEN);
+  console.log("  Open  : " + browseUrl);
+  console.log("");
+  console.log("  Anyone with this token gets a shell on this machine.");
+  console.log(`└${line}┘\n`);
+}
+
+// ---- relay connection ----------------------------------------------------
+let ws = null;
+let reconnectDelay = 1000;
+let announced = false;
+const activeDownloads = new Map(); // id -> fs.ReadStream
+const activeUploads = new Map(); // id -> { stream, finalPath }
+
+function sendCtl(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function connect() {
+  ws = new WebSocket(wsUrl);
+
+  ws.on("open", () => {
+    reconnectDelay = 1000;
+    if (!announced) { banner(); announced = true; }
+    log("[relay] connected");
+  });
+
+  // The relay rejects a second daemon on the same token with HTTP 409 — fatal.
+  ws.on("unexpected-response", (_req, res) => {
+    if (res.statusCode === 409) {
+      console.error(
+        "\nERROR: this token is already in use by another daemon on the relay.\n" +
+          "       Choose a different token (--token <value>) or stop the other one."
+      );
+      for (const sid of sessions.keys()) killSession(sid);
+      process.exit(1);
+    }
+    log(`[relay] server responded ${res.statusCode}; will retry`);
+    res.resume();
+  });
+
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) {
+      // Keystrokes from a window: [1-byte sid length][sid][payload].
+      const sidLen = data[0];
+      const sid = data.toString("utf8", 1, 1 + sidLen);
+      const s = sessions.get(sid);
+      if (s) s.pty.write(data.subarray(1 + sidLen).toString("utf8"));
+      return;
+    }
+    let msg;
+    try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+    switch (msg.type) {
+      case "open":
+        openSession(msg.sid, msg.cols, msg.rows);
+        sendStats();
+        break;
+      case "resize": {
+        if (!(msg.cols > 0 && msg.rows > 0)) break;
+        const s = sessions.get(msg.sid);
+        if (s) try { s.pty.resize(msg.cols, msg.rows); } catch {}
+        break;
+      }
+      case "client-gone": scheduleSessionCleanup(msg.sid); break;
+      case "dl-open": startDownload(msg.id, msg.path); break;
+      case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
+      case "ul-chunk": uploadChunk(msg.id, msg.data); break;
+      case "ul-end": endUpload(msg.id); break;
+      case "peer-status": log("[relay] browser " + (msg.online ? "connected" : "disconnected")); break;
+    }
+  });
+
+  ws.on("close", () => {
+    // Sessions are kept across reconnects; their onData handlers check ws state.
+    for (const stream of activeDownloads.values()) stream.destroy();
+    activeDownloads.clear();
+    for (const up of activeUploads.values()) up.stream.destroy();
+    activeUploads.clear();
+    log(`[relay] disconnected, retrying in ${reconnectDelay}ms`);
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  });
+
+  ws.on("error", (err) => {
+    logErr("[relay] error: " + err.message);
+    ws.close();
+  });
+}
+
+// ---- file transfer -------------------------------------------------------
+// Best-effort cwd of a window's shell, so uploads land where the user is.
+function getShellCwd(sid, cb) {
+  const fallback = () => process.env.HOME || process.cwd();
+  const s = sessions.get(sid);
+  const pid = s ? s.pty.pid : null;
+  if (!pid) return cb(fallback());
+  if (process.platform === "linux") {
+    fs.readlink(`/proc/${pid}/cwd`, (err, dir) => cb(!err && dir ? dir : fallback()));
+  } else if (process.platform === "darwin") {
+    exec(`lsof -a -d cwd -p ${pid} -Fn`, (err, out) => {
+      if (err) return cb(fallback());
+      const line = out.split("\n").find((l) => l.startsWith("n"));
+      cb(line ? line.slice(1) : fallback());
+    });
+  } else {
+    cb(fallback());
+  }
+}
+
+// Open for writing without clobbering: on a name clash, insert -1, -2, … before
+// the extension. "wx" makes the check-and-create atomic.
+function openUniqueFile(dir, name) {
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  let candidate = path.join(dir, name);
+  for (let n = 1; n < 100000; n++) {
+    try {
+      const fd = fs.openSync(candidate, "wx", 0o644);
+      return { fd, finalPath: candidate };
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      candidate = path.join(dir, `${stem}-${n}${ext}`);
+    }
+  }
+  throw new Error("too many name collisions");
+}
+
+function startUpload(id, sid, name) {
+  getShellCwd(sid, (dir) => {
+    const safe = path.basename(String(name || "")).trim() || "upload";
+    let opened;
+    try {
+      opened = openUniqueFile(dir, safe);
+    } catch (e) {
+      sendCtl({ type: "ul-error", id, message: e.message });
+      return;
+    }
+    const stream = fs.createWriteStream(null, { fd: opened.fd });
+    activeUploads.set(id, { stream, finalPath: opened.finalPath });
+    stream.on("error", (e) => {
+      activeUploads.delete(id);
+      sendCtl({ type: "ul-error", id, message: e.message });
+    });
+    sendCtl({ type: "ul-ready", id });
+  });
+}
+
+function uploadChunk(id, b64) {
+  const up = activeUploads.get(id);
+  if (up) up.stream.write(Buffer.from(b64, "base64"));
+}
+
+function endUpload(id) {
+  const up = activeUploads.get(id);
+  if (!up) return;
+  up.stream.end(() => {
+    activeUploads.delete(id);
+    sendCtl({ type: "ul-done", id, path: up.finalPath, name: path.basename(up.finalPath) });
+    log(`[file] received ${up.finalPath}`);
+  });
+}
+
+// Stream a host file to the browser as base64 chunks, with backpressure.
+function startDownload(id, rawPath) {
+  if (!rawPath) {
+    sendCtl({ type: "dl-error", id, message: "no path given" });
+    return;
+  }
+  let filePath = rawPath;
+  if (filePath === "~" || filePath.startsWith("~/")) {
+    filePath = path.join(os.homedir(), filePath.slice(1));
+  }
+  filePath = path.resolve(filePath);
+
+  fs.stat(filePath, (err, st) => {
+    if (err) {
+      sendCtl({ type: "dl-error", id, message: err.code === "ENOENT" ? "no such file" : err.message });
+      return;
+    }
+    if (st.isDirectory()) {
+      sendCtl({ type: "dl-error", id, message: "path is a directory" });
+      return;
+    }
+    sendCtl({ type: "dl-meta", id, name: path.basename(filePath), size: st.size, mime: "application/octet-stream" });
+
+    const stream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
+    activeDownloads.set(id, stream);
+    stream.on("data", (chunk) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { stream.destroy(); return; }
+      stream.pause(); // resume once this chunk has flushed -> backpressure
+      ws.send(JSON.stringify({ type: "dl-chunk", id, data: chunk.toString("base64") }), () => {
+        if (ws && ws.readyState === WebSocket.OPEN) stream.resume();
+      });
+    });
+    stream.on("end", () => {
+      activeDownloads.delete(id);
+      sendCtl({ type: "dl-end", id });
+      log(`[file] sent ${filePath} (${st.size} bytes)`);
+    });
+    stream.on("error", (e) => {
+      activeDownloads.delete(id);
+      sendCtl({ type: "dl-error", id, message: e.message });
+    });
+  });
+}
+
+// ---- host metrics --------------------------------------------------------
+let prevCpu = cpuSample();
+function cpuSample() {
+  let idle = 0, total = 0;
+  for (const c of os.cpus()) {
+    for (const k in c.times) total += c.times[k];
+    idle += c.times.idle;
+  }
+  return { idle, total };
+}
+function cpuUsage() {
+  const cur = cpuSample();
+  const idleDiff = cur.idle - prevCpu.idle;
+  const totalDiff = cur.total - prevCpu.total;
+  prevCpu = cur;
+  if (totalDiff <= 0) return 0;
+  return Math.max(0, Math.min(1, 1 - idleDiff / totalDiff));
+}
+function primaryIp() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const i of list || []) {
+      if (i.family === "IPv4" && !i.internal) return i.address;
+    }
+  }
+  return "127.0.0.1";
+}
+
+// total - freemem overstates "used" (page cache etc.); track *available* memory.
+let memAvailable = os.freemem();
+function refreshMemAvailable() {
+  if (process.platform === "linux") {
+    try {
+      const m = /MemAvailable:\s+(\d+)\s*kB/.exec(fs.readFileSync("/proc/meminfo", "utf8"));
+      memAvailable = m ? parseInt(m[1], 10) * 1024 : os.freemem();
+    } catch { memAvailable = os.freemem(); }
+  } else if (process.platform === "darwin") {
+    exec("vm_stat", (err, out) => {
+      if (err) { memAvailable = os.freemem(); return; }
+      const pageSize = parseInt((/page size of (\d+)/.exec(out) || [])[1], 10) || 4096;
+      const pages = (re) => parseInt((re.exec(out) || [])[1], 10) || 0;
+      const reclaimable =
+        pages(/Pages free:\s+(\d+)/) +
+        pages(/Pages inactive:\s+(\d+)/) +
+        pages(/Pages speculative:\s+(\d+)/) +
+        pages(/Pages purgeable:\s+(\d+)/);
+      memAvailable = reclaimable * pageSize;
+    });
+  } else {
+    memAvailable = os.freemem(); // Windows os.freemem() already reports available
+  }
+}
+function sendStats() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  refreshMemAvailable();
+  const total = os.totalmem();
+  try {
+    ws.send(JSON.stringify({
+      type: "stats",
+      cpu: cpuUsage(),
+      memUsed: Math.max(0, Math.min(total, total - memAvailable)),
+      memTotal: total,
+      cores: os.cpus().length,
+      ip: primaryIp(),
+      host: os.hostname(),
+      platform: process.platform,
+    }));
+  } catch { /* peer gone */ }
+}
+
+// ---- start ---------------------------------------------------------------
+refreshMemAvailable();
+setInterval(sendStats, 2000);
+log(`connecting to ${SERVER} …`);
+connect();
+
+process.on("SIGINT", () => {
+  log("shutting down.");
+  for (const sid of sessions.keys()) killSession(sid);
+  process.exit(0);
+});

@@ -1,18 +1,24 @@
 # Switchboard
 
-A self-hosted, drop-in replacement for `webterm.elsetech.app` — the relay that
-the [`@elsetech/webterm`](https://www.npmjs.com/package/@elsetech/webterm) daemon
-dials out to. Deploy it to your own Cloudflare account and you no longer depend
-on anyone else's infrastructure.
+Self-hostable browser terminal: run a daemon on any machine and get a full
+interactive shell in your browser — from behind NAT, with no inbound ports. A
+clean reimplementation of [`@elsetech/webterm`](https://www.npmjs.com/package/@elsetech/webterm)
+— **both ends** — so you own the whole stack and can add protocol-level features
+(E2E, port-forwarding, …) on the relay and the daemon together.
+
+Two parts live in this repo:
+- **relay** (repo root) — a Cloudflare Worker + Durable Object that pairs a daemon
+  with browser(s) by token; a drop-in replacement for `webterm.elsetech.app`.
+- **daemon** (`daemon/`) — the host agent that spawns your shell and dials out to
+  the relay; wire-compatible with the original `@elsetech/webterm`.
 
 Think of it as an old telephone switchboard: each **token is a circuit**, and the
-operator (a Cloudflare Worker + Durable Object) patches the daemon's line to the
-browser's.
+operator (the Worker + Durable Object) patches the daemon's line to the browser's.
 
 ```
   your machine                         your Cloudflare account            any browser
  ┌──────────────┐   wss (dials out)   ┌───────────────────────────┐   wss   ┌──────────┐
- │  webterm     │ ──────────────────▶ │  Worker  +  Durable Object │ ◀────── │ xterm.js │
+ │  switchboard │ ──────────────────▶ │  Worker  +  Durable Object │ ◀────── │ xterm.js │
  │  daemon      │  /ws?role=daemon    │  (one Circuit per token)   │ browser │   page   │
  └──────────────┘                     └───────────────────────────┘         └──────────┘
 ```
@@ -32,6 +38,8 @@ token and shovels frames between them. It never parses the terminal payloads.
 | `src/index.js` | Worker entry + `Circuit` Durable Object (the relay) |
 | `public/index.html` | The browser terminal (xterm.js, self-contained) |
 | `wrangler.jsonc` | Cloudflare config (DO binding, migration, static assets) |
+| `daemon/index.js` | Host daemon — spawns your shell, dials out to the relay |
+| `daemon/scripts/fix-pty-perms.js` | node-pty macOS spawn-helper fix (postinstall) |
 
 ## Deploy
 
@@ -44,11 +52,13 @@ npm run deploy
 
 Wrangler prints the deployed URL, e.g. `https://switchboard.<your-subdomain>.workers.dev`.
 
-Then point the daemon at it:
+Then run the host daemon (in this repo) pointing at it:
 
 ```bash
-npx @elsetech/webterm --server https://switchboard.<your-subdomain>.workers.dev
-# or: WEBTERM_SERVER=https://switchboard.<your-subdomain>.workers.dev npx @elsetech/webterm
+cd daemon && npm install
+node index.js --server https://switchboard.<your-subdomain>.workers.dev
+# the original is wire-compatible too:
+# npx @elsetech/webterm --server https://switchboard.<your-subdomain>.workers.dev
 ```
 
 The daemon prints a token and an `Open:` URL on **your** domain. Open it (or
@@ -68,8 +78,8 @@ To serve it at `switchboard.example.com`, add a route in the Cloudflare dashboar
 
 ```bash
 npm run dev               # wrangler dev, defaults to http://localhost:8787
-# in another terminal:
-npx @elsetech/webterm --server http://localhost:8787
+# in another terminal — our daemon defaults to localhost:8787, so just:
+cd daemon && npm install && node index.js
 ```
 
 The daemon rewrites `http→ws` automatically, so `http://localhost:8787` works.
