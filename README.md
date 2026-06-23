@@ -1,143 +1,231 @@
 # Switchboard
 
-Self-hostable browser terminal: run a daemon on any machine and get a full
-interactive shell in your browser — from behind NAT, with no inbound ports. A
-clean reimplementation of [`@elsetech/webterm`](https://www.npmjs.com/package/@elsetech/webterm)
-— **both ends** — so you own the whole stack and can add protocol-level features
-(E2E, port-forwarding, …) on the relay and the daemon together.
+**A shell on any of your machines — right in your browser. No SSH config, no inbound ports, no VPN.**
 
-Two parts live in this repo:
-- **relay** (repo root) — a Cloudflare Worker + Durable Object that pairs a daemon
-  with browser(s) by token; a drop-in replacement for `webterm.elsetech.app`.
-- **cli** (`cli/`, package `@switch-board/cli`) — the host agent that spawns your
-  shell and dials out to the relay; wire-compatible with the original `@elsetech/webterm`.
+[![npm](https://img.shields.io/npm/v/@switch-board/cli?color=2f81f7&label=%40switch-board%2Fcli)](https://www.npmjs.com/package/@switch-board/cli)
+&nbsp;[![node](https://img.shields.io/node/v/@switch-board/cli?color=2ea043)](https://www.npmjs.com/package/@switch-board/cli)
+&nbsp;![runs on Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020)
 
-Think of it as an old telephone switchboard: each **token is a circuit**, and the
-operator (the Worker + Durable Object) patches the daemon's line to the browser's.
+Run one command on a machine and it shows up in your browser dashboard. Click it
+and you get a real interactive terminal — tabs, file transfer, live host
+stats — even when that machine sits behind NAT or a corporate firewall. Both the
+machine **and** the browser dial *out* to a Cloudflare relay, so there's nothing
+to port-forward and nothing to expose.
 
-```
-  your machine                         your Cloudflare account            any browser
- ┌──────────────┐   wss (dials out)   ┌───────────────────────────┐   wss   ┌──────────┐
- │  switchboard │ ──────────────────▶ │  Worker  +  Durable Object │ ◀────── │ xterm.js │
- │  daemon      │  /ws?role=daemon    │  (one Circuit per token)   │ browser │   page   │
- └──────────────┘                     └───────────────────────────┘         └──────────┘
-```
+> Think of an old telephone switchboard: every connection is a **circuit**, and
+> the operator — a Cloudflare Worker plus a Durable Object — patches your
+> machine's line straight through to your browser's.
 
-It is a **transparent forwarder**: it pairs the daemon and the browser(s) by
-token and shovels frames between them. It never parses the terminal payloads.
+---
 
-> ⚠️ Like the original, Switchboard is **not end-to-end encrypted** — TLS
-> terminates at the Worker, so the relay (i.e. you, the operator) can see the
-> plaintext stream. Self-hosting removes the third party, not the relay's
-> visibility. See [Security](#security).
+## Try it in 30 seconds
 
-## What's here
-
-| File | Purpose |
-| --- | --- |
-| `src/index.js` | Worker entry + `Circuit` Durable Object (the relay) |
-| `public/index.html` | The browser terminal (xterm.js, self-contained) |
-| `wrangler.jsonc` | Cloudflare config (DO binding, migration, static assets) |
-| `cli/index.js` | Host CLI (`@switch-board/cli`) — spawns your shell, dials out to the relay |
-| `cli/scripts/fix-pty-perms.js` | node-pty macOS spawn-helper fix (postinstall) |
-
-## Deploy
+No install, no deploy — this uses the hosted relay at **`shell.lfkdsk.org`**:
 
 ```bash
-cd Switchboard
+npx @switch-board/cli login
+```
+
+It opens your browser, signs you in with GitHub, and exposes this machine's shell
+under your account in one step. The dashboard URL it prints lists your machine —
+click **Open shell** and you're in.
+
+Just want to hand someone temporary access instead?
+
+```bash
+npx @switch-board/cli           # prints a one-off token + URL
+```
+
+Anyone you give that URL to gets a shell on the machine — handy for pairing or
+quick remote help. No sign-in required; the token *is* the key (see
+[Security](#security)).
+
+---
+
+## What you get
+
+- **🖥️ A real terminal in the browser** — full xterm.js: 256-color, resize,
+  scrollback, copy/paste. Not a log viewer — your actual shell.
+- **📊 All your machines, one dashboard** — sign in with GitHub and every machine
+  you've bound is listed with live status: online/offline, round-trip latency,
+  CPU, memory, and last-seen.
+- **🗂️ Multiple shells, tmux-style** — open as many tabs as you want on a single
+  machine. Shells survive tab reloads and flaky links; in account mode they keep
+  running even after you close the browser, so you can reattach right where you
+  left off.
+- **📁 Drag-and-drop file transfer** — drop a file onto the page to upload it
+  into the active shell's working directory, or pull any file off the host with a
+  click.
+- **🔌 Works behind NAT** — the daemon dials out over WebSocket. No inbound
+  ports, no firewall rules, no VPN, no tunnel to babysit.
+- **💤 Free at idle** — built on Cloudflare's hibernatable WebSockets, so idle
+  terminals cost nothing and the whole thing runs on the free Workers plan.
+- **🛠️ Self-hostable** — the relay is a few hundred lines of Worker code. Deploy
+  your own and own the entire stack end to end.
+
+---
+
+## Two ways to connect
+
+|                          | **Account** — `switchboard login`     | **Token** — `switchboard`              |
+| ------------------------ | ------------------------------------- | -------------------------------------- |
+| Sign-in                  | GitHub, once per machine              | none                                   |
+| Who can open the shell   | only you                              | anyone holding the token               |
+| Appears in the dashboard | ✅ with live stats                     | —                                      |
+| Shell lifetime           | persists — reattach anytime           | persists across reloads (60s grace)    |
+| Best for                 | your own machines                     | sharing · pairing · one-offs           |
+
+Both modes give you the multi-tab terminal and file transfer; they differ only in
+*who* can connect and how long shells stick around.
+
+---
+
+## How it works
+
+```
+       your machine(s)                  Cloudflare  (the operator)             your browser
+  ┌────────────────────────┐            ┌──────────────────────────┐
+  │  @switch-board/cli      │   wss      │  Worker + Durable Object │   wss    ┌────────────────┐
+  │  daemon  =  your shell  │ ─────────▶ │  "Circuit"  (one/token   │ ◀─────── │  xterm.js UI   │
+  │                         │  dials out │   or one/machine)        │ dials in │  + dashboard   │
+  └────────────────────────┘            │  + D1 account registry   │          └────────────────┘
+        no inbound ports                └──────────────────────────┘       tabs · files · stats
+```
+
+- Both ends **dial out** over WebSocket — keystrokes flow one way, terminal
+  output the other.
+- `idFromName(token-or-machine)` funnels every daemon and browser on the same
+  circuit into a single Durable Object — the operator that patches them together
+  and broadcasts host output to every open tab.
+- The relay is a **transparent forwarder**: it pairs the two ends and shovels
+  frames between them. It never parses your terminal payload.
+- A small **D1** database holds the account bookkeeping — which machines belong to
+  whom, hashed agent tokens, and the heartbeat that powers the live dashboard.
+  Terminal traffic never touches it.
+
+The repo ships **both ends** — relay and daemon — so protocol-level features
+(end-to-end encryption, port forwarding, …) can be built across the wire at once.
+The daemon is wire-compatible with [`@elsetech/webterm`](https://www.npmjs.com/package/@elsetech/webterm),
+which it's a clean reimplementation of.
+
+---
+
+## Self-host your own relay
+
+Want to own the stack? Deploy the relay to your own Cloudflare account:
+
+```bash
+git clone https://github.com/lfkdsk/Switchboard.git && cd Switchboard
 npm install
-npx wrangler login        # one-time, opens a browser
+npx wrangler login                                   # one-time, opens a browser
+
+# create the D1 registry and load the schema
+npx wrangler d1 create switchboard_db                # paste the printed id into wrangler.jsonc
+npx wrangler d1 execute switchboard_db --remote --file schema.sql
+
+npx wrangler secret put SESSION_SECRET               # any long random string
 npm run deploy
 ```
 
-Wrangler prints the deployed URL, e.g. `https://switchboard.<your-subdomain>.workers.dev`.
-
-Then run the host daemon (in this repo) pointing at it:
+Wrangler prints your URL (e.g. `https://switchboard.<subdomain>.workers.dev`).
+Point the daemon at it:
 
 ```bash
-cd cli && npm install
-node index.js --server https://switchboard.<your-subdomain>.workers.dev
-# the original is wire-compatible too:
-# npx @elsetech/webterm --server https://switchboard.<your-subdomain>.workers.dev
+npx @switch-board/cli --server https://switchboard.<subdomain>.workers.dev
 ```
 
-The daemon prints a token and an `Open:` URL on **your** domain. Open it (or
-paste the token into the page) and you get a shell on the daemon's machine.
-
-### Custom domain (optional)
-
-To serve it at `switchboard.example.com`, add a route in the Cloudflare dashboard
-(Workers & Pages → your worker → Settings → Domains & Routes) or via
-`wrangler.jsonc`:
+To serve it on your own domain, add a route in `wrangler.jsonc`:
 
 ```jsonc
 "routes": [{ "pattern": "switchboard.example.com", "custom_domain": true }]
 ```
 
-## Local development
+> **Heads up on GitHub login:** the dashboard's GitHub sign-in is wired to the
+> author's shared auth broker (`auth.lfkdsk.org`) and OAuth app. A fresh deploy
+> works great in **token mode** out of the box; to get the account dashboard on
+> your own domain, point `src/auth.js` at your own GitHub OAuth app and callback.
+
+### Local development
 
 ```bash
-npm run dev               # wrangler dev, defaults to http://localhost:8787
-# in another terminal — the CLI defaults to localhost:8787, so just:
-cd cli && npm install && node index.js
+npm run dev                 # wrangler dev → http://localhost:8787
+npx @switch-board/cli --server http://localhost:8787
 ```
 
-The daemon rewrites `http→ws` automatically, so `http://localhost:8787` works.
-Durable Objects and hibernatable WebSockets run under `wrangler dev` locally.
+The daemon rewrites `http→ws` automatically. Durable Objects, hibernatable
+WebSockets, and a local D1 all run under `wrangler dev` (apply the schema once
+with `--local` instead of `--remote`).
 
-## How it works
+---
 
-`idFromName(token)` maps every daemon/browser carrying the same token into one
-Durable Object instance — the **circuit** for that token. Inside the circuit:
-
-- **binary frames** `[1-byte sid len][sid][payload]` are forwarded verbatim in
-  both directions (keystrokes one way, PTY output the other). Daemon output is
-  broadcast to every browser on the circuit; each browser filters by its own `sid`.
-- **JSON control messages** are forwarded verbatim: the browser's
-  `open` / `resize` / `client-gone` / `dl-*` / `ul-*` go to the daemon; the
-  daemon's `stats` / `exit` / `dl-*` / `ul-*` go to the browsers.
-- the relay itself sends `peer-status {online}` to the daemon (which logs it)
-  and a private `_relay {event}` to browsers (host online/offline).
-- a **second daemon** on the same token gets **HTTP 409**, which the daemon
-  treats as fatal — exactly as the original relay behaves.
-
-It uses the **Hibernatable WebSockets API**, so idle terminals cost nothing and
-the circuit survives the DO being evicted between messages. A plain
-`"ping"`/`"pong"` auto-response keeps connections warm without waking the DO.
-
-## Protocol
-
-Reverse-engineered from `@elsetech/webterm@2.0.0` and forwarded verbatim, so
-Switchboard stays payload-agnostic. Frame format:
+## CLI reference
 
 ```
-binary:  [1-byte sid length][sid utf8][payload bytes]
-browser → daemon JSON:  open · resize · client-gone · dl-open · ul-open · ul-chunk · ul-end
-daemon → browser JSON:  stats · exit · dl-meta · dl-chunk · dl-end · dl-error · ul-ready · ul-done · ul-error
-relay  → daemon  JSON:  peer-status {online}
-relay  → browser JSON:  _relay {event}   (Switchboard's own frontend only)
+switchboard login            Sign in via the browser, then expose this machine's
+                             shell under your account — one step.
+switchboard                  Expose this shell using saved credentials, or an
+                             anonymous one-off token if you're not signed in.
+switchboard logout           Remove the stored account credential.
 ```
+
+| Option | Description |
+| --- | --- |
+| `-t, --token <token>` | Force anonymous mode with this token (min 24 chars). |
+| `-s, --server <url>`  | Relay origin. Default: `https://shell.lfkdsk.org`. |
+| `--shell <path>`      | Shell to spawn. Default: `$SHELL`, else `bash`/`powershell`. |
+| `-v, --version`       | Print version and exit. |
+| `-h, --help`          | Show help and exit. |
+
+Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
+`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`. The `WEBTERM_*` equivalents are also
+accepted for drop-in compatibility. Account credentials live in
+`~/.switchboard/config.json` (mode `0600`).
+
+---
 
 ## Security
 
-- **The token is the only credential.** Anyone with it gets a shell on the
-  daemon's host. Treat it like a password; it is a fresh 256-bit value per run.
-- **The relay sees plaintext.** This matches the original design. If you want the
-  relay to be untrusted too, add an end-to-end encryption layer (e.g. derive a
-  key from extra entropy in the token, X25519 + an AEAD between daemon and
-  browser) — the relay forwards opaque bytes either way, so no relay change is
-  needed.
-- **Anyone who can reach the Worker URL can try tokens.** Tokens are 256-bit
-  random, so guessing is infeasible, but you can add Cloudflare Access in front
-  of the Worker to gate it behind your own auth.
-- The browser frontend loads `xterm.js` from jsDelivr. To remove that external
-  dependency, vendor the two `@xterm` files into `public/` and update the
-  `<script>`/`<link>` tags.
+- **The token is the only credential in token mode.** Anyone with it gets a shell
+  on the host — treat it like a password. It's a fresh 256-bit random value per
+  run, so guessing is infeasible.
+- **Account mode is gated by GitHub identity.** A machine bound with
+  `switchboard login` can only be opened by the signed-in owner; sessions are
+  HMAC-signed cookies, and agent tokens are stored **hashed** (SHA-256) in D1.
+- **The relay sees plaintext.** TLS terminates at the Worker, so the operator
+  (you, when self-hosting) can see the stream. Switchboard is **not** end-to-end
+  encrypted — self-hosting removes the third party, not the relay's visibility.
+  Because the relay forwards opaque bytes, you can layer E2E (e.g. X25519 + an
+  AEAD between daemon and browser) without changing it.
+- **Gate the relay itself** with Cloudflare Access if you want auth in front of
+  the whole Worker.
+- The frontend loads `xterm.js` from jsDelivr; vendor the `@xterm` files into
+  `public/` to drop that external dependency.
 
-## Compatibility
+---
 
-Verified against the daemon protocol in `@elsetech/webterm@2.0.0`, including a
-full end-to-end run (real daemon ↔ Switchboard ↔ browser): live commands, host
-stats, and file upload/download all round-trip. The relay is payload-agnostic,
-so it should keep working as long as the framing (1-byte sid length prefix +
-JSON control messages) is unchanged.
+## Project layout
+
+| Path | What it is |
+| --- | --- |
+| `src/index.js` | Worker entry + router (WebSocket, auth, CLI-login, dashboard API) |
+| `src/circuit.js` | The `Circuit` Durable Object — the per-token/per-machine relay |
+| `src/auth.js` | GitHub OAuth sessions (HMAC-signed cookies) |
+| `src/registry.js` | D1 bookkeeping: machines, agent tokens, CLI-login handshake |
+| `public/index.html` | The browser app — terminal, tabs, dashboard, file transfer |
+| `public/cli-login.html` | The `switchboard login` authorization page |
+| `schema.sql` | D1 schema |
+| `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
+| `cli/` | `@switch-board/cli` — the host daemon |
+
+---
+
+## Compatibility & credits
+
+Switchboard is a clean reimplementation of
+[`@elsetech/webterm`](https://www.npmjs.com/package/@elsetech/webterm) — **both
+ends** — verified against the `@elsetech/webterm@2.0.0` daemon protocol with a
+full end-to-end run (live commands, host stats, and file upload/download all
+round-trip). The relay is payload-agnostic, so it keeps working as long as the
+framing (1-byte sid-length prefix + JSON control messages) is unchanged.
+
+MIT licensed.
