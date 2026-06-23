@@ -1,5 +1,5 @@
 {
-  "name": "@switchboard/cli",
+  "name": "@switch-board/cli",
   "version": "1.0.0",
   "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay (bound to your account, or via a one-off token).",
   "license": "MIT",

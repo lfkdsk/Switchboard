@@ -112,7 +112,7 @@
       <div class="card" style="width:auto;margin-top:18px">
         <h1 style="font-size:15px">Add a machine</h1>
         <p style="margin-bottom:8px">On the host you want to reach, run:</p>
-        <div><code>npx @switchboard/cli login</code></div>
+        <div><code>npx @switch-board/cli login</code></div>
         <p class="muted" style="margin-top:8px;margin-bottom:0">Authorize in the browser, then run <code>switchboard</code> to expose its shell. It appears here.</p>
       </div>
     </div>
@@ -223,7 +223,7 @@
       let machines = [];
       try { machines = (await (await api("/api/machines")).json()).machines || []; }
       catch { list.innerHTML = '<div class="empty">Could not load machines.</div>'; return; }
-      if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switchboard/cli login</code> on a host to bind it.</div>'; return; }
+      if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switch-board/cli login</code> on a host to bind it.</div>'; return; }
       list.innerHTML = "";
       for (const m of machines) {
         const el = document.createElement("div");

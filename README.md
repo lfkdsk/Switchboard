@@ -9,7 +9,7 @@ clean reimplementation of [`@elsetech/webterm`](https://www.npmjs.com/package/@e
 Two parts live in this repo:
 - **relay** (repo root) — a Cloudflare Worker + Durable Object that pairs a daemon
   with browser(s) by token; a drop-in replacement for `webterm.elsetech.app`.
-- **cli** (`cli/`, package `@switchboard/cli`) — the host agent that spawns your
+- **cli** (`cli/`, package `@switch-board/cli`) — the host agent that spawns your
   shell and dials out to the relay; wire-compatible with the original `@elsetech/webterm`.
 
 Think of it as an old telephone switchboard: each **token is a circuit**, and the
@@ -38,7 +38,7 @@ token and shovels frames between them. It never parses the terminal payloads.
 | `src/index.js` | Worker entry + `Circuit` Durable Object (the relay) |
 | `public/index.html` | The browser terminal (xterm.js, self-contained) |
 | `wrangler.jsonc` | Cloudflare config (DO binding, migration, static assets) |
-| `cli/index.js` | Host CLI (`@switchboard/cli`) — spawns your shell, dials out to the relay |
+| `cli/index.js` | Host CLI (`@switch-board/cli`) — spawns your shell, dials out to the relay |
 | `cli/scripts/fix-pty-perms.js` | node-pty macOS spawn-helper fix (postinstall) |
 
 ## Deploy
