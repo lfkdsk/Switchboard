@@ -1,10 +1,18 @@
-# Switchboard
+<p align="center">
+  <img src="docs/logo.svg" alt="Switchboard" width="108" height="108">
+</p>
 
-**A shell on any of your machines — right in your browser. No SSH config, no inbound ports, no VPN.**
+<h1 align="center">Switchboard</h1>
 
-[![npm](https://img.shields.io/npm/v/@switch-board/cli?color=2f81f7&label=%40switch-board%2Fcli)](https://www.npmjs.com/package/@switch-board/cli)
-&nbsp;[![node](https://img.shields.io/node/v/@switch-board/cli?color=2ea043)](https://www.npmjs.com/package/@switch-board/cli)
-&nbsp;![runs on Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020)
+<p align="center">
+  <strong>A shell on any of your machines — right in your browser. No SSH config, no inbound ports, no VPN.</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/@switch-board/cli"><img src="https://img.shields.io/npm/v/@switch-board/cli?color=2f81f7&label=%40switch-board%2Fcli" alt="npm"></a>
+  &nbsp;<a href="https://www.npmjs.com/package/@switch-board/cli"><img src="https://img.shields.io/node/v/@switch-board/cli?color=2ea043" alt="node"></a>
+  &nbsp;<img src="https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020" alt="runs on Cloudflare Workers">
+</p>
 
 <p align="center">
   <img src="docs/terminal.png" alt="A Switchboard browser terminal: tabbed multi-shell with a live header showing RTT, CPU, memory, and IP" width="880">
