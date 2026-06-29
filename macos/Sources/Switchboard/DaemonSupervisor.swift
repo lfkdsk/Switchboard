@@ -80,8 +80,9 @@ final class DaemonSupervisor: ObservableObject {
             p.standardError = logHandle
         }
 
-        p.terminationHandler = { [weak self] proc in
-            DispatchQueue.main.async { self?.handleTermination(code: proc.terminationStatus) }
+        p.terminationHandler = { proc in
+            let status = proc.terminationStatus
+            DispatchQueue.main.async { [weak self] in self?.handleTermination(code: status) }
         }
 
         do {
@@ -132,8 +133,8 @@ final class DaemonSupervisor: ObservableObject {
         p.arguments = [rt.cli.path, "logout"]
         p.environment = ProcessInfo.processInfo.environment
         try? p.run()
-        p.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
+        p.terminationHandler = { _ in
+            DispatchQueue.main.async { [weak self] in
                 self?.account = nil
                 self?.mode = nil
             }
@@ -194,7 +195,8 @@ final class DaemonSupervisor: ObservableObject {
     private func startStatusPolling() {
         stopStatusPolling()
         let t = Timer(timeInterval: 0.35, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.drainStatus() }
+            guard let self else { return }
+            Task { @MainActor in self.drainStatus() }
         }
         RunLoop.main.add(t, forMode: .common)
         statusTimer = t
