@@ -1,0 +1,126 @@
+name: macOS app
+
+# Build the Switchboard menu-bar app, package each arch as a self-contained DMG,
+# upload them as artifacts, and attach them to a GitHub Release on tag pushes.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create/update the Release on tag pushes
+
+concurrency:
+  group: macos-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast sanity check on the daemon sources (no native build here — the macOS
+  # job exercises the real node-pty install when embedding the runtime).
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Syntax-check daemon
+        run: |
+          node --check cli/index.js
+          node --check cli/scripts/fix-pty-perms.js
+
+  app:
+    name: Build & package (${{ matrix.arch }})
+    needs: cli
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, arch: arm64 }      # Apple Silicon
+          - { runner: macos-15-intel, arch: x64 }  # Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          swift --version
+          xcodebuild -version
+          uname -m
+
+      # Plain semver for tags (v1.2.3 -> 1.2.3); a stable 0.1.0 otherwise so the
+      # bundle's CFBundleVersion stays a valid period-separated number.
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.1.0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .app (embeds Node ${{ matrix.arch }} + cli deps, ad-hoc signs)
+        working-directory: macos
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          chmod +x scripts/*.sh run-dev.sh
+          CONFIG=release scripts/make-app.sh
+
+      - name: Verify bundle
+        working-directory: macos
+        run: |
+          codesign --verify --verbose build/Switchboard.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' build/Switchboard.app/Contents/Info.plist)" = "true"
+          file build/Switchboard.app/Contents/Resources/runtime/bin/node
+
+      # Best-effort smoke test against the public relay. Non-gating: a relay
+      # hiccup must not block packaging a release.
+      - name: Smoke test (--selftest)
+        working-directory: macos
+        continue-on-error: true
+        run: SELFTEST_SECONDS=12 build/Switchboard.app/Contents/MacOS/Switchboard --selftest
+
+      - name: Package DMG
+        working-directory: macos
+        run: |
+          DMG="Switchboard-${{ steps.ver.outputs.version }}-${{ matrix.arch }}.dmg"
+          # Stage into a clean folder (with a drag-to-install Applications alias).
+          # Copying out of build/ also avoids the occasional "resource busy" when
+          # hdiutil reads the freshly-signed app while Spotlight is scanning it.
+          STAGE="$(mktemp -d)/Switchboard"
+          mkdir -p "$STAGE"
+          ditto build/Switchboard.app "$STAGE/Switchboard.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Switchboard" -srcfolder "$STAGE" \
+            -ov -format UDZO "$DMG"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Switchboard-${{ matrix.arch }}
+          path: macos/${{ env.DMG }}
+          if-no-files-found: error
+
+  # Single release job so the two matrix builds don't race on upserting the
+  # Release; it gathers both DMGs and attaches them in one shot.
+  release:
+    name: Release
+    needs: app
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all DMGs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: List
+        run: find dist -type f
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.dmg
+          generate_release_notes: true
+          fail_on_unmatched_files: true
