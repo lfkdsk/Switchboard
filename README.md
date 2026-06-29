@@ -96,6 +96,18 @@ quick remote help. No sign-in required; the token *is* the key (see
 Both modes give you the multi-tab terminal and file transfer; they differ only in
 *who* can connect and how long shells stick around.
 
+### Keep it running — macOS menu-bar app
+
+Rather than leaving the CLI in a terminal window, you can run Switchboard as a
+**menu-bar app** that lives in the top-right (no Dock icon), shows live status,
+and can launch at login. It supervises the same daemon under the hood. Grab a prebuilt `.dmg` from the
+[Releases](https://github.com/lfkdsk/Switchboard/releases) page (arm64 or Intel),
+or build it yourself from [`macos/`](macos/README.md):
+
+```bash
+cd macos && scripts/make-app.sh && open build/Switchboard.app
+```
+
 <p align="center">
   <img src="docs/landing.png" alt="The Switchboard landing page: sign in with GitHub, or paste a one-off token" width="720">
 </p>
@@ -238,6 +250,7 @@ accepted for drop-in compatibility. Account credentials live in
 | `schema.sql` | D1 schema |
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
 | `cli/` | `@switch-board/cli` — the host daemon |
+| `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 
 ---
 
