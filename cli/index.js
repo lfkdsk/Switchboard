@@ -43,6 +43,25 @@ function ts() {
 const log = (...a) => console.log(`[${ts()}]`, ...a);
 const logErr = (...a) => console.error(`[${ts()}]`, ...a);
 
+// ---- structured status (opt-in) ------------------------------------------
+// Emit one JSON object per line on each lifecycle event, so a supervisor (e.g.
+// the macOS menu-bar app) can track online/offline, RTT and host stats without
+// scraping the human-readable log. Two opt-in sinks, both off by default:
+//   SWITCHBOARD_STATUS_FILE=<path>  append NDJSON to a file (Foundation-friendly)
+//   SWITCHBOARD_JSON_STATUS=1       write NDJSON to fd 3 (inherited pipe)
+// The file sink wins if both are set. Human logs on stdout/stderr are untouched.
+const STATUS_FILE = process.env.SWITCHBOARD_STATUS_FILE || null;
+const STATUS_FD = process.env.SWITCHBOARD_JSON_STATUS ? 3 : null;
+const STATUS_ON = !!(STATUS_FILE || STATUS_FD);
+function emitStatus(ev, extra) {
+  if (!STATUS_ON) return;
+  const line = JSON.stringify({ ev, t: Date.now(), ...extra }) + "\n";
+  try {
+    if (STATUS_FILE) fs.appendFileSync(STATUS_FILE, line);
+    else fs.writeSync(STATUS_FD, line);
+  } catch {}
+}
+
 const DEFAULT_SERVER = "https://shell.lfkdsk.org";
 const MIN_TOKEN_LEN = 24; // reject weak custom tokens; the generated one is ~43 chars
 
@@ -295,6 +314,15 @@ function banner() {
     console.log("  Anyone with this token gets a shell on this machine.");
   }
   console.log(`└${line}┘\n`);
+  emitStatus("ready", {
+    mode: BOUND ? "account" : "token",
+    machine: os.hostname(),
+    account: BOUND ? (cfg.login || null) : null,
+    machineId: BOUND ? MACHINE : null,
+    dashboardUrl: browseUrl,
+    shareUrl: BOUND ? null : browseUrl,
+    token: BOUND ? null : TOKEN,
+  });
 }
 
 // ---- relay connection ----------------------------------------------------
@@ -316,6 +344,7 @@ function connect() {
     reconnectDelay = 1000;
     if (!announced) { banner(); announced = true; }
     log("[relay] connected");
+    emitStatus("connected", { mode: BOUND ? "account" : "token" });
   });
 
   // Fatal server responses: 409 (another daemon on this circuit) and, in bound
@@ -326,6 +355,7 @@ function connect() {
         "\nERROR: this " + (BOUND ? "machine" : "token") + " already has a daemon connected on the relay.\n" +
           "       Stop the other one" + (BOUND ? "." : ", or choose a different --token.")
       );
+      emitStatus("fatal", { reason: "conflict", code: res.statusCode });
       for (const sid of sessions.keys()) killSession(sid);
       process.exit(1);
     }
@@ -334,6 +364,7 @@ function connect() {
         `\nERROR: relay rejected this machine (${res.statusCode}). ` +
           "Your login may have expired — run `switchboard login` again."
       );
+      emitStatus("fatal", { reason: "auth", code: res.statusCode });
       for (const sid of sessions.keys()) killSession(sid);
       process.exit(1);
     }
@@ -375,7 +406,10 @@ function connect() {
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
       case "ul-end": endUpload(msg.id); break;
-      case "peer-status": log("[relay] browser " + (msg.online ? "connected" : "disconnected")); break;
+      case "peer-status":
+        log("[relay] browser " + (msg.online ? "connected" : "disconnected"));
+        emitStatus("peer", { online: !!msg.online });
+        break;
     }
   });
 
@@ -386,6 +420,7 @@ function connect() {
     // an intentional stop and doesn't restart us back into the fight.
     if (code === 4001) {
       log("[relay] replaced by a newer daemon for this " + (BOUND ? "machine" : "token") + "; exiting.");
+      emitStatus("fatal", { reason: "replaced", code });
       for (const sid of sessions.keys()) killSession(sid);
       process.exit(0);
     }
@@ -395,6 +430,7 @@ function connect() {
     for (const up of activeUploads.values()) up.stream.destroy();
     activeUploads.clear();
     log(`[relay] disconnected, retrying in ${reconnectDelay}ms`);
+    emitStatus("disconnected", { code, retryInMs: reconnectDelay });
     setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 15000);
   });
@@ -577,18 +613,24 @@ function sendStats() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   refreshMemAvailable();
   const total = os.totalmem();
+  // cpuUsage() advances the sampling window, so compute these once and reuse
+  // them for both the relay frame and the local status event.
+  const cpu = cpuUsage();
+  const memUsed = Math.max(0, Math.min(total, total - memAvailable));
+  const cores = os.cpus().length;
   try {
     ws.send(JSON.stringify({
       type: "stats",
-      cpu: cpuUsage(),
-      memUsed: Math.max(0, Math.min(total, total - memAvailable)),
+      cpu,
+      memUsed,
       memTotal: total,
-      cores: os.cpus().length,
+      cores,
       ip: primaryIp(),
       host: os.hostname(),
       platform: process.platform,
       rtt: lastRtt, // relay-edge round-trip from the previous tick (ms)
     }));
+    emitStatus("stats", { cpu, memUsed, memTotal: total, cores, rtt: lastRtt });
     // Probe the relay edge for the next tick's rtt (auto-ponged, no DO wake).
     pingSentAt = Date.now();
     ws.send("ping");
@@ -607,9 +649,11 @@ function sendStats() {
   refreshMemAvailable();
   setInterval(sendStats, 2000);
   log(`connecting to ${SERVER} …`);
+  emitStatus("connecting", { server: SERVER, mode: BOUND ? "account" : "token" });
   connect();
   process.on("SIGINT", () => {
     log("shutting down.");
+    emitStatus("stopping", {});
     for (const sid of sessions.keys()) killSession(sid);
     process.exit(0);
   });
