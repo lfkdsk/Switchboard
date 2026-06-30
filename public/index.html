@@ -27,6 +27,8 @@
   button { background: #1b2230; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--err); border-color: rgba(248,81,73,.4); }
+  button.danger:hover { border-color: var(--err); background: rgba(248,81,73,.12); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   input { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 9px 11px; font: inherit; }
   input:focus { outline: none; border-color: var(--accent); }
@@ -238,11 +240,31 @@
           : "offline · last seen " + fmtAgo(m.last_seen);
         const el = document.createElement("div");
         el.className = "machine";
-        el.innerHTML = `<span class="dot ${online ? "on" : "off"}"></span><div><div class="name"></div><div class="meta">${meta}</div></div><span class="spacer"></span><button class="primary">Open shell</button>`;
-        el.querySelector(".name").textContent = m.name || m.machine_id.slice(0, 8);
-        el.querySelector("button").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        el.innerHTML = `<span class="dot ${online ? "on" : "off"}"></span><div><div class="name"></div><div class="meta">${meta}</div></div><span class="spacer"></span><button class="primary">Open shell</button>${online ? "" : '<button class="danger" title="Remove this offline machine from your dashboard">Delete</button>'}`;
+        const label = m.name || m.machine_id.slice(0, 8);
+        el.querySelector(".name").textContent = label;
+        el.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        if (!online) el.querySelector(".danger").onclick = () => deleteMachine(m.machine_id, label, el);
         list.appendChild(el);
       }
+    }
+
+    async function deleteMachine(machineId, label, el) {
+      if (!confirm(`Delete offline machine "${label}"?\n\nThis removes it from your dashboard. You can re-add it by running the CLI on that host again.`)) return;
+      const btn = el.querySelector(".danger");
+      btn.disabled = true;
+      try {
+        const r = await api("/api/machines/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ machine_id: machineId }) });
+        if (r.ok) {
+          toast(`Deleted “${label}”`, "ok");
+          el.remove();
+          if (!$("machineList").children.length) renderDashboard();
+        } else {
+          const e = await r.json().catch(() => ({}));
+          toast(e.error === "machine is online" ? `“${label}” just came online — not deleted.` : "Couldn't delete machine.", "err");
+          btn.disabled = false;
+        }
+      } catch { toast("Couldn't delete machine — network error.", "err"); btn.disabled = false; }
     }
 
     // ===================== TERMINAL (multi-shell) ===========================

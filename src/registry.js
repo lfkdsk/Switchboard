@@ -70,6 +70,23 @@ export async function listMachines(env, accountId) {
   return results || [];
 }
 
+// A machine is "online" while its heartbeat stays fresh; mirror the dashboard's
+// freshness window so the two agree on what's deletable.
+const ONLINE_WINDOW_MS = 6000;
+
+// Remove one of the caller's own machines, but only while it's offline — a live
+// daemon would just re-register on its next heartbeat, so deleting it is futile
+// and looks like a bug. Returns { ok } or { ok:false, reason }.
+export async function deleteMachine(env, machineId, accountId) {
+  const row = await env.DB.prepare(
+    "SELECT account_id, last_seen FROM machines WHERE machine_id=?",
+  ).bind(machineId).first();
+  if (!row || row.account_id !== accountId) return { ok: false, reason: "not-found" };
+  if (Date.now() - row.last_seen < ONLINE_WINDOW_MS) return { ok: false, reason: "online" };
+  await env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId).run();
+  return { ok: true };
+}
+
 // ---- CLI-login handshake (PKCE-like) -------------------------------------
 export async function cliStart(env, state, verifierHash) {
   await env.DB.prepare("DELETE FROM cli_logins WHERE created_at < ?").bind(Date.now() - 600000).run();

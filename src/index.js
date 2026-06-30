@@ -15,7 +15,7 @@ import { Circuit } from "./circuit.js";
 import { handleLogin, handleSession, handleLogout, getSession, json } from "./auth.js";
 import {
   cliStart, cliComplete, cliPoll,
-  listMachines, verifyAgentToken, registerMachine, machineOwner,
+  listMachines, deleteMachine, verifyAgentToken, registerMachine, machineOwner,
 } from "./registry.js";
 
 export { Circuit };
@@ -66,6 +66,17 @@ export default {
       const s = await getSession(request, env);
       if (!s) return json({ error: "not signed in" }, 401);
       return json({ machines: await listMachines(env, s.id) });
+    }
+    if (p === "/api/machines/delete" && request.method === "POST") {
+      const s = await getSession(request, env);
+      if (!s) return json({ error: "not signed in" }, 401);
+      const b = await safeJson(request);
+      if (!b || !b.machine_id) return json({ error: "missing machine_id" }, 400);
+      const r = await deleteMachine(env, b.machine_id, s.id);
+      if (r.ok) return json({ ok: true });
+      return r.reason === "online"
+        ? json({ error: "machine is online" }, 409)
+        : json({ error: "not found" }, 404);
     }
 
     // ---- static assets (frontend) ----
