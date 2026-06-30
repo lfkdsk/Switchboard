@@ -83,6 +83,10 @@ struct MenuContent: View {
                         .foregroundStyle(.secondary)
                         .help("A browser is viewing this machine")
                 }
+                if config.signedIn, let login = config.login {
+                    AvatarView(login: login, size: 20)
+                        .help("Signed in as \(login)")
+                }
             }
             HStack(spacing: 6) {
                 Text(supervisor.machineName ?? Host.current().localizedName ?? "this machine")
@@ -150,9 +154,12 @@ struct MenuContent: View {
     private var accountSection: some View {
         VStack(spacing: 2) {
             if config.signedIn {
-                HStack {
-                    Label(config.login ?? "signed in", systemImage: "person.crop.circle.fill")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    AvatarView(login: config.login ?? "", size: 28)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(config.login ?? "signed in").font(.system(size: 12, weight: .medium))
+                        Text("Signed in").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
                     Spacer()
                 }
                 .padding(.vertical, 2)
@@ -233,5 +240,35 @@ struct MenuContent: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// The signed-in user's GitHub avatar (github.com/<login>.png), circular, with
+/// a person-glyph placeholder while loading or offline.
+struct AvatarView: View {
+    let login: String
+    var size: CGFloat = 28
+
+    var body: some View {
+        AsyncImage(url: avatarURL) { phase in
+            switch phase {
+            case .success(let image):
+                image.resizable().scaledToFill()
+            default:
+                Image(systemName: "person.crop.circle.fill")
+                    .resizable()
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
+    }
+
+    private var avatarURL: URL? {
+        let safe = login.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? login
+        // Request 2× for crisp rendering on Retina; github.com/<login>.png
+        // redirects to the avatar CDN, which AsyncImage follows.
+        return URL(string: "https://github.com/\(safe).png?size=\(Int(size * 2))")
     }
 }
