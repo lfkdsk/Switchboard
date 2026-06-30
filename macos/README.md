@@ -111,6 +111,8 @@ hardened runtime.
 | `Sources/Switchboard/Prefs.swift` | server/shell prefs + launch-at-login |
 | `Sources/Switchboard/ConfigReader.swift` | read `~/.switchboard/config.json` |
 | `Sources/Switchboard/SelfTest.swift` | headless `--selftest` verification |
+| `Resources/AppIcon.icns` | app icon, generated from `docs/logo.svg` (committed) |
 | `scripts/make-app.sh` | assemble + sign `Switchboard.app` |
 | `scripts/fetch-runtime.sh` | stage the embedded Node runtime |
+| `scripts/make-icon.sh` | regenerate `AppIcon.icns` from the logo (needs `librsvg`) |
 | `run-dev.sh` | run from source against the repo cli |
