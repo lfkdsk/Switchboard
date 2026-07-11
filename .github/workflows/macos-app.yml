@@ -231,3 +231,8 @@ jobs:
           files: dist/**/*.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # An -rc tag (v0.2.1-rc1) is where the signing path first runs on CI,
+          # so keep it a draft: not public, and deletable once verified. Plain
+          # v0.2.1 publishes normally.
+          draft: ${{ contains(github.ref_name, '-rc') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
