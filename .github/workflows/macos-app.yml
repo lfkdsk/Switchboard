@@ -40,6 +40,10 @@ jobs:
           - { runner: macos-14, arch: arm64 }      # Apple Silicon
           - { runner: macos-15-intel, arch: x64 }  # Intel
     runs-on: ${{ matrix.runner }}
+    env:
+      # Sign + notarize on tag pushes only. Branch/PR runs stay ad-hoc so they
+      # cost nothing and still work for forks, which cannot read secrets.
+      SIGNED: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -60,20 +64,98 @@ jobs:
             echo "version=0.1.0" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build .app (embeds Node ${{ matrix.arch }} + cli deps, ad-hoc signs)
+      # Only tag builds are signed for real: branch and PR runs have no reason to
+      # burn a notarization round-trip, and forked PRs cannot read the secrets.
+      - name: Import Developer ID certificate
+        if: env.SIGNED == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          base64 --decode <<<"$APPLE_CERTIFICATE" > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -x
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Without this, codesign blocks on a GUI prompt for the private key
+          # and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN"
+
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep "Developer ID Application"
+
+      # notarytool reads the App Store Connect key off disk, not from the env.
+      - name: Stage App Store Connect API key
+        if: env.SIGNED == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/private_keys"
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/private_keys/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/private_keys/AuthKey.p8"
+
+      - name: Build .app (embeds Node ${{ matrix.arch }} + cli deps)
         working-directory: macos
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          # make-app.sh treats "-" as ad-hoc and signs inside-out for anything else.
+          SIGN_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_SIGNING_IDENTITY || '-' }}
         run: |
           chmod +x scripts/*.sh run-dev.sh
           CONFIG=release scripts/make-app.sh
 
+      # The app is notarized before it goes into the DMG so the stapled ticket
+      # travels inside the image; ditto preserves Contents/CodeResources.
+      - name: Notarize and staple the app
+        if: env.SIGNED == 'true'
+        working-directory: macos
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          ditto -c -k --keepParent build/Switchboard.app "$RUNNER_TEMP/app.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/app.zip" \
+            --key "$RUNNER_TEMP/private_keys/AuthKey.p8" \
+            --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple build/Switchboard.app
+
       - name: Verify bundle
         working-directory: macos
         run: |
-          codesign --verify --verbose build/Switchboard.app
+          codesign --verify --strict --deep --verbose=2 build/Switchboard.app
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' build/Switchboard.app/Contents/Info.plist)" = "true"
           file build/Switchboard.app/Contents/Resources/runtime/bin/node
+
+          if [ "$SIGNED" = true ]; then
+            # Every nested Mach-O must be hardened, not just the outer bundle —
+            # an unsigned pty.node is exactly what --deep used to leave behind.
+            # Feed the loop by process substitution: behind a pipe it would run in
+            # a subshell and its exit 1 could never fail the step.
+            checked=0
+            while IFS= read -r -d '' f; do
+              file -b "$f" | grep -q Mach-O || continue
+              codesign --verify --strict "$f"
+              codesign -dv --verbose=2 "$f" 2>&1 | grep -q 'flags=.*runtime' \
+                || { echo "not hardened: $f" >&2; exit 1; }
+              checked=$((checked + 1))
+            done < <(find build/Switchboard.app -type f -print0)
+            echo "hardened Mach-O binaries: $checked"
+            [ "$checked" -ge 4 ] || { echo "too few Mach-O found; layout changed?" >&2; exit 1; }
+
+            codesign -d --entitlements - --xml \
+              build/Switchboard.app/Contents/Resources/runtime/bin/node \
+              | grep -q 'com.apple.security.cs.allow-jit'
+
+            xcrun stapler validate build/Switchboard.app
+            spctl --assess --type execute --verbose build/Switchboard.app
+          fi
 
       # Best-effort smoke test against the public relay. Non-gating: a relay
       # hiccup must not block packaging a release.
@@ -96,6 +178,31 @@ jobs:
           hdiutil create -volname "Switchboard" -srcfolder "$STAGE" \
             -ov -format UDZO "$DMG"
           echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      # Quarantine lands on whatever the user downloads, and that is the DMG.
+      # A notarized app inside an unnotarized image still trips Gatekeeper, so
+      # the image has to be signed and notarized in its own right.
+      - name: Sign, notarize and staple the DMG
+        if: env.SIGNED == 'true'
+        working-directory: macos
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          SIGN_ID: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/private_keys/AuthKey.p8" \
+            --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$DMG"
+
+      - name: Verify DMG
+        if: env.SIGNED == 'true'
+        working-directory: macos
+        run: |
+          codesign --verify --strict --verbose=2 "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose "$DMG"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -124,3 +231,8 @@ jobs:
           files: dist/**/*.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # An -rc tag (v0.2.1-rc1) is where the signing path first runs on CI,
+          # so keep it a draft: not public, and deletable once verified. Plain
+          # v0.2.1 publishes normally.
+          draft: ${{ contains(github.ref_name, '-rc') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}

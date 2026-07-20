@@ -65,7 +65,44 @@ fi
 
 SIGN_ID="${SIGN_ID:--}"   # default to ad-hoc ("-")
 echo "▸ codesign ($SIGN_ID)"
-codesign --force --deep --sign "$SIGN_ID" "$APP"
+
+if [ "$SIGN_ID" = "-" ]; then
+  # Dev builds never meet Gatekeeper, so ad-hoc is fine and --deep is tolerable.
+  codesign --force --deep --sign - "$APP"
+else
+  # Release builds have to survive notarization: every Mach-O in the bundle needs
+  # its own hardened-runtime signature and a secure timestamp. --deep is the
+  # wrong tool — it walks a fixed set of locations, misses the node-pty
+  # prebuilds, and smears one entitlement set over everything. Sign inside-out
+  # instead: nested code first, bundle last, because sealing the bundle would
+  # otherwise invalidate anything signed after it.
+  ENTS="$MACOS_DIR/Resources/node.entitlements"
+  NODE="$APP/Contents/Resources/runtime/bin/node"
+  signed=0
+
+  while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q Mach-O || continue
+
+    # Only Node needs the JIT entitlements; pty.node and spawn-helper just need
+    # to be signed and hardened.
+    if [ "$f" = "$NODE" ]; then
+      codesign --force --timestamp --options runtime \
+        --entitlements "$ENTS" --sign "$SIGN_ID" "$f"
+    else
+      codesign --force --timestamp --options runtime --sign "$SIGN_ID" "$f"
+    fi
+    echo "    signed ${f#"$APP/Contents/"}"
+    signed=$((signed + 1))
+  done < <(find "$APP/Contents/Resources" -type f -print0)
+
+  # The embedded runtime is the whole point of this bundle. An empty sweep means
+  # the layout moved and we are one step from shipping an unsigned Node.
+  [ "$signed" -ge 2 ] || { echo "expected nested Mach-O binaries, signed $signed" >&2; exit 1; }
+
+  # Sealing the bundle signs Contents/MacOS/Switchboard along with it.
+  codesign --force --timestamp --options runtime --sign "$SIGN_ID" "$APP"
+  codesign --verify --strict --deep --verbose=2 "$APP"
+fi
 
 echo "✓ built $APP"
 echo "  open it with:  open \"$APP\""
