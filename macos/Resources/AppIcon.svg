@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Switchboard">
+  <!--
+    docs/logo.svg redrawn on Apple's macOS icon grid: 1024pt canvas, 824pt
+    squircle (radius 185.4) with transparent margin and a soft drop shadow, so
+    the icon sits at the same optical size as every other app in Finder/Dock.
+    Keep the artwork in sync with docs/logo.svg; regenerate the .icns with
+    scripts/make-icon.sh.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a2030"/>
+      <stop offset="1" stop-color="#0b0e14"/>
+    </linearGradient>
+    <linearGradient id="cable" x1="40" y1="30" x2="92" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6cb0ff"/>
+      <stop offset="1" stop-color="#2f81f7"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="124%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="12"/>
+      <feOffset dy="10" result="drop"/>
+      <feFlood flood-color="#000000" flood-opacity="0.3" result="ink"/>
+      <feComposite in="ink" in2="drop" operator="in" result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#bg)" stroke="#222a38" stroke-width="13.5"/>
+    <!-- artwork from docs/logo.svg, mapped from its 3..125 box onto 100..924 -->
+    <g transform="translate(79.7377 79.7377) scale(6.754098)">
+      <!-- the patch cord, bent into an S -->
+      <path d="M82 38 C52 30 38 52 64 64 C90 76 76 98 46 90"
+            fill="none" stroke="url(#cable)" stroke-width="12" stroke-linecap="round"/>
+      <!-- host jack (online green) -->
+      <circle cx="82" cy="38" r="11" fill="#0b0e14"/>
+      <circle cx="82" cy="38" r="7.5" fill="#2ea043"/>
+      <!-- browser jack (accent blue) -->
+      <circle cx="46" cy="90" r="11" fill="#0b0e14"/>
+      <circle cx="46" cy="90" r="7.5" fill="#3b8eff"/>
+    </g>
+  </g>
+</svg>

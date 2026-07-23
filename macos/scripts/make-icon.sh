@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Regenerate macos/Resources/AppIcon.icns from the repo logo (docs/logo.svg).
-# The resulting .icns is committed, so the app build (and CI) needs no SVG
-# tooling — only re-run this when the logo changes. Requires rsvg-convert
-# (`brew install librsvg`) and iconutil (built into macOS).
+# Regenerate macos/Resources/AppIcon.icns from Resources/AppIcon.svg (the repo
+# logo redrawn on Apple's icon grid — transparent margin + shadow, unlike the
+# full-bleed docs/logo.svg). The resulting .icns is committed, so the app build
+# (and CI) needs no SVG tooling — only re-run this when the logo changes.
+# Requires rsvg-convert (`brew install librsvg`) and iconutil (built into macOS).
 set -euo pipefail
 
 MACOS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-REPO_DIR="$(cd "$MACOS_DIR/.." && pwd)"
-SVG="$REPO_DIR/docs/logo.svg"
+SVG="$MACOS_DIR/Resources/AppIcon.svg"
 OUT="$MACOS_DIR/Resources/AppIcon.icns"
 WORK="$(mktemp -d)/AppIcon.iconset"
 mkdir -p "$WORK" "$MACOS_DIR/Resources"
