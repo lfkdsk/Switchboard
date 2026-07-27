@@ -42,11 +42,21 @@ jobs:
           done
           XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show-environment >/dev/null
 
-      # node-pty ships prebuilds for darwin/win32 only, so this is a real
-      # source build — it catches a broken binding.gyp or a toolchain claim in
-      # the README going stale.
-      - name: Install the CLI globally (compiles node-pty from source)
-        run: npm install -g ./cli
+      # Pack first, then install the tarball: `npm install -g ./cli` only
+      # symlinks the working tree, so no dependency is ever installed and
+      # node-pty never builds. The tarball is what a user gets from the
+      # registry, and node-pty ships prebuilds for darwin/win32 only — so this
+      # is a real source build, which also guards the README's toolchain claim.
+      - name: Install the CLI globally from a packed tarball
+        run: |
+          npm pack ./cli
+          npm install -g ./switch-board-cli-*.tgz
+          ROOT="$(npm root -g)/@switch-board/cli"
+          test -f "$ROOT/node_modules/node-pty/build/Release/pty.node" || {
+            echo "::error::node-pty native addon missing — the source build did not run"
+            ls -R "$ROOT/node_modules/node-pty" | head -40; exit 1
+          }
+          switchboard --version   # proves ws and node-pty both actually load
 
       - name: Guard — refuses to install from an npx cache path
         run: |
