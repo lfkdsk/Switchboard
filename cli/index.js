@@ -27,7 +27,7 @@ const crypto = require("crypto");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { exec } = require("child_process");
+const { exec, spawnSync } = require("child_process");
 const WebSocket = require("ws");
 const pty = require("node-pty");
 const fixPtyPerms = require("./scripts/fix-pty-perms");
@@ -75,6 +75,8 @@ Usage:
   switchboard [options]        Expose this shell using saved credentials, or an
                                anonymous one-off token if not signed in.
   switchboard logout           Remove the stored account credential.
+  switchboard service <verb>   Linux: run in the background via systemd, starting
+                               at boot. Verbs: install, uninstall, status.
 
 Options:
   -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
@@ -114,7 +116,9 @@ function parseArgs(argv) {
 }
 
 const rawArgs = process.argv.slice(2);
-const sub = rawArgs[0] === "login" || rawArgs[0] === "logout" ? rawArgs.shift() : null;
+const sub = ["login", "logout", "service"].includes(rawArgs[0]) ? rawArgs.shift() : null;
+// `service` takes a bare verb of its own before the usual flags.
+const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
 const args = parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
@@ -180,6 +184,160 @@ function doLogout() {
   saveConfig(c);
   console.log("Logged out. (Account credential removed; machine id kept for re-login.)");
   process.exit(0);
+}
+
+// ---- background service (systemd --user) ---------------------------------
+// The Linux counterpart to the macOS app's "launch at login": a user-level unit
+// plus lingering, so the daemon comes up at boot and keeps running after you log
+// out. User scope rather than /etc/systemd/system is the right level — the
+// daemon reads ~/.switchboard/config.json and spawns *your* login shell, so it
+// should run as you and needs no root.
+const UNIT_NAME = "switchboard.service";
+const UNIT_PATH = path.join(os.homedir(), ".config", "systemd", "user", UNIT_NAME);
+const sh = (cmd, argv) => spawnSync(cmd, argv, { encoding: "utf8" });
+const die = (msg) => { console.error(msg); process.exit(1); };
+
+// systemd needs literal absolute paths — it has no PATH lookup for ExecStart and
+// no shell to expand anything. __filename is already symlink-resolved by Node,
+// so a global install's bin shim resolves to the real module path.
+const CLI_PATH = __filename;
+
+function requireSystemd() {
+  if (process.platform !== "linux") {
+    die(process.platform === "darwin"
+      ? "`service` manages a systemd unit and is Linux-only.\nOn macOS, use the menu-bar app instead: https://github.com/lfkdsk/Switchboard/releases"
+      : `\`service\` manages a systemd unit and is Linux-only (this is ${process.platform}).`);
+  }
+  if (sh("systemctl", ["--user", "show-environment"]).status !== 0) {
+    die("No systemd user manager is reachable here.\n\n" +
+      "  • On Alpine/Devuan (OpenRC) or WSL without systemd, there's no user manager\n" +
+      "    to install into — run the daemon under your own supervisor instead.\n" +
+      "  • Over sudo or a non-login shell, XDG_RUNTIME_DIR may be unset; log in as\n" +
+      "    this user directly and retry.");
+  }
+}
+
+// A unit records absolute paths, so it outlives the process that wrote it only
+// if those paths do. npx unpacks into a cache npm is free to evict.
+function requireStablePath() {
+  if (/[/\\]_npx[/\\]/.test(CLI_PATH)) {
+    die("This copy of the CLI lives in npx's cache, which npm may delete at any\n" +
+      "time — a unit pointing there would break on the next boot.\n\n" +
+      "Install it for real first, then re-run:\n\n" +
+      "  npm install -g @switch-board/cli\n" +
+      "  switchboard service install\n");
+  }
+}
+
+function unitBody() {
+  const shell = args.shell || process.env.SWITCHBOARD_SHELL || process.env.WEBTERM_SHELL || process.env.SHELL;
+  const token = args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN;
+  const env = [`Environment="SWITCHBOARD_SERVER=${SERVER}"`];
+  // A systemd user unit starts from a near-empty environment, so $SHELL isn't
+  // there to be read at boot the way it is in an interactive run. Pin it now or
+  // every session silently falls back to bash.
+  if (shell) env.push(`Environment="SWITCHBOARD_SHELL=${shell}"`);
+  if (token) env.push(`Environment="SWITCHBOARD_TOKEN=${token}"`);
+  return `[Unit]
+Description=Switchboard — a shell on this machine, in your browser
+Documentation=https://github.com/lfkdsk/Switchboard
+
+[Service]
+Type=simple
+ExecStart="${process.execPath}" "${CLI_PATH}"
+${env.join("\n")}
+# Not Restart=always: when the relay hands this circuit to a newer daemon for the
+# same machine, this one exits 0 on purpose (see the 4001 close handler). Only
+# restarting on failure honours that instead of restarting back into the fight.
+Restart=on-failure
+RestartSec=5
+# No After=network-online.target — that's a system target a user unit can't pull
+# in, and the daemon already retries the relay with its own backoff.
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function serviceInstall() {
+  requireSystemd();
+  requireStablePath();
+  // Same rule the macOS app applies to silent launches: an anonymous token
+  // nobody has seen is useless, and a fresh random one every restart is worse —
+  // the URL would change on each boot. Demand a durable credential.
+  if (!cfg.agentToken && !args.token && !process.env.SWITCHBOARD_TOKEN) {
+    die("Not signed in, so the service would mint a new random token on every\n" +
+      "restart — and nobody would ever see the URL it printed.\n\n" +
+      "Bind this machine to your account first, then install:\n\n" +
+      "  switchboard login       # Ctrl-C once it's connected\n" +
+      "  switchboard service install\n\n" +
+      "Or pin a fixed token you already hold:\n\n" +
+      "  switchboard service install --token <token>\n");
+  }
+
+  fs.mkdirSync(path.dirname(UNIT_PATH), { recursive: true });
+  // 0600: the unit may carry a token, and the token *is* the shell credential.
+  fs.writeFileSync(UNIT_PATH, unitBody(), { mode: 0o600 });
+  console.log("Wrote " + UNIT_PATH);
+
+  // Lingering is what makes this survive logout and come up at boot; without it
+  // the user manager only exists while a session does.
+  const user = os.userInfo().username;
+  const linger = sh("loginctl", ["enable-linger", user]);
+  if (linger.status !== 0) {
+    console.error(`\n! Could not enable lingering (${(linger.stderr || "").trim() || "loginctl unavailable"}).\n` +
+      `  The service will still start when you log in, but not at boot. Fix with:\n\n` +
+      `    sudo loginctl enable-linger ${user}\n`);
+  }
+
+  for (const argv of [["daemon-reload"], ["enable", "--now", UNIT_NAME]]) {
+    const r = sh("systemctl", ["--user", ...argv]);
+    if (r.status !== 0) die(`systemctl --user ${argv.join(" ")} failed:\n${r.stderr || r.stdout}`);
+  }
+
+  console.log("\n✓ Switchboard is running in the background and will start at boot.\n");
+  const hints = [
+    [`systemctl --user status ${UNIT_NAME}`, "is it up?"],
+    [`journalctl --user -u ${UNIT_NAME} -f`, "follow its log"],
+    ["switchboard service uninstall", "undo all of this"],
+  ];
+  const w = Math.max(...hints.map(([c]) => c.length));
+  for (const [cmd, note] of hints) console.log(`  ${cmd.padEnd(w)}   # ${note}`);
+  if (cfg.agentToken) console.log(`\nThis machine should now appear in your dashboard: ${SERVER}`);
+  console.log("");
+  process.exit(0);
+}
+
+function serviceUninstall() {
+  requireSystemd();
+  if (!fs.existsSync(UNIT_PATH)) die("Nothing to remove — no unit at " + UNIT_PATH);
+  sh("systemctl", ["--user", "disable", "--now", UNIT_NAME]);
+  fs.rmSync(UNIT_PATH, { force: true });
+  sh("systemctl", ["--user", "daemon-reload"]);
+  console.log(`✓ Stopped and removed ${UNIT_PATH}\n`);
+  // Lingering is user-wide, so clearing it could take down someone else's
+  // long-running units. Leave it and say so.
+  console.log(`Lingering was left enabled (it's user-wide and other services may rely
+on it). Turn it off with: sudo loginctl disable-linger ${os.userInfo().username}\n`);
+  process.exit(0);
+}
+
+function doService(action) {
+  switch (action) {
+    case "install": return serviceInstall();
+    case "uninstall": case "remove": return serviceUninstall();
+    case "status": {
+      requireSystemd();
+      const r = spawnSync("systemctl", ["--user", "status", UNIT_NAME], { stdio: "inherit" });
+      process.exit(r.status === null ? 1 : r.status);
+      break;
+    }
+    default:
+      die(`Usage: switchboard service <install|uninstall|status>\n\n` +
+        `  install     Run Switchboard in the background via systemd, starting at boot.\n` +
+        `  uninstall   Stop it and remove the unit.\n` +
+        `  status      Show whether it's running.\n`);
+  }
 }
 
 // Connection state, resolved by setupConnection() at startup — after any login —
@@ -640,6 +798,7 @@ function sendStats() {
 // ---- start ---------------------------------------------------------------
 (async function main() {
   if (sub === "logout") return doLogout(); // remove creds and exit
+  if (sub === "service") return doService(serviceAction); // install/remove the systemd unit and exit
   if (sub === "login") {
     // One step: sign in, then fall through to expose this machine's shell.
     await doLogin(); // saves config; fatal-exits on failure
@@ -651,10 +810,14 @@ function sendStats() {
   log(`connecting to ${SERVER} …`);
   emitStatus("connecting", { server: SERVER, mode: BOUND ? "account" : "token" });
   connect();
-  process.on("SIGINT", () => {
-    log("shutting down.");
-    emitStatus("stopping", {});
+  // SIGTERM matters as much as SIGINT: it's what `systemctl stop` sends, and
+  // Node's default handler would exit without reaping the shells we spawned.
+  const shutdown = (sig) => () => {
+    log(`shutting down (${sig}).`);
+    emitStatus("stopping", { signal: sig });
     for (const sid of sessions.keys()) killSession(sid);
     process.exit(0);
-  });
+  };
+  process.on("SIGINT", shutdown("SIGINT"));
+  process.on("SIGTERM", shutdown("SIGTERM"));
 })();

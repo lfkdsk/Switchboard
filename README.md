@@ -108,6 +108,43 @@ or build it yourself from [`macos/`](macos/README.md):
 cd macos && scripts/make-app.sh && open build/Switchboard.app
 ```
 
+### Keep it running — Linux background service
+
+On Linux the daemon runs as a **systemd user service**, so it starts at boot and
+keeps running after you log out — no terminal window, no tray icon needed:
+
+```bash
+npm install -g @switch-board/cli
+switchboard login                  # bind this machine; Ctrl-C once it connects
+switchboard service install
+```
+
+That writes `~/.config/systemd/user/switchboard.service`, enables it, and turns on
+[lingering](https://www.freedesktop.org/software/systemd/man/loginctl.html#enable-linger%20USER%E2%80%A6)
+so it survives logout. From there it's an ordinary unit:
+
+```bash
+systemctl --user status switchboard.service
+journalctl --user -u switchboard.service -f
+switchboard service uninstall
+```
+
+It installs at **user** scope, not `/etc/systemd/system` — the daemon reads your
+`~/.switchboard/config.json` and spawns *your* login shell, so it runs as you and
+needs no root. Sign in first: without a stored credential the service would mint
+a fresh random token on every restart and nobody would ever see the URL. To pin a
+token you already hold, use `switchboard service install --token <token>`.
+
+> **Build prerequisite:** node-pty ships prebuilt binaries for macOS and Windows
+> but **not Linux**, so installing compiles it from source. If `npm install`
+> fails, you're missing a toolchain:
+> `apt install -y python3 make g++` (or `dnf groupinstall "Development Tools"`).
+
+> **No systemd?** On Alpine/Devuan (OpenRC) or WSL without systemd, `service
+> install` will tell you so — run `switchboard` under your own supervisor
+> instead. It handles `SIGTERM` cleanly and exits 0 when the relay hands its
+> circuit to a newer daemon, so `Restart=on-failure` semantics work anywhere.
+
 <p align="center">
   <img src="docs/landing.png" alt="The Switchboard landing page: sign in with GitHub, or paste a one-off token" width="720">
 </p>
@@ -200,6 +237,8 @@ switchboard login            Sign in via the browser, then expose this machine's
 switchboard                  Expose this shell using saved credentials, or an
                              anonymous one-off token if you're not signed in.
 switchboard logout           Remove the stored account credential.
+switchboard service install  Linux: run in the background via systemd, starting
+                             at boot. Also: uninstall, status.
 ```
 
 | Option | Description |
