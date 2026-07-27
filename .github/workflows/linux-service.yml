@@ -1,0 +1,123 @@
+name: Linux service
+
+# Exercises the Linux background-service path end to end on a real systemd:
+# compile node-pty from source (there are no Linux prebuilds), install the user
+# unit, confirm the daemon actually comes up under systemd, then tear it down.
+on:
+  push:
+    branches: [main]
+    paths: ['cli/**', '.github/workflows/linux-service.yml']
+  pull_request:
+    paths: ['cli/**', '.github/workflows/linux-service.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: linux-service-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  service:
+    name: systemd --user install/uninstall
+    runs-on: ubuntu-latest
+    env:
+      # Long enough to clear MIN_TOKEN_LEN. Nothing listens on port 9, so the
+      # daemon stays in its reconnect loop — which is exactly what we assert.
+      TOKEN: ci0123456789abcdef0123456789abcd
+      SERVER: http://127.0.0.1:9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      # The runner executes outside a login session, so there's no user manager
+      # by default. Lingering is what spawns user@$UID.service — the same
+      # mechanism `service install` relies on for surviving logout.
+      - name: Bring up a systemd user manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          for i in $(seq 30); do
+            XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show-environment >/dev/null 2>&1 && break
+            sleep 1
+          done
+          XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show-environment >/dev/null
+
+      # node-pty ships prebuilds for darwin/win32 only, so this is a real
+      # source build — it catches a broken binding.gyp or a toolchain claim in
+      # the README going stale.
+      - name: Install the CLI globally (compiles node-pty from source)
+        run: npm install -g ./cli
+
+      - name: Guard — refuses to install from an npx cache path
+        run: |
+          FAKE="$RUNNER_TEMP/_npx/deadbeef/node_modules/@switch-board/cli"
+          mkdir -p "$FAKE"
+          # Copy the installed package wholesale so node-pty resolves — the
+          # guard fires well after `require("node-pty")` at module load.
+          cp -R "$(npm root -g)/@switch-board/cli/." "$FAKE/"
+          if node "$FAKE/index.js" service install --token "$TOKEN" > out.txt 2>&1; then
+            echo "::error::install should have refused an npx cache path"; cat out.txt; exit 1
+          fi
+          grep -q "npx's cache" out.txt || { echo "::error::wrong refusal"; cat out.txt; exit 1; }
+
+      - name: Guard — refuses to install unauthenticated
+        run: |
+          if switchboard service install --server "$SERVER" > out.txt 2>&1; then
+            echo "::error::install should have refused without a credential"; cat out.txt; exit 1
+          fi
+          grep -q "Not signed in" out.txt || { echo "::error::wrong refusal"; cat out.txt; exit 1; }
+
+      # --shell is explicit because $SHELL is not reliably set in a runner step,
+      # and an absent one would make the "shell is pinned" assertion vacuous.
+      - name: Install the service
+        run: switchboard service install --token "$TOKEN" --server "$SERVER" --shell /bin/bash
+
+      - name: Verify the generated unit
+        run: |
+          UNIT="$HOME/.config/systemd/user/switchboard.service"
+          echo "--- $UNIT ---"; cat "$UNIT"
+          test "$(stat -c '%a' "$UNIT")" = 600 || { echo "::error::unit should be 0600 (carries a token)"; exit 1; }
+          # on-failure, not always: the daemon exits 0 on purpose when the relay
+          # hands its circuit to a newer one (close code 4001).
+          grep -qx 'Restart=on-failure' "$UNIT" || { echo "::error::expected Restart=on-failure"; exit 1; }
+          grep -qx 'WantedBy=default.target' "$UNIT" || { echo "::error::expected WantedBy=default.target"; exit 1; }
+          grep -q "SWITCHBOARD_SERVER=$SERVER" "$UNIT" || { echo "::error::server not pinned"; exit 1; }
+          grep -q 'SWITCHBOARD_SHELL=/bin/bash' "$UNIT" || { echo "::error::shell not pinned"; exit 1; }
+          # Non-gating: actually starting the unit below is the stronger check,
+          # and verify is noisy about units outside the search path.
+          systemd-analyze --user verify "$UNIT" || echo "note: systemd-analyze had remarks (non-gating)"
+
+      - name: Verify it is enabled, running, and talking to the relay
+        run: |
+          systemctl --user is-enabled switchboard.service
+          systemctl --user is-active switchboard.service
+          # The daemon logs its first line before dialing; give journald a beat.
+          for i in $(seq 20); do
+            journalctl --user -u switchboard.service --no-pager | grep -q 'connecting to' && break
+            sleep 1
+          done
+          journalctl --user -u switchboard.service --no-pager | tail -20
+          journalctl --user -u switchboard.service --no-pager | grep -q "connecting to $SERVER" \
+            || { echo "::error::daemon never dialed the configured relay"; exit 1; }
+
+      - name: Verify SIGTERM stops it cleanly
+        run: |
+          systemctl --user stop switchboard.service
+          journalctl --user -u switchboard.service --no-pager | tail -5
+          journalctl --user -u switchboard.service --no-pager | grep -q 'shutting down (SIGTERM)' \
+            || { echo "::error::SIGTERM did not reach the daemon's handler"; exit 1; }
+          # A clean exit under `systemctl stop` must not be recorded as a failure.
+          test "$(systemctl --user show -p Result --value switchboard.service)" = success \
+            || { echo "::error::stop was not recorded as a clean exit"; exit 1; }
+          systemctl --user start switchboard.service
+
+      - name: Uninstall
+        run: |
+          switchboard service uninstall
+          test ! -e "$HOME/.config/systemd/user/switchboard.service" || { echo "::error::unit still on disk"; exit 1; }
+          if systemctl --user is-active --quiet switchboard.service; then
+            echo "::error::service still running after uninstall"; exit 1
+          fi
+          if switchboard service uninstall > out.txt 2>&1; then
+            echo "::error::a second uninstall should report there is nothing to remove"; cat out.txt; exit 1
+          fi
