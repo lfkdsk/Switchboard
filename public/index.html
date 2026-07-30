@@ -225,28 +225,56 @@
       if (s < 86400) return Math.floor(s / 3600) + "h ago"; return Math.floor(s / 86400) + "d ago";
     }
     function fmtBytes(n) { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
+    const machineEls = new Map(); // machine_id -> row element, reused across polls so rows don't blink
     async function renderDashboard(silent) {
       const list = $("machineList");
-      if (!silent && !list.children.length) list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
+      if (!silent && !machineEls.size) list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
       let machines = [];
       try { machines = (await (await api("/api/machines")).json()).machines || []; }
-      catch { if (!silent) list.innerHTML = '<div class="empty">Could not load machines.</div>'; return; }
-      if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switch-board/cli login</code> on a host to bind it.</div>'; return; }
-      list.innerHTML = "";
-      for (const m of machines) {
+      catch { if (!silent) { list.innerHTML = '<div class="empty">Could not load machines.</div>'; machineEls.clear(); } return; }
+      if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switch-board/cli login</code> on a host to bind it.</div>'; machineEls.clear(); return; }
+
+      // Drop the placeholder / error text the first time we have real rows.
+      if (!machineEls.size) list.innerHTML = "";
+
+      // Remove rows for machines that no longer exist.
+      const ids = new Set(machines.map((m) => m.machine_id));
+      for (const [id, el] of machineEls) if (!ids.has(id)) { el.remove(); machineEls.delete(id); }
+
+      machines.forEach((m, i) => {
         const online = Date.now() - m.last_seen < 6000; // heartbeat freshness
+        const label = m.name || m.machine_id.slice(0, 8);
         const meta = online
           ? `online · ${m.rtt != null ? m.rtt + "ms" : "—"}${m.cpu != null ? " · cpu " + Math.round(m.cpu * 100) + "%" : ""}${m.mem_used != null && m.mem_total ? " · mem " + fmtBytes(m.mem_used) + "/" + fmtBytes(m.mem_total) : ""}`
           : "offline · last seen " + fmtAgo(m.last_seen);
-        const el = document.createElement("div");
-        el.className = "machine";
-        el.innerHTML = `<span class="dot ${online ? "on" : "off"}"></span><div><div class="name"></div><div class="meta">${meta}</div></div><span class="spacer"></span><button class="primary">Open shell</button>${online ? "" : '<button class="danger" title="Remove this offline machine from your dashboard">Delete</button>'}`;
-        const label = m.name || m.machine_id.slice(0, 8);
+
+        let el = machineEls.get(m.machine_id);
+        if (!el) { // first sighting: build the row once, then reuse it
+          el = document.createElement("div");
+          el.className = "machine";
+          el.innerHTML = `<span class="dot"></span><div><div class="name"></div><div class="meta"></div></div><span class="spacer"></span><button class="primary">Open shell</button>`;
+          machineEls.set(m.machine_id, el);
+        }
+        // Update fields in place — no teardown, so no flicker.
+        el.querySelector(".dot").className = "dot " + (online ? "on" : "off");
         el.querySelector(".name").textContent = label;
+        el.querySelector(".meta").textContent = meta;
         el.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
-        if (!online) el.querySelector(".danger").onclick = () => deleteMachine(m.machine_id, label, el);
-        list.appendChild(el);
-      }
+        // The Delete button only exists while the machine is offline.
+        let del = el.querySelector(".danger");
+        if (!online) {
+          if (!del) {
+            del = document.createElement("button");
+            del.className = "danger";
+            del.textContent = "Delete";
+            del.title = "Remove this offline machine from your dashboard";
+            el.appendChild(del);
+          }
+          del.onclick = () => deleteMachine(m.machine_id, label, el);
+        } else if (del) { del.remove(); }
+        // Place the row at its slot (only moves the node if the order actually changed).
+        if (list.children[i] !== el) list.insertBefore(el, list.children[i] || null);
+      });
     }
 
     async function deleteMachine(machineId, label, el) {
@@ -258,6 +286,7 @@
         if (r.ok) {
           toast(`Deleted “${label}”`, "ok");
           el.remove();
+          machineEls.delete(machineId);
           if (!$("machineList").children.length) renderDashboard();
         } else {
           const e = await r.json().catch(() => ({}));

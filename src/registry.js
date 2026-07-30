@@ -65,7 +65,9 @@ export async function machineOwner(env, machineId) {
 }
 export async function listMachines(env, accountId) {
   const { results } = await env.DB.prepare(
-    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total FROM machines WHERE account_id=? ORDER BY last_seen DESC",
+    // Stable order: created_at never changes, so rows keep a fixed position.
+    // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
+    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
   ).bind(accountId).all();
   return results || [];
 }
