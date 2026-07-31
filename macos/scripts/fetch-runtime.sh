@@ -56,9 +56,15 @@ fi
 chmod +x "$DEST/bin/node"
 
 # Stage the daemon sources and install production deps with the bundled Node.
-cp "$REPO_DIR/cli/index.js" "$DEST/cli/"
-cp "$REPO_DIR/cli/package.json" "$DEST/cli/"
-cp -R "$REPO_DIR/cli/scripts" "$DEST/cli/"
+#
+# Take them from `npm pack` rather than copying named files: the package's own
+# `files` field already declares exactly what the daemon needs to run, so this
+# bundle stays byte-identical to the published package and a newly added source
+# file can't be forgotten here. (It was: activity.js shipped to npm but not into
+# the .app, and the daemon then died on `require("./activity")`.)
+TARBALL="$(cd "$REPO_DIR/cli" && npm pack --silent --pack-destination "$WORK")"
+tar -xzf "$WORK/$TARBALL" -C "$WORK"
+cp -R "$WORK/package/." "$DEST/cli/"
 
 echo "  installing cli production deps" >&2
 ( cd "$DEST/cli" && PATH="$DEST/bin:$PATH" npm install --omit=dev --no-audit --no-fund )
