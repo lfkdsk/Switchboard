@@ -53,7 +53,9 @@ export class Circuit extends DurableObject {
     const att = ws.deserializeAttachment() || {};
     if (att.role === "daemon") {
       // Bound-machine heartbeat → D1 (small JSON stats only; skip binary + big dl-chunks).
-      if (att.machineId && typeof message === "string" && message.length < 2000) {
+      // The cap sits above a full stats frame — which now carries the activity
+      // summary — but well below a dl-chunk, so file transfers still skip parsing.
+      if (att.machineId && typeof message === "string" && message.length < 8000) {
         this.recordHeartbeat(att.machineId, message);
       }
       for (const b of this.ctx.getWebSockets("browser")) this.safeSend(b, message);

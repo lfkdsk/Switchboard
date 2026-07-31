@@ -1,0 +1,12 @@
+-- Adds machines.activity — the JSON summary of what a host is currently doing
+-- (shell processes, top cpu consumers, and opt-in Claude Code sessions), shown
+-- on the dashboard so you don't have to open a shell to find out.
+--
+-- schema.sql only uses CREATE TABLE IF NOT EXISTS, so it can't add a column to a
+-- database that already exists. Run this once against each:
+--   npx wrangler d1 execute switchboard_db --local  --file migrations/0001_add_activity.sql
+--   npx wrangler d1 execute switchboard_db --remote --file migrations/0001_add_activity.sql
+--
+-- Not idempotent: SQLite has no ADD COLUMN IF NOT EXISTS, so a second run fails
+-- with "duplicate column name: activity". That error means it was already applied.
+ALTER TABLE machines ADD COLUMN activity TEXT;

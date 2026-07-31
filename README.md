@@ -67,6 +67,12 @@ quick remote help. No sign-in required; the token *is* the key (see
 - **📊 All your machines, one dashboard** — sign in with GitHub and every machine
   you've bound is listed with live status: online/offline, round-trip latency,
   CPU, memory, and last-seen.
+- **👀 See what each host is doing** — without opening a shell. Every machine
+  shows the foreground process of each open shell, how long it's been quiet, and
+  the busiest processes on the box. Opt in with `SWITCHBOARD_ACTIVITY=claude` and
+  running **Claude Code** sessions show up too: what each one is working on,
+  which tool it's running, and whether it's mid-task or waiting on you — the
+  thing cpu% can't tell you, since an agent blocked on an API call looks idle.
 - **🗂️ Multiple shells, tmux-style** — open as many tabs as you want on a single
   machine. Shells survive tab reloads and flaky links; in account mode they keep
   running even after you close the browser, so you can reattach right where you
@@ -254,6 +260,13 @@ Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
 accepted for drop-in compatibility. Account credentials live in
 `~/.switchboard/config.json` (mode `0600`).
 
+`SWITCHBOARD_ACTIVITY=claude` additionally reports running Claude Code sessions
+to your dashboard. It's off by default because a session's title summarises what
+you asked for — more revealing than a process name. Even when enabled the daemon
+sends only the title, the current tool name, and timestamps; never your prompts
+and never message contents. Shell process names and cwds are always reported,
+and never include command-line arguments (those routinely carry secrets).
+
 ---
 
 ## Security
@@ -287,8 +300,10 @@ accepted for drop-in compatibility. Account credentials live in
 | `public/index.html` | The browser app — terminal, tabs, dashboard, file transfer |
 | `public/cli-login.html` | The `switchboard login` authorization page |
 | `schema.sql` | D1 schema |
+| `migrations/` | Incremental D1 changes, for databases that predate a column |
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
 | `cli/` | `@switch-board/cli` — the host daemon |
+| `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 
 ---

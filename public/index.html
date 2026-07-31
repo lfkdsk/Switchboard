@@ -48,9 +48,22 @@
   .dash-wrap { width: min(720px, 100%); margin: 0 auto; }
   .dash-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
   .dash-head h1 { font-size: 18px; margin: 0; }
-  .machine { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 10px; }
+  .machine { display: flex; flex-direction: column; gap: 9px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 10px; }
+  .machine .m-head { display: flex; align-items: center; gap: 12px; }
   .machine .name { font-weight: 600; }
   .machine .meta { color: var(--muted); font-size: 12px; }
+  /* activity: what the host is actually doing, without opening a shell */
+  .m-act { display: flex; flex-direction: column; gap: 4px; font-size: 12px; padding-left: 20px; }
+  .m-act:empty { display: none; }
+  .act-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .act-mark { flex: none; width: 8px; color: var(--muted); }
+  /* min-width keeps the description column aligned across rows whose process
+     names differ in length (vim vs BetterDisplay), without truncating either. */
+  .act-proc { flex: none; color: var(--fg); min-width: 4.5em; }
+  .act-row.hot .act-mark, .act-row.hot .act-proc { color: var(--accent); }
+  .act-text { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .act-status { flex: none; color: var(--muted); }
+  .act-row.hot .act-status { color: var(--fg); }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 8px; }
   code { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
   /* terminal + tabs */
@@ -225,6 +238,58 @@
       if (s < 86400) return Math.floor(s / 3600) + "h ago"; return Math.floor(s / 86400) + "d ago";
     }
     function fmtBytes(n) { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
+    function fmtDur(ms) {
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m";
+      if (s < 86400) return Math.floor(s / 3600) + "h"; return Math.floor(s / 86400) + "d";
+    }
+
+    // ---- activity ("what is this host doing?") -----------------------------
+    // Flatten the daemon's activity blob into uniform rows so one renderer can
+    // draw agents, shells and busy processes alike.
+    const AGENT_STATE = { tool: "", thinking: "thinking", waiting: "waiting" };
+    function activityRows(a) {
+      if (!a) return [];
+      const rows = [];
+      for (const g of a.agents || []) {
+        // A session mid-tool-call or mid-response is the thing you actually
+        // want to see; one parked waiting for you is dimmed.
+        const hot = g.state === "tool" || g.state === "thinking";
+        const status = [g.state === "tool" ? g.tool : AGENT_STATE[g.state], g.at ? fmtDur(Date.now() - g.at) : null]
+          .filter(Boolean).join(" · ");
+        rows.push({ hot, mark: hot ? "▸" : "", proc: g.kind, text: [g.title, g.cwd].filter(Boolean).join("  "), status });
+      }
+      if (a.agentsIdle) rows.push({ hot: false, mark: "", proc: "", text: `+${a.agentsIdle} idle session${a.agentsIdle > 1 ? "s" : ""}`, status: "" });
+      for (const s of a.shells || []) {
+        // Below a couple of seconds the shell is mid-output — call it live
+        // rather than showing a stopwatch that resets on every frame.
+        const live = s.idle != null && s.idle < 2500;
+        rows.push({ hot: live, mark: "", proc: s.proc || "shell", text: s.cwd || "", status: s.idle == null ? "" : live ? "active" : "idle " + fmtDur(s.idle) });
+      }
+      if ((a.top || []).length) {
+        rows.push({ hot: false, mark: "", proc: "", text: a.top.map((t) => `${t.name} ${t.cpu}%`).join(" · "), status: "" });
+      }
+      return rows;
+    }
+    // Reuse row elements across polls for the same reason the machine rows are
+    // reused: rebuilding them every 3s makes the whole block flicker.
+    function syncActivity(box, rows) {
+      while (box.children.length > rows.length) box.lastChild.remove();
+      while (box.children.length < rows.length) {
+        const r = document.createElement("div");
+        r.className = "act-row";
+        r.innerHTML = '<span class="act-mark"></span><span class="act-proc"></span><span class="act-text"></span><span class="spacer"></span><span class="act-status"></span>';
+        box.appendChild(r);
+      }
+      rows.forEach((row, i) => {
+        const el = box.children[i];
+        el.classList.toggle("hot", !!row.hot);
+        el.querySelector(".act-mark").textContent = row.mark;
+        el.querySelector(".act-proc").textContent = row.proc;
+        el.querySelector(".act-text").textContent = row.text;
+        el.querySelector(".act-status").textContent = row.status;
+      });
+    }
     const machineEls = new Map(); // machine_id -> row element, reused across polls so rows don't blink
     async function renderDashboard(silent) {
       const list = $("machineList");
@@ -252,23 +317,26 @@
         if (!el) { // first sighting: build the row once, then reuse it
           el = document.createElement("div");
           el.className = "machine";
-          el.innerHTML = `<span class="dot"></span><div><div class="name"></div><div class="meta"></div></div><span class="spacer"></span><button class="primary">Open shell</button>`;
+          el.innerHTML = `<div class="m-head"><span class="dot"></span><div><div class="name"></div><div class="meta"></div></div><span class="spacer"></span><button class="primary">Open shell</button></div><div class="m-act"></div>`;
           machineEls.set(m.machine_id, el);
         }
         // Update fields in place — no teardown, so no flicker.
+        const head = el.querySelector(".m-head");
         el.querySelector(".dot").className = "dot " + (online ? "on" : "off");
         el.querySelector(".name").textContent = label;
         el.querySelector(".meta").textContent = meta;
         el.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        // An offline machine's last-known activity is stale by definition.
+        syncActivity(el.querySelector(".m-act"), online ? activityRows(m.activity) : []);
         // The Delete button only exists while the machine is offline.
-        let del = el.querySelector(".danger");
+        let del = head.querySelector(".danger");
         if (!online) {
           if (!del) {
             del = document.createElement("button");
             del.className = "danger";
             del.textContent = "Delete";
             del.title = "Remove this offline machine from your dashboard";
-            el.appendChild(del);
+            head.appendChild(del);
           }
           del.onclick = () => deleteMachine(m.machine_id, label, el);
         } else if (del) { del.remove(); }

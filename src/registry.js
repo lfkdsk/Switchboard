@@ -50,14 +50,23 @@ export async function registerMachine(env, machineId, account, name) {
   return true;
 }
 export async function setMachineOffline(env, machineId) {
-  await env.DB.prepare("UPDATE machines SET online=0, last_seen=? WHERE machine_id=?").bind(Date.now(), machineId).run();
+  // Clear activity too: "claude · running Bash" is a claim about *now*, and
+  // leaving the last one behind would have an offline machine still looking busy.
+  await env.DB.prepare("UPDATE machines SET online=0, last_seen=?, activity=NULL WHERE machine_id=?")
+    .bind(Date.now(), machineId).run();
 }
 // Heartbeat: each daemon `stats` message bumps last_seen (+ latency/load) so the
 // dashboard shows accurate, self-healing status (online = last_seen is fresh).
 export async function updateMachineStats(env, machineId, s) {
   await env.DB.prepare(
-    "UPDATE machines SET online=1, last_seen=?, rtt=?, cpu=?, mem_used=?, mem_total=? WHERE machine_id=?",
-  ).bind(Date.now(), s.rtt ?? null, s.cpu ?? null, s.memUsed ?? null, s.memTotal ?? null, machineId).run();
+    "UPDATE machines SET online=1, last_seen=?, rtt=?, cpu=?, mem_used=?, mem_total=?, activity=? WHERE machine_id=?",
+  ).bind(
+    Date.now(), s.rtt ?? null, s.cpu ?? null, s.memUsed ?? null, s.memTotal ?? null,
+    // Stored as an opaque JSON blob: it's display-only, ephemeral, and rides in
+    // the UPDATE the heartbeat already performs, so it costs no extra write.
+    s.act ? JSON.stringify(s.act) : null,
+    machineId,
+  ).run();
 }
 export async function machineOwner(env, machineId) {
   const row = await env.DB.prepare("SELECT account_id FROM machines WHERE machine_id=?").bind(machineId).first();
@@ -67,9 +76,14 @@ export async function listMachines(env, accountId) {
   const { results } = await env.DB.prepare(
     // Stable order: created_at never changes, so rows keep a fixed position.
     // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
-    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
+    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
   ).bind(accountId).all();
-  return results || [];
+  // Hand the client a parsed object; a row written by an older daemon has none.
+  return (results || []).map((r) => {
+    let activity = null;
+    if (r.activity) { try { activity = JSON.parse(r.activity); } catch {} }
+    return { ...r, activity };
+  });
 }
 
 // A machine is "online" while its heartbeat stays fresh; mirror the dashboard's
