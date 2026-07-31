@@ -30,6 +30,35 @@ and drives the menu state machine. Human-readable logs still go to
 `~/Library/Logs/Switchboard/daemon.log`. This is opt-in and inert for normal CLI
 use.
 
+## Hot updates (cli)
+
+The JS daemon can update itself from npm without a new DMG. `DaemonUpdater`
+checks `registry.npmjs.org` for `@switch-board/cli` (on launch, every 6 h, and
+from **Settings → Check for cli updates**), verifies the tarball against the
+registry's sha512 SSRI, and stages it under
+`~/Library/Application Support/Switchboard/cli-updates/<version>/`. When a
+staged version is newer than the bundled one, the supervisor runs its
+`index.js` — still on the **bundled** Node and the **bundled** `node_modules`
+(via a `node_modules` symlink into the staged dir, `NODE_PATH` as fallback), so
+native code (node-pty) never changes outside a signed release.
+
+Guardrails:
+
+- An update whose `dependencies` differ from the bundled package's is refused
+  (`needs a new app build`) — dep changes ride the DMG train.
+- If a hot-updated daemon dies twice within 20 s of starting, the update is
+  dropped and the bundled cli takes the next restart (`updater.log` records it).
+- After a DMG upgrade whose bundled cli is ≥ the staged version, the stale
+  staging is pruned automatically.
+
+Headless check (same code path as the menu button):
+
+```bash
+build/Switchboard.app/Contents/MacOS/Switchboard --update-check
+```
+
+Logs: `~/Library/Logs/Switchboard/updater.log`.
+
 ## Develop
 
 ```bash
@@ -107,7 +136,8 @@ hardened runtime.
 | `Sources/Switchboard/DaemonSupervisor.swift` | spawn/restart the daemon, parse NDJSON, exit-code handling |
 | `Sources/Switchboard/MenuContent.swift` | the menu UI |
 | `Sources/Switchboard/StatusEvent.swift` | NDJSON event model + connection state |
-| `Sources/Switchboard/NodeRuntime.swift` | locate bundled vs dev Node + cli |
+| `Sources/Switchboard/NodeRuntime.swift` | locate bundled vs dev Node + cli (hot update aware) |
+| `Sources/Switchboard/DaemonUpdater.swift` | hot-update the cli from npm (verify, stage, rollback) |
 | `Sources/Switchboard/Prefs.swift` | server/shell prefs + launch-at-login |
 | `Sources/Switchboard/ConfigReader.swift` | read `~/.switchboard/config.json` |
 | `Sources/Switchboard/SelfTest.swift` | headless `--selftest` verification |

@@ -5,7 +5,9 @@ import Foundation
 /// Resolution order:
 ///   1. Bundled runtime inside the .app — Resources/runtime/bin/node + runtime/cli/index.js
 ///      (what scripts/make-app.sh produces; the only path that works for a
-///      distributed app, since a GUI process has a minimal PATH).
+///      distributed app, since a GUI process has a minimal PATH). If a validated
+///      hot update is staged (see DaemonUpdater), its index.js replaces the
+///      bundled one — still on the bundled Node and bundled node_modules.
 ///   2. Dev override via SWITCHBOARD_NODE + SWITCHBOARD_CLI env vars.
 ///   3. System `node` on PATH + a sibling ../cli/index.js relative to the binary
 ///      (handy when running `swift run` from inside the repo).
@@ -13,6 +15,10 @@ enum NodeRuntime {
     struct Resolved {
         let node: URL
         let cli: URL
+        /// NODE_PATH fallback for hot updates (bundled node_modules), in case
+        /// the staged dir's node_modules symlink couldn't be created.
+        var nodePathDir: URL? = nil
+        var isHotUpdate: Bool = false
     }
 
     static func resolve() -> Resolved? {
@@ -23,6 +29,12 @@ enum NodeRuntime {
             let node = res.appendingPathComponent("runtime/bin/node")
             let cli = res.appendingPathComponent("runtime/cli/index.js")
             if fm.isExecutableFile(atPath: node.path), fm.fileExists(atPath: cli.path) {
+                if let up = DaemonUpdater.activeUpdate() {
+                    return Resolved(node: node,
+                                    cli: up.dir.appendingPathComponent("index.js"),
+                                    nodePathDir: res.appendingPathComponent("runtime/cli/node_modules"),
+                                    isHotUpdate: true)
+                }
                 return Resolved(node: node, cli: cli)
             }
         }

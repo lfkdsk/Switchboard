@@ -34,6 +34,13 @@ final class DaemonSupervisor: ObservableObject {
     private var restartWork: DispatchWorkItem?
     private var backoffMs = 1000
 
+    // Crash rollback for hot-updated cli code: if a launch that ran a staged
+    // update dies twice in a row within seconds, drop the update and let the
+    // bundled cli take the next restart.
+    private var lastLaunchDate: Date?
+    private var lastLaunchWasHotUpdate = false
+    private var hotUpdateStrikes = 0
+
     init(prefs: Prefs) {
         self.prefs = prefs
     }
@@ -71,7 +78,13 @@ final class DaemonSupervisor: ObservableObject {
         if !prefs.shell.trimmingCharacters(in: .whitespaces).isEmpty {
             env["SWITCHBOARD_SHELL"] = prefs.shell
         }
+        if let np = rt.nodePathDir {
+            env["NODE_PATH"] = np.path
+        }
         p.environment = env
+
+        lastLaunchDate = Date()
+        lastLaunchWasHotUpdate = rt.isHotUpdate
 
         // Daemon logs (human-readable) go to a rolling file; status flows via the
         // NDJSON file above, so we never have to drain a pipe.
@@ -131,7 +144,9 @@ final class DaemonSupervisor: ObservableObject {
         let p = Process()
         p.executableURL = rt.node
         p.arguments = [rt.cli.path, "logout"]
-        p.environment = ProcessInfo.processInfo.environment
+        var env = ProcessInfo.processInfo.environment
+        if let np = rt.nodePathDir { env["NODE_PATH"] = np.path }
+        p.environment = env
         try? p.run()
         p.terminationHandler = { _ in
             DispatchQueue.main.async { [weak self] in
@@ -169,6 +184,18 @@ final class DaemonSupervisor: ObservableObject {
         if let fatal = pendingFatal {
             state = .fatal(fatal)
             return
+        }
+        // A hot-updated cli that dies almost immediately is presumed broken:
+        // two strikes and the staged update is dropped, so the restart below
+        // resolves back to the known-good bundled cli.
+        if lastLaunchWasHotUpdate,
+           let started = lastLaunchDate, Date().timeIntervalSince(started) < 20 {
+            hotUpdateStrikes += 1
+            if hotUpdateStrikes >= 2 {
+                DaemonUpdater.revertToBundled(
+                    reason: "daemon exited \(hotUpdateStrikes)× within 20s of start (code \(code))")
+                hotUpdateStrikes = 0
+            }
         }
         // Unexpected exit with no fatal marker — treat as a crash and retry with
         // backoff. A clean `connected`/`ready` resets the backoff to 1s.
@@ -229,10 +256,12 @@ final class DaemonSupervisor: ObservableObject {
             if state == .starting || state == .stopped { state = .connecting }
         case "connected":
             backoffMs = 1000
+            hotUpdateStrikes = 0
             mode = e.mode ?? mode
             state = .online
         case "ready":
             backoffMs = 1000
+            hotUpdateStrikes = 0
             mode = e.mode ?? mode
             machineName = e.machine ?? machineName
             account = e.account ?? account

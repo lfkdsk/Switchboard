@@ -26,12 +26,15 @@ extension ConnState {
 struct MenuContent: View {
     @ObservedObject var supervisor: DaemonSupervisor
     @ObservedObject var prefs: Prefs
+    @ObservedObject var updater: DaemonUpdater
 
     @State private var config = ConfigReader.read()
     @State private var showSettings = false
     @State private var loginItemFailed = false
 
-    private let appVersion = "0.1.0"
+    // make-app.sh stamps the real version into Info.plist; bare `swift run` has none.
+    private let appVersion = Bundle.main
+        .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -66,6 +69,7 @@ struct MenuContent: View {
         .onAppear {
             config = ConfigReader.read()
             prefs.refreshLoginItem()
+            updater.refresh()
         }
     }
 
@@ -192,6 +196,10 @@ struct MenuContent: View {
                 }
                 Text("Relay/Shell changes apply on the next Start.")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
+
+                Divider()
+
+                updateRow
             }
             .padding(.top, 4)
         } label: {
@@ -200,9 +208,35 @@ struct MenuContent: View {
         .font(.system(size: 11))
     }
 
+    /// npm hot-update controls for the bundled cli, inside the settings group.
+    private var updateRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Button {
+                    Task { await updater.checkAndApply() }
+                } label: {
+                    Label("Check for cli updates", systemImage: "arrow.down.circle")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .disabled(updater.status == .checking || updater.bundledVersion == nil)
+                if updater.status == .checking {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            if let line = updater.status.line {
+                Text(line).font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var footer: some View {
         HStack {
-            Text("Switchboard \(appVersion)").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text("Switchboard \(appVersion)\(cliVersionSuffix)")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .help(updater.hotUpdateActive
+                    ? "cli hot-updated from npm (bundled: \(updater.bundledVersion ?? "?"))"
+                    : "cli bundled with the app")
             Spacer()
             Button("Quit") {
                 supervisor.stop()
@@ -210,6 +244,11 @@ struct MenuContent: View {
             }
             .font(.system(size: 11))
         }
+    }
+
+    private var cliVersionSuffix: String {
+        guard let v = updater.activeVersion else { return "" }
+        return " · cli \(v)\(updater.hotUpdateActive ? "↑" : "")"
     }
 
     // MARK: Bits
