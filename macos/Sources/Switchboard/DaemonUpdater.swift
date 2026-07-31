@@ -72,13 +72,16 @@ final class DaemonUpdater: ObservableObject {
     func startAutoChecks() {
         guard timer == nil, Self.bundledManifest() != nil else { return }
         // First check shortly after launch, then every 6 hours.
+        // `guard let self` first: the macos-14 toolchain rejects awaiting through
+        // a captured weak (mutable) self inside concurrently-executing code.
         checkTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 20 * 1_000_000_000)
-            guard !Task.isCancelled else { return }
-            await self?.checkAndApply(auto: true)
+            guard !Task.isCancelled, let self else { return }
+            await self.checkAndApply(auto: true)
         }
         let t = Timer(timeInterval: 6 * 3600, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.checkAndApply(auto: true) }
+            guard let self else { return }
+            Task { @MainActor in await self.checkAndApply(auto: true) }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
