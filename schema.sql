@@ -15,7 +15,11 @@ CREATE TABLE IF NOT EXISTS machines (
   rtt           INTEGER,            -- daemon↔relay round-trip (ms), from heartbeat
   cpu           REAL,               -- last reported cpu fraction 0..1
   mem_used      INTEGER,
-  mem_total     INTEGER
+  mem_total     INTEGER,
+  -- What the machine is doing, as an opaque JSON blob (shells / top / agents).
+  -- Display-only and always ephemeral: cleared the moment the daemon goes away.
+  -- See migrations/ for applying this to a database created before it existed.
+  activity      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_machines_account ON machines(account_id);
 

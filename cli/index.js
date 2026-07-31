@@ -31,6 +31,7 @@ const { exec, spawnSync } = require("child_process");
 const WebSocket = require("ws");
 const pty = require("node-pty");
 const fixPtyPerms = require("./scripts/fix-pty-perms");
+const activity = require("./activity");
 const pkg = require("./package.json");
 
 // ---- logging -------------------------------------------------------------
@@ -87,6 +88,11 @@ Options:
 
 Environment (overridden by the flags above):
   SWITCHBOARD_TOKEN, SWITCHBOARD_SERVER, SWITCHBOARD_SHELL  (WEBTERM_* also accepted)
+  SWITCHBOARD_ACTIVITY=claude   Also report live Claude Code sessions (title,
+                                current tool, idle time) to your dashboard.
+                                Off by default: a session title summarises what
+                                you asked for, so it leaves this machine only
+                                when you opt in.
 
 Notes:
   Logged in → this machine shows up in your dashboard; only you can open its shell.
@@ -410,9 +416,9 @@ function openSession(sid, cols, rows) {
     cwd: process.env.HOME || process.cwd(),
     env: process.env,
   });
-  s = { pty: p, graceTimer: null, startedAt: Date.now() };
+  s = { pty: p, graceTimer: null, startedAt: Date.now(), lastOutputAt: Date.now() };
   sessions.set(sid, s);
-  p.onData((d) => sendSessionData(sid, d));
+  p.onData((d) => { s.lastOutputAt = Date.now(); sendSessionData(sid, d); });
   p.onExit(({ exitCode }) => {
     sessions.delete(sid);
     sendCtl({ type: "exit", sid, code: exitCode });
@@ -619,6 +625,15 @@ function getShellCwd(sid, cb) {
   }
 }
 
+// Cached cwd per session. getShellCwd shells out — lsof on macOS — which is far
+// too expensive to repeat for every session on every 2s heartbeat, so refresh it
+// on a slow timer and let the heartbeat read the cache.
+const cwdCache = new Map(); // sid -> path
+function refreshCwds() {
+  for (const sid of sessions.keys()) getShellCwd(sid, (dir) => cwdCache.set(sid, dir));
+  for (const sid of [...cwdCache.keys()]) if (!sessions.has(sid)) cwdCache.delete(sid);
+}
+
 // Open for writing without clobbering: on a name clash, insert -1, -2, … before
 // the extension. "wx" makes the check-and-create atomic.
 function openUniqueFile(dir, name) {
@@ -776,6 +791,10 @@ function sendStats() {
   const cpu = cpuUsage();
   const memUsed = Math.max(0, Math.min(total, total - memAvailable));
   const cores = os.cpus().length;
+  // What the machine is *doing* — process names, idle times, and (opt-in) live
+  // Claude Code sessions. cpu alone can't answer this: an agent blocked on an
+  // API call looks exactly like an idle machine.
+  const act = activity.snapshot(sessions, cwdCache);
   try {
     ws.send(JSON.stringify({
       type: "stats",
@@ -787,8 +806,9 @@ function sendStats() {
       host: os.hostname(),
       platform: process.platform,
       rtt: lastRtt, // relay-edge round-trip from the previous tick (ms)
+      act,
     }));
-    emitStatus("stats", { cpu, memUsed, memTotal: total, cores, rtt: lastRtt });
+    emitStatus("stats", { cpu, memUsed, memTotal: total, cores, rtt: lastRtt, act });
     // Probe the relay edge for the next tick's rtt (auto-ponged, no DO wake).
     pingSentAt = Date.now();
     ws.send("ping");
@@ -807,7 +827,9 @@ function sendStats() {
   setupConnection();
   refreshMemAvailable();
   setInterval(sendStats, 2000);
+  setInterval(refreshCwds, 10000);
   log(`connecting to ${SERVER} …`);
+  if (activity.agentsEnabled) log("[activity] reporting Claude Code sessions (SWITCHBOARD_ACTIVITY)");
   emitStatus("connecting", { server: SERVER, mode: BOUND ? "account" : "token" });
   connect();
   // SIGTERM matters as much as SIGINT: it's what `systemctl stop` sends, and
