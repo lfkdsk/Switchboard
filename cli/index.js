@@ -91,6 +91,9 @@ Usage:
   switchboard flow <run|check> <file.json>
                                Run a graph of commands across several machines.
                                Whichever host you run it on conducts it.
+  switchboard mcp              Serve the machines to an agent over MCP (stdio):
+                               list them, run commands, move files. Point Claude
+                               Code or Codex at this command.
 
 Options:
   -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
@@ -149,7 +152,7 @@ function takeExecSpec(argv) {
 }
 
 const rawArgs = process.argv.slice(2);
-const sub = ["login", "logout", "service", "list", "exec", "flow"].includes(rawArgs[0]) ? rawArgs.shift() : null;
+const sub = ["login", "logout", "service", "list", "exec", "flow", "mcp"].includes(rawArgs[0]) ? rawArgs.shift() : null;
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
 const execSpec = sub === "exec" ? takeExecSpec(rawArgs) : null;
@@ -1188,6 +1191,7 @@ function sendStats() {
 (async function main() {
   if (sub === "logout") return doLogout(); // remove creds and exit
   if (sub === "service") return doService(serviceAction); // install/remove the systemd unit and exit
+  if (sub === "mcp") return require("./mcp").serve(SERVER, cfg.agentToken); // stdio server; nothing else may touch stdout
   if (sub === "list") return doList(); // what this account can reach; never becomes a daemon
   if (sub === "exec") return doExec(execSpec); // drive someone else's daemon; never becomes one
   if (sub === "flow") return doFlow(flowAction, flowFile); // conduct a graph of them; also never becomes one

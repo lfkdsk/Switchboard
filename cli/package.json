@@ -1,7 +1,7 @@
 {
   "name": "@switch-board/cli",
-  "version": "1.1.0",
-  "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay (bound to your account, or via a one-off token).",
+  "version": "1.2.0",
+  "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay (bound to your account, or via a one-off token), and drives other machines from this one.",
   "license": "MIT",
   "bin": {
     "switchboard": "index.js"
@@ -13,6 +13,9 @@
   "files": [
     "index.js",
     "activity.js",
+    "target.js",
+    "flow.js",
+    "mcp.js",
     "scripts/"
   ],
   "repository": {
