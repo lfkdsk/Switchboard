@@ -27,10 +27,11 @@ const crypto = require("crypto");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { exec, spawnSync } = require("child_process");
+const { exec, spawn, spawnSync } = require("child_process");
 const WebSocket = require("ws");
 const pty = require("node-pty");
 const fixPtyPerms = require("./scripts/fix-pty-perms");
+const { dial, machines: reachableMachines } = require("./target");
 const activity = require("./activity");
 const pkg = require("./package.json");
 
@@ -78,11 +79,21 @@ Usage:
   switchboard logout           Remove the stored account credential.
   switchboard service <verb>   Linux: run in the background via systemd, starting
                                at boot. Verbs: install, uninstall, status.
+  switchboard list             Machines this account can reach: your own, plus the
+                               ones shared with you and what they allow.
+  switchboard exec <machine> -- <command…>
+                               Run one command on another machine and stream it
+                               back here. No TTY, so stdout and stderr stay apart
+                               and the exit code is the command's own — this is
+                               the door for scripts and agents; the browser
+                               terminal is the one for people. <machine> is a name
+                               or id from "switchboard list", or a share token.
 
 Options:
   -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
   -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
+      --timeout <ms>    exec only: give up on the command after this long.
   -v, --version         Print version and exit.
   -h, --help            Show this help and exit.
 
@@ -112,6 +123,7 @@ function parseArgs(argv) {
       case "-t": case "--token": opts.token = inline !== null ? inline : argv[++i]; break;
       case "-s": case "--server": opts.server = inline !== null ? inline : argv[++i]; break;
       case "--shell": opts.shell = inline !== null ? inline : argv[++i]; break;
+      case "--timeout": opts.timeout = inline !== null ? inline : argv[++i]; break;
       default:
         console.error(`Unknown option: ${a}\n`);
         printHelp();
@@ -121,10 +133,23 @@ function parseArgs(argv) {
   return opts;
 }
 
+// `exec` carries a target and then a whole command line of its own. Neither is
+// ours to interpret, so both are lifted out of argv before parseArgs sees it —
+// otherwise the command's flags would be read as the CLI's own and rejected.
+// The words are re-joined for the far shell to re-split, the way ssh does it:
+// quote anything that has to survive as a single argument.
+function takeExecSpec(argv) {
+  const target = argv[0] && !argv[0].startsWith("-") ? argv.shift() : null;
+  const dash = argv.indexOf("--");
+  const words = dash > -1 ? argv.splice(dash).slice(1) : [];
+  return { target, cmd: words.join(" ") };
+}
+
 const rawArgs = process.argv.slice(2);
-const sub = ["login", "logout", "service"].includes(rawArgs[0]) ? rawArgs.shift() : null;
+const sub = ["login", "logout", "service", "list", "exec"].includes(rawArgs[0]) ? rawArgs.shift() : null;
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
+const execSpec = sub === "exec" ? takeExecSpec(rawArgs) : null;
 const args = parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
@@ -459,6 +484,261 @@ function scheduleSessionCleanup(sid) {
   }, SESSION_GRACE_MS);
 }
 
+// ---- exec channel --------------------------------------------------------
+// The non-interactive counterpart to a session. A PTY is the right thing for a
+// person and the wrong thing for a program: the shell echoes what was typed,
+// redraws it with escape codes, folds stderr into stdout, and the exit status
+// disappears into a prompt. An exec runs the same shell with no tty at all, so
+// a caller gets the two streams apart and the code the command really returned.
+const execs = new Map(); // id -> { child, startedAt, timedOut, timeoutTimer, killTimer }
+// Payload cap per exec-out frame, in base64 characters. The relay reads every
+// string frame that passes through it, and one enormous frame also holds up
+// everything queued behind it. A multiple of 4 is what makes splitting safe:
+// each frame stays a whole number of base64 quads, so the far end can decode
+// them one at a time instead of having to rejoin them first.
+const EXEC_MAX_B64 = 32768;
+const EXEC_KILL_AFTER_MS = 5000; // SIGTERM → SIGKILL grace once a timeout fires
+
+function sendExecOut(id, stream, chunk) {
+  const b64 = chunk.toString("base64");
+  for (let i = 0; i < b64.length; i += EXEC_MAX_B64) {
+    sendCtl({ type: "exec-out", id, stream, data: b64.slice(i, i + EXEC_MAX_B64) });
+  }
+}
+
+// Drop the bookkeeping for an exec without touching the child — the callers
+// below either already reaped it or are about to signal it themselves.
+function forgetExec(id) {
+  const e = execs.get(id);
+  if (!e) return;
+  if (e.timeoutTimer) clearTimeout(e.timeoutTimer);
+  if (e.killTimer) clearTimeout(e.killTimer);
+  execs.delete(id);
+}
+
+function startExec(msg) {
+  const id = msg.id;
+  if (!id) return; // nothing to address a reply to, so there is nothing to say
+  if (execs.has(id)) {
+    // The id is how stdin and kill find their child; a second one would make
+    // both ambiguous. Refuse instead of quietly writing to the wrong process.
+    sendCtl({ type: "exec-error", id, message: "an exec with this id is already running" });
+    return;
+  }
+  if (typeof msg.cmd !== "string" || !msg.cmd) {
+    sendCtl({ type: "exec-error", id, message: "cmd must be a non-empty string" });
+    return;
+  }
+
+  let child;
+  try {
+    child = spawn(SHELL, ["-lc", msg.cmd], {
+      cwd: msg.cwd || process.env.HOME || process.cwd(),
+      // Merged over the daemon's environment, never replacing it: a command
+      // that arrived without PATH or HOME would fail in ways the caller has no
+      // way to diagnose from the other side of the relay.
+      env: { ...process.env, ...(msg.env || {}) },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    sendCtl({ type: "exec-error", id, message: e.message });
+    return;
+  }
+  const e = { child, startedAt: Date.now(), timedOut: false, timeoutTimer: null, killTimer: null };
+  execs.set(id, e);
+
+  // A command that exits without draining its stdin turns our next write into
+  // an EPIPE on an unhandled 'error' event, which would take the daemon down
+  // with it. Swallow it: the exec is over either way.
+  child.stdin.on("error", () => {});
+  child.stdout.on("data", (d) => sendExecOut(id, "stdout", d));
+  child.stderr.on("data", (d) => sendExecOut(id, "stderr", d));
+
+  const timeout = Number(msg.timeout) || 0; // 0, the default, means no limit
+  if (timeout > 0) {
+    e.timeoutTimer = setTimeout(() => {
+      e.timedOut = true;
+      try { child.kill("SIGTERM"); } catch {}
+      // Anything that traps or ignores SIGTERM would otherwise hold its id, and
+      // its process, forever. Escalate once and be done.
+      e.killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, EXEC_KILL_AFTER_MS);
+    }, timeout);
+  }
+
+  child.on("error", (err) => {
+    if (!execs.has(id)) return;
+    forgetExec(id);
+    sendCtl({ type: "exec-error", id, message: err.message });
+    logErr(`[exec ${id}] could not start: ${err.message}`);
+  });
+  // 'close' rather than 'exit': exit can fire while stdout still holds buffered
+  // data, and a caller that reads exec-exit as end-of-output would lose the tail.
+  child.on("close", (code, signal) => {
+    if (!execs.has(id)) return; // spawn failed; exec-error already went out
+    const ms = Date.now() - e.startedAt;
+    forgetExec(id);
+    // A shell that traps SIGTERM exits with an ordinary code, which reads as a
+    // normal finish. Report the signal we sent so a timeout stays recognisable.
+    sendCtl({ type: "exec-exit", id, code, signal: signal || (e.timedOut ? "SIGTERM" : null), ms });
+    log(`[exec ${id}] exited (${signal || code}) after ${ms}ms`);
+  });
+
+  sendCtl({ type: "exec-started", id, pid: child.pid });
+  log(`[exec ${id}] running: ${msg.cmd}`);
+}
+
+function execStdin(id, b64) {
+  const e = execs.get(id);
+  if (!e || typeof b64 !== "string") return;
+  try { e.child.stdin.write(Buffer.from(b64, "base64")); } catch {}
+}
+
+function execStdinEnd(id) {
+  const e = execs.get(id);
+  if (!e) return;
+  try { e.child.stdin.end(); } catch {}
+}
+
+// No exec-exit from here: the 'close' handler still sends it, so a caller
+// learns how the command died the same way whether it asked for this or not.
+function killExec(id, signal) {
+  const e = execs.get(id);
+  if (!e) return;
+  try { e.child.kill(signal || "SIGTERM"); } catch {}
+}
+
+// Unlike a PTY session, an exec has nobody to reattach to it — its output went
+// to a socket that is now gone, and the caller waiting on the exit code has
+// gone with it. SIGKILL rather than a polite SIGTERM because we forget the
+// entry here, so no one is left to escalate if the child ignores it.
+function killAllExecs() {
+  for (const [id, e] of [...execs.entries()]) {
+    forgetExec(id);
+    try { e.child.kill("SIGKILL"); } catch {}
+  }
+}
+
+// ---- `switchboard exec` (the client end) ---------------------------------
+// The other side of the channel above, so a script or an agent can drive a
+// machine without a browser. It joins the circuit exactly as the web UI does —
+// role=browser, same URL — and then does nothing but pass one command's two
+// streams and its exit status through, which is what lets it exit with the
+// command's own code and be useful in a pipeline.
+async function doExec(spec) {
+  if (!spec.target || !spec.cmd) {
+    die("Usage: switchboard exec <machine> [--timeout <ms>] -- <command…>\n\n" +
+      "  <machine>  A machine name or id from `switchboard list`, or a share token.\n\n" +
+      "  Example:   switchboard exec pi -- ls -la /tmp\n");
+  }
+  let how;
+  try { how = await dial(SERVER, spec.target, cfg.agentToken); }
+  catch (e) { die("exec: " + e.message + "\n"); }
+  const id = crypto.randomUUID();
+  const sock = new WebSocket(how.url, { headers: how.headers });
+
+  let done = false;
+  const finish = (code) => {
+    done = true;
+    process.exitCode = code;
+    // Deliberately not process.exit(): a redirected stdout flushes
+    // asynchronously and the tail of the output would go missing. Dropping our
+    // hold on stdin and the socket leaves nothing keeping the loop alive, so the
+    // process ends by itself once the writes have drained.
+    try { process.stdin.pause(); process.stdin.unref(); } catch {}
+    // terminate(), not close(): close() starts a closing handshake and waits for
+    // the peer's reply, and ws gives that a 30s timeout — through a relay that
+    // doesn't hurry, every exec would take 30 seconds longer than the command it
+    // ran (measured). exec-exit is the last thing we had to hear, so there is
+    // nothing left to wait for.
+    try { sock.terminate(); } catch {}
+  };
+
+  sock.on("open", () => {
+    sock.send(JSON.stringify({ type: "exec", id, cmd: spec.cmd, timeout: Number(args.timeout) || 0 }));
+    // A command that reads stdin would otherwise wait forever on a pipe nobody
+    // writes to. Forward ours when it has been redirected, and say EOF straight
+    // away when it hasn't — an interactive terminal has nothing to send.
+    if (process.stdin.isTTY) return sock.send(JSON.stringify({ type: "exec-stdin-end", id }));
+    process.stdin.on("data", (d) => sock.send(JSON.stringify({ type: "exec-stdin", id, data: d.toString("base64") })));
+    process.stdin.on("end", () => sock.send(JSON.stringify({ type: "exec-stdin-end", id })));
+  });
+
+  sock.on("message", (data, isBinary) => {
+    if (isBinary) return; // a PTY window sharing this circuit; none of our business
+    let msg;
+    try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+    if (msg.type === "_relay" && msg.event === "daemon-offline") {
+      console.error("exec: no daemon is connected on that circuit.");
+      return finish(1);
+    }
+    if (msg.id !== id) return; // circuits are shared; ignore other clients' work
+    switch (msg.type) {
+      case "exec-out":
+        (msg.stream === "stderr" ? process.stderr : process.stdout).write(Buffer.from(msg.data, "base64"));
+        break;
+      case "exec-error":
+        console.error("exec: " + msg.message);
+        finish(1);
+        break;
+      case "exec-exit":
+        // 128+signum is what a shell reports for a signalled child, so `$?`
+        // means the same here as it would had the command run locally.
+        finish(msg.signal ? 128 + (os.constants.signals[msg.signal] || 0) : (msg.code || 0));
+        break;
+    }
+  });
+
+  sock.on("close", () => {
+    if (done) return;
+    console.error("exec: the relay closed the connection before the command finished.");
+    process.exit(1);
+  });
+  // A refused upgrade carries its reason in the body ("shared with you for shell
+  // access only", "invalid agent token"). ws would otherwise surface only
+  // "Unexpected server response: 403", which names the number and not the fix.
+  sock.on("unexpected-response", (_req, res) => {
+    let body = "";
+    res.on("data", (d) => { body += d; });
+    res.on("end", () => {
+      console.error("exec: " + (body.trim() || `the relay refused the connection (${res.statusCode})`));
+      process.exit(1);
+    });
+  });
+  sock.on("error", (e) => {
+    if (done) return; // terminate() after a clean finish surfaces here too
+    console.error("exec: " + e.message);
+    process.exit(1);
+  });
+}
+
+// ---- `switchboard list` --------------------------------------------------
+// What can this host reach, and what may it do there? An agent that is about to
+// drive another node needs both halves, and the second one is invisible from the
+// dashboard's point of view — a shell-only share looks like any other machine
+// until a flow tries to use it.
+async function doList() {
+  if (!cfg.agentToken) {
+    die("switchboard list: this host isn't signed in.\n\n" +
+      "  Run `switchboard login` first — the list is per account.\n");
+  }
+  let all;
+  try { all = await reachableMachines(SERVER, cfg.agentToken); }
+  catch (e) { die("switchboard list: " + e.message + "\n"); }
+  if (!all.length) {
+    console.log("No machines yet. Run `switchboard login` on a host to bind it.");
+    return;
+  }
+  const now = Date.now();
+  const width = Math.max(...all.map((m) => (m.name || "(unnamed)").length), 4);
+  for (const m of all) {
+    const online = now - m.last_seen < 6000; // same freshness window as the dashboard
+    const how = m.owned ? "yours" : `@${m.owner_login}${m.can_exec ? "" : ", shell only"}`;
+    console.log(
+      `${(m.name || "(unnamed)").padEnd(width)}  ${m.machine_id.slice(0, 8)}  ` +
+      `${(online ? "online" : "offline").padEnd(7)}  ${how}`);
+  }
+}
+
 // ---- banner --------------------------------------------------------------
 function banner() {
   const line = "─".repeat(58);
@@ -521,6 +801,7 @@ function connect() {
       );
       emitStatus("fatal", { reason: "conflict", code: res.statusCode });
       for (const sid of sessions.keys()) killSession(sid);
+      killAllExecs();
       process.exit(1);
     }
     if (res.statusCode === 401 || res.statusCode === 403) {
@@ -530,6 +811,7 @@ function connect() {
       );
       emitStatus("fatal", { reason: "auth", code: res.statusCode });
       for (const sid of sessions.keys()) killSession(sid);
+      killAllExecs();
       process.exit(1);
     }
     log(`[relay] server responded ${res.statusCode}; will retry`);
@@ -566,6 +848,10 @@ function connect() {
       case "list-sessions": broadcastSessions(); break;
       case "close": killSession(msg.sid); broadcastSessions(); break;
       case "ping": sendCtl({ type: "pong", t: msg.t }); break; // browser↔daemon RTT probe
+      case "exec": startExec(msg); break;
+      case "exec-stdin": execStdin(msg.id, msg.data); break;
+      case "exec-stdin-end": execStdinEnd(msg.id); break;
+      case "exec-kill": killExec(msg.id, msg.signal); break;
       case "dl-open": startDownload(msg.id, msg.path); break;
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
@@ -586,6 +872,7 @@ function connect() {
       log("[relay] replaced by a newer daemon for this " + (BOUND ? "machine" : "token") + "; exiting.");
       emitStatus("fatal", { reason: "replaced", code });
       for (const sid of sessions.keys()) killSession(sid);
+      killAllExecs();
       process.exit(0);
     }
     // Sessions are kept across reconnects; their onData handlers check ws state.
@@ -593,6 +880,7 @@ function connect() {
     activeDownloads.clear();
     for (const up of activeUploads.values()) up.stream.destroy();
     activeUploads.clear();
+    killAllExecs();
     log(`[relay] disconnected, retrying in ${reconnectDelay}ms`);
     emitStatus("disconnected", { code, retryInMs: reconnectDelay });
     setTimeout(connect, reconnectDelay);
@@ -819,6 +1107,8 @@ function sendStats() {
 (async function main() {
   if (sub === "logout") return doLogout(); // remove creds and exit
   if (sub === "service") return doService(serviceAction); // install/remove the systemd unit and exit
+  if (sub === "list") return doList(); // what this account can reach; never becomes a daemon
+  if (sub === "exec") return doExec(execSpec); // drive someone else's daemon; never becomes one
   if (sub === "login") {
     // One step: sign in, then fall through to expose this machine's shell.
     await doLogin(); // saves config; fatal-exits on failure
@@ -838,6 +1128,7 @@ function sendStats() {
     log(`shutting down (${sig}).`);
     emitStatus("stopping", { signal: sig });
     for (const sid of sessions.keys()) killSession(sid);
+    killAllExecs();
     process.exit(0);
   };
   process.on("SIGINT", shutdown("SIGINT"));
