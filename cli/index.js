@@ -88,6 +88,9 @@ Usage:
                                the door for scripts and agents; the browser
                                terminal is the one for people. <machine> is a name
                                or id from "switchboard list", or a share token.
+  switchboard flow <run|check> <file.json>
+                               Run a graph of commands across several machines.
+                               Whichever host you run it on conducts it.
 
 Options:
   -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
@@ -146,10 +149,13 @@ function takeExecSpec(argv) {
 }
 
 const rawArgs = process.argv.slice(2);
-const sub = ["login", "logout", "service", "list", "exec"].includes(rawArgs[0]) ? rawArgs.shift() : null;
+const sub = ["login", "logout", "service", "list", "exec", "flow"].includes(rawArgs[0]) ? rawArgs.shift() : null;
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
 const execSpec = sub === "exec" ? takeExecSpec(rawArgs) : null;
+// `flow`, like `service`, takes a bare verb and then a file before the flags.
+const flowAction = sub === "flow" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
+const flowFile = sub === "flow" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
 const args = parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
@@ -739,6 +745,81 @@ async function doList() {
   }
 }
 
+// ---- `switchboard flow` (the conductor) ----------------------------------
+// Runs a graph of commands across several nodes, each step driven through the
+// same exec channel `switchboard exec` uses. Whichever machine you run this on
+// is that flow's conductor — nothing designates one, by design: a flow whose
+// steps all land on a single machine should be conducted by that machine, and
+// only the person writing the flow knows that. The spec's optional `conductor`
+// is that person writing it down, so running it in the wrong place is noticed
+// rather than silently slower.
+function doFlow(action, file) {
+  const { loadFlow, runFlow } = require("./flow");
+  if (action !== "run" && action !== "check") {
+    die("Usage: switchboard flow <run|check> <file.json> [--server <url>]\n\n" +
+      "  run     Execute the flow, streaming each step's output as it happens.\n" +
+      "  check   Validate the file and print the plan without running anything.\n");
+  }
+  if (!file) die("switchboard flow " + action + ": which file?\n");
+
+  let flow;
+  try { flow = loadFlow(file); }
+  catch (e) { console.error(e.message); process.exit(1); }
+
+  if (action === "check") {
+    console.log(`${flow.name || path.basename(file)} — ${flow.steps.length} step(s)`);
+    if (flow.conductor) console.log(`  conductor: ${flow.conductor}`);
+    for (const s of flow.steps) {
+      console.log(`  ${s.id.padEnd(16)} ${s.target.slice(0, 16).padEnd(16)}  ${s.cmd}`);
+      const edges = [s.on_success && `ok→${s.on_success}`, s.on_failure && `fail→${s.on_failure}`,
+        s.stdin_from && `stdin←${s.stdin_from}`].filter(Boolean);
+      if (edges.length) console.log(`  ${" ".repeat(34)}${edges.join("  ")}`);
+    }
+    console.log("\nLooks runnable. Targets are not resolved or contacted by `check`.");
+    return;
+  }
+
+  const t0 = Date.now();
+  runFlow(flow, {
+    server: SERVER,
+    // This host's own credential and identity: how each step authenticates, and
+    // what `conductor` is checked against.
+    agentToken: cfg.agentToken,
+    self: { machineId: cfg.machineId, name: os.hostname() },
+    // Stream as it arrives rather than buffering to the end: a flow step can run
+    // for minutes, and a conductor that prints nothing until it finishes is
+    // indistinguishable from one that has hung.
+    // Prefixing with a /^/gm replace looks right and isn't: the position after a
+    // chunk's trailing newline matches too, so every chunk emits a dangling
+    // prefix that then swallows the front of whatever prints next. Split, drop
+    // the empty tail, and rebuild.
+    onOutput: (id, stream, buf) => {
+      const lines = buf.toString("utf8").split("\n");
+      if (lines[lines.length - 1] === "") lines.pop();
+      if (!lines.length) return;
+      (stream === "stderr" ? process.stderr : process.stdout)
+        .write(lines.map((l) => `[${id}] ${l}`).join("\n") + "\n");
+    },
+    log: (ev, d) => {
+      if (ev === "step-start") log(`▶ ${d.id} on ${String(d.target).slice(0, 8)}… : ${d.cmd}`);
+      else if (ev === "step-end") {
+        log(d.ok ? `✓ ${d.id} (${d.ms}ms)`
+          : `✗ ${d.id} — ${d.unreachable ? "unreachable" : "exit " + (d.signal || d.code)} (${d.ms}ms)`);
+      } else if (ev === "halt") log(`■ stopped at ${d.id}: ${d.reason}`);
+      else if (ev === "conductor-mismatch") {
+        logErr(`this flow names "${d.want}" as its conductor, but it is running on ${d.here} — every step pays an extra relay hop.`);
+      }
+    },
+  }).then((r) => {
+    const ms = Date.now() - t0;
+    if (r.ok) {
+      log(`flow finished: ${r.results.size} step(s) in ${ms}ms` +
+        (r.failed.length ? ` (recovered from: ${r.failed.join(", ")})` : ""));
+    } else logErr(`flow failed after ${ms}ms — ${r.failed.join(", ")}`);
+    process.exitCode = r.ok ? 0 : 1;
+  }).catch((e) => { logErr("flow: " + e.message); process.exitCode = 1; });
+}
+
 // ---- banner --------------------------------------------------------------
 function banner() {
   const line = "─".repeat(58);
@@ -1109,6 +1190,7 @@ function sendStats() {
   if (sub === "service") return doService(serviceAction); // install/remove the systemd unit and exit
   if (sub === "list") return doList(); // what this account can reach; never becomes a daemon
   if (sub === "exec") return doExec(execSpec); // drive someone else's daemon; never becomes one
+  if (sub === "flow") return doFlow(flowAction, flowFile); // conduct a graph of them; also never becomes one
   if (sub === "login") {
     // One step: sign in, then fall through to expose this machine's shell.
     await doLogin(); // saves config; fatal-exits on failure
