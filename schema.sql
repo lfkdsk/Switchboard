@@ -23,6 +23,36 @@ CREATE TABLE IF NOT EXISTS machines (
 );
 CREATE INDEX IF NOT EXISTS idx_machines_account ON machines(account_id);
 
+-- Delegated access: one row per (machine, person you shared it with). A machine
+-- still belongs to exactly one account — this table only widens who may *open a
+-- shell*, never who may rename, delete or re-share it. Keyed on the grantee's
+-- numeric id rather than their login so a grant survives a GitHub rename, and
+-- so a stranger who later claims the freed login does not inherit the access.
+CREATE TABLE IF NOT EXISTS machine_grants (
+  machine_id       TEXT NOT NULL,      -- machines.machine_id being shared
+  grantee_id       TEXT NOT NULL,      -- GitHub numeric user id of the invitee
+  grantee_login    TEXT NOT NULL,      -- their login when granted (for display)
+  granted_by_id    TEXT NOT NULL,      -- owner at the time, for the audit trail
+  granted_by_login TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  expires_at       INTEGER,            -- NULL = never expires
+  -- Whether software may drive this machine, or only a person may sit at it.
+  -- Off by default: sharing a shell with someone is a smaller thing than letting
+  -- their agents and flows run commands here unattended, and the smaller thing
+  -- is what "share" means to the person clicking it. This is a guardrail on
+  -- automation, not a sandbox — a grantee who wants to can still type anything
+  -- into the shell they were given.
+  can_exec         INTEGER NOT NULL DEFAULT 0,
+  -- Revocation writes a tombstone instead of deleting the row: the row *is* the
+  -- record of who was let in and when they were cut off. Re-granting the same
+  -- person clears revoked_at rather than inserting a second row, which is why
+  -- (machine_id, grantee_id) can be the primary key.
+  revoked_at       INTEGER,            -- NULL = live
+  PRIMARY KEY (machine_id, grantee_id)
+);
+-- "which machines am I allowed into?" — asked on every dashboard load.
+CREATE INDEX IF NOT EXISTS idx_machine_grants_grantee ON machine_grants(grantee_id);
+
 -- Account-scoped agent tokens the CLI presents to register/connect a machine.
 -- Only the SHA-256 hash is stored; the plaintext lives in the CLI's config.
 CREATE TABLE IF NOT EXISTS agent_tokens (

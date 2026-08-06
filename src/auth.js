@@ -94,6 +94,39 @@ export async function githubUser(token) {
   return { id: String(u.id), login: u.login };
 }
 
+// GitHub's own rules for a login: alphanumerics and single interior hyphens,
+// 39 characters max. Checked before the login ever reaches a URL — an
+// unvalidated one ("../orgs/foo", "x?per_page=1") would let a caller steer this
+// fetch at a different API path, and encodeURIComponent alone would still leave
+// a lookup that succeeds for something that is not a user.
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+
+// Resolve a login to its numeric id, for sharing a machine with someone by name.
+// Unauthenticated on purpose: the person being shared with may never have signed
+// in here, so there is no token of theirs to use and none of the owner's is
+// stored. That costs us GitHub's 60-requests-per-hour anonymous budget, which is
+// survivable because a grant stores the resolved id — only the first share with
+// a given person spends a call.
+export async function githubUserByLogin(login) {
+  if (!login || !GITHUB_LOGIN.test(login)) return null;
+  let r;
+  try {
+    r = await fetch("https://api.github.com/users/" + encodeURIComponent(login), {
+      headers: {
+        "user-agent": "switchboard",
+        accept: "application/vnd.github+json",
+      },
+    });
+  } catch { return null; }
+  if (!r.ok) return null;
+  const u = await r.json();
+  if (!u || u.id == null) return null;
+  // Organizations resolve here too, but an org can never hold a session, so a
+  // grant to one would be a row nobody could ever use. Say no instead.
+  if (u.type && u.type !== "User") return null;
+  return { id: String(u.id), login: u.login };
+}
+
 // GET /auth/login → bounce to GitHub authorize (via the lfkdsk-auth callback).
 export function handleLogin(url) {
   const state = url.searchParams.get("state") || "";

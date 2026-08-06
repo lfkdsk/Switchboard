@@ -1,0 +1,17 @@
+-- Adds machine_grants.can_exec — whether a share also lets the grantee's
+-- software drive the machine (the exec channel, and so `switchboard exec` and
+-- flow steps), or only lets a person open a shell on it.
+--
+-- Run once against each database:
+--   npx wrangler d1 execute switchboard_db --local  --file migrations/0003_add_can_exec.sql
+--   npx wrangler d1 execute switchboard_db --remote --file migrations/0003_add_can_exec.sql
+--
+-- Not idempotent: SQLite has no ADD COLUMN IF NOT EXISTS, so a second run fails
+-- with "duplicate column name" — which is harmless, and is also how you can tell
+-- it already ran.
+--
+-- Existing shares land on 0, the same default new ones get. That is the
+-- conservative direction: a grant handed out before this column existed was
+-- agreed to as "you can open a shell", and silently widening it to "your agents
+-- may drive this host" is not a migration's decision to make.
+ALTER TABLE machine_grants ADD COLUMN can_exec INTEGER NOT NULL DEFAULT 0;

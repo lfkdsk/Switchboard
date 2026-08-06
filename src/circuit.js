@@ -36,7 +36,11 @@ export class Circuit extends DurableObject {
 
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server, [role]);
-    server.serializeAttachment({ role, machineId });
+    // Set only for a share that grants a shell but not automation (see
+    // machine_grants.can_exec). Stored inverted so the ordinary attachment keeps
+    // an empty flag and takes the fast path in webSocketMessage.
+    const noExec = request.headers.get("x-sb-exec") === "0" || undefined;
+    server.serializeAttachment({ role, machineId, noExec });
 
     if (role === "browser") {
       const daemonUp = this.ctx.getWebSockets("daemon").some((s) => s.readyState === WS_OPEN);
@@ -60,9 +64,30 @@ export class Circuit extends DurableObject {
       }
       for (const b of this.ctx.getWebSockets("browser")) this.safeSend(b, message);
     } else {
+      // A shell-only share can open a terminal but must not drive the machine
+      // through the exec channel. Only such an attachment pays for the parse:
+      // every other browser frame — and every byte of terminal payload, which is
+      // binary — is forwarded without being looked at, so the relay stays opaque
+      // where opacity is the point.
+      if (att.noExec && typeof message === "string" && !this.allowFromRestricted(ws, message)) return;
       const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);
       if (daemon) this.safeSend(daemon, message);
     }
+  }
+
+  // False when this frame is an exec-channel message the attachment isn't
+  // allowed to send. Unparseable frames are passed through: the daemon is the
+  // one that has to make sense of them, and inventing a second opinion here
+  // would mean the relay deciding what valid traffic looks like.
+  allowFromRestricted(ws, str) {
+    let m;
+    try { m = JSON.parse(str); } catch { return true; }
+    if (typeof m?.type !== "string" || !m.type.startsWith("exec")) return true;
+    this.safeSend(ws, JSON.stringify({
+      type: "exec-error", id: m.id,
+      message: "this machine is shared with you for shell access only",
+    }));
+    return false;
   }
 
   recordHeartbeat(machineId, str) {
