@@ -7,3 +7,6 @@ node_modules/
 # macOS menu-bar app (SwiftPM build output + assembled bundle)
 macos/.build/
 macos/build/
+
+# Agent Box local config — may carry a share token or API keys
+docker/.env

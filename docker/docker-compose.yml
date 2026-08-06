@@ -1,0 +1,57 @@
+name: agentbox
+
+services:
+  agentbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Pin these to make a build reproducible; `latest` is what you want for a
+        # box you rebuild to upgrade.
+        SWITCHBOARD_CLI_VERSION: ${SWITCHBOARD_CLI_VERSION:-latest}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+        CODEX_VERSION: ${CODEX_VERSION:-latest}
+    image: ${AGENTBOX_IMAGE:-agentbox:latest}
+    container_name: ${AGENTBOX_NAME:-agentbox}
+    hostname: ${AGENTBOX_NAME:-agentbox}
+    restart: unless-stopped
+
+    environment:
+      SWITCHBOARD_SERVER: ${SWITCHBOARD_SERVER:-https://shell.lfkdsk.org}
+      # auto → token mode (shareable URL) unless this box has been signed in.
+      SWITCHBOARD_MODE: ${SWITCHBOARD_MODE:-auto}
+      # Set to pin your own token instead of the generated one.
+      SWITCHBOARD_TOKEN: ${SWITCHBOARD_TOKEN:-}
+      # `claude` also reports live Claude Code sessions to the dashboard.
+      SWITCHBOARD_ACTIVITY: ${SWITCHBOARD_ACTIVITY:-}
+      # Optional: skip the interactive logins entirely. Note that these are
+      # visible to anyone with a shell in the box — which is the point of sharing
+      # the URL, so only set them if you mean to lend out your quota.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+    volumes:
+      - home:/home/dev        # logins, shell history, ~/.claude, ~/.codex
+      - workspace:/workspace  # the code people actually work on
+
+    # No published ports on purpose. Everything reaches this box through the
+    # relay, and forwarding codex's OAuth callback port (1455) only ever worked
+    # for whoever runs the container — `codex login --device-auth` needs no
+    # callback and works for everyone.
+
+    # Agents npm/pip-install things and run test suites; the 64 MB default /dev/shm
+    # is the first thing that breaks (notably headless Chrome).
+    shm_size: 1gb
+
+    # A shared box is a box someone else's agent can fork-bomb by accident.
+    pids_limit: 4096
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  home:
+  workspace:
