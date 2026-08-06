@@ -80,6 +80,16 @@ quick remote help. No sign-in required; the token *is* the key (see
 - **📁 Drag-and-drop file transfer** — drop a file onto the page to upload it
   into the active shell's working directory, or pull any file off the host with a
   click.
+- **🤝 Share one machine with one person** — hand `@someone` a shell on a single
+  host, revocable and with an expiry, without giving them your account or a
+  password-equivalent token. You choose whether the share is a shell for them to
+  sit at, or one their agents may also drive.
+- **🔗 Machines that drive each other** — `switchboard exec pi -- ...` runs a
+  command on another host and gives you back its stdout, stderr and exit code,
+  separately and unmangled. `switchboard flow` runs a whole graph of those across
+  several machines, and `switchboard mcp` hands the same thing to Claude Code or
+  Codex as tools, so an agent on your laptop can work on the box wired to your
+  hardware.
 - **🔌 Works behind NAT** — the daemon dials out over WebSocket. No inbound
   ports, no firewall rules, no VPN, no tunnel to babysit.
 - **💤 Free at idle** — built on Cloudflare's hibernatable WebSockets, so idle
@@ -113,6 +123,21 @@ or build it yourself from [`macos/`](macos/README.md):
 ```bash
 cd macos && scripts/make-app.sh && open build/Switchboard.app
 ```
+
+### Share a sandbox, not your machine — the Agent Box
+
+Sometimes you want to hand someone a shell but not *your* shell. [`docker/`](docker/README.md)
+builds a container with **Claude Code** and **Codex** already in it and exposes
+*that* through the relay:
+
+```bash
+cd docker && ./run.sh          # builds, starts, prints a share URL
+```
+
+Same token model, but the other end of the URL is a throwaway container with its
+own filesystem — nothing of yours is mounted in, and `./run.sh reset` deletes the
+whole thing. Everyone signs the agents in with their own account; the logins
+persist in a volume.
 
 ### Keep it running — Linux background service
 
@@ -187,6 +212,109 @@ which it's a clean reimplementation of.
 
 ---
 
+## Share a machine with someone
+
+A share is a **grant**, not a password. On your dashboard, open a machine's
+**Share** panel and type a GitHub login: they get that one machine, in their own
+dashboard, under their own account. You pick how long it lasts, and you can
+revoke it in a click. Nothing bearer changes hands, so there is nothing for them
+to forward, and revoking one person doesn't disturb anyone else.
+
+Two kinds of share, and the difference matters:
+
+| | **Shell only** (default) | **Shell + commands** |
+| --- | --- | --- |
+| They can open a terminal | ✅ | ✅ |
+| Their agents and flows can drive it | — | ✅ |
+| `switchboard exec` / MCP against it | refused | allowed |
+
+"Shell only" is the default because letting someone sit at a terminal is a
+smaller thing than letting their software run commands on your host unattended.
+It's a guardrail on automation rather than a sandbox — someone with a shell can
+still type whatever they like into it.
+
+What a grant never confers: renaming, deleting, or re-sharing. Those stay with
+the owner, so access can't be chained onward by whoever received it. Access is
+re-checked against the database on **every connect**, so an expiry or a
+revocation takes effect immediately — but a shell already open stays open until
+it disconnects.
+
+---
+
+## Machines that drive each other
+
+The same identity and the same grants that decide what you can open in a browser
+decide what your machines may do to each other. A host that has run
+`switchboard login` can drive any machine its account can reach, authenticating
+with its own agent token — no share tokens to copy onto disk, and revoking in the
+dashboard stops the automation too.
+
+```bash
+switchboard list                          # what can this host reach, and what may it do there?
+switchboard exec pi -- uname -a           # one command, clean output, real exit code
+echo "$FIRMWARE" | switchboard exec pi -- 'cat > /tmp/fw.bin'
+```
+
+`exec` allocates **no TTY**: stdout and stderr come back separately, free of
+escape codes and prompt echo, and the process exits with the far command's own
+status. That is what makes it safe to put in a pipeline or hand to an agent — the
+browser terminal remains the thing for people.
+
+### Flows — a graph of commands across machines
+
+```jsonc
+{
+  "name": "nightly",
+  "conductor": "buildbox",            // where this is meant to run (checked, not enforced)
+  "steps": [
+    { "id": "build",  "target": "buildbox", "cmd": "make -C ~/fw" },
+    { "id": "flash",  "target": "pi",       "cmd": "flashrom -w /tmp/fw.bin",
+      "on_failure": "recover" },
+    { "id": "verify", "target": "pi",       "cmd": "sha256sum /dev/mtd0" },
+    { "id": "recover","target": "pi",       "cmd": "flashrom -w /tmp/known-good.bin" }
+  ]
+}
+```
+
+```bash
+switchboard flow check nightly.json    # validate and print the plan, contacting nothing
+switchboard flow run   nightly.json    # execute it
+```
+
+Steps run in document order; `on_success` / `on_failure` are only for the
+exceptions, and `stdin_from` pipes an earlier step's stdout into a later one's
+stdin. Every target is resolved **before the first command runs**, so a typo in
+the last step can't be discovered after the first four have already changed
+something.
+
+Whichever machine you run `flow run` on conducts it — there is no designated
+conductor, because a flow whose steps all land on one host should be conducted by
+that host and save a relay round trip per step. `conductor` records where the
+author meant it to run, and you're told when it's running somewhere else.
+
+Orchestration lives in the CLI, never in the relay. Teaching the relay to
+sequence steps would mean teaching it to parse payloads, and that forecloses
+layering end-to-end encryption underneath it.
+
+### MCP — hand the machines to an agent
+
+```bash
+claude mcp add switchboard -- switchboard mcp
+```
+
+That exposes four tools: `list_machines`, `run_on`, `upload`, `download`. Now
+"go build the firmware on buildbox and flash the pi" is something the agent can
+actually carry out. Codex and anything else that speaks MCP over stdio works the
+same way.
+
+> **Think about this before you wire agents together.** An agent on machine A
+> driving machine B means a prompt injection on A is code execution on B. Shares
+> default to shell-only for exactly this reason; widen them deliberately, keep
+> the blast radius somewhere you can throw away (the [Agent Box](docker/README.md)
+> is one), and remember that `exec` runs whatever it's given.
+
+---
+
 ## Self-host your own relay
 
 Want to own the stack? Deploy the relay to your own Cloudflare account:
@@ -202,6 +330,14 @@ npx wrangler d1 execute switchboard_db --remote --file schema.sql
 
 npx wrangler secret put SESSION_SECRET               # any long random string
 npm run deploy
+```
+
+`schema.sql` only ever uses `CREATE TABLE IF NOT EXISTS`, so a database created
+before a column existed never picks it up on its own. If yours predates one, run
+the files in [`migrations/`](migrations/) once each, `--local` and `--remote`:
+
+```bash
+npx wrangler d1 execute switchboard_db --remote --file migrations/0003_add_can_exec.sql
 ```
 
 Wrangler prints your URL (e.g. `https://switchboard.<subdomain>.workers.dev`).
@@ -245,6 +381,17 @@ switchboard                  Expose this shell using saved credentials, or an
 switchboard logout           Remove the stored account credential.
 switchboard service install  Linux: run in the background via systemd, starting
                              at boot. Also: uninstall, status.
+switchboard list             Machines this account can reach — your own, plus the
+                             ones shared with you and what they allow.
+switchboard exec <machine> -- <command…>
+                             Run one command on another machine. No TTY: stdout
+                             and stderr stay apart and the exit code is the
+                             command's own. <machine> is a name or id from
+                             `switchboard list`, or a share token.
+switchboard flow <run|check> <file.json>
+                             Run a graph of commands across several machines.
+                             Whichever host you run it on conducts it.
+switchboard mcp              Serve those machines to an agent over MCP (stdio).
 ```
 
 | Option | Description |
@@ -252,6 +399,7 @@ switchboard service install  Linux: run in the background via systemd, starting
 | `-t, --token <token>` | Force anonymous mode with this token (min 24 chars). |
 | `-s, --server <url>`  | Relay origin. Default: `https://shell.lfkdsk.org`. |
 | `--shell <path>`      | Shell to spawn. Default: `$SHELL`, else `bash`/`powershell`. |
+| `--timeout <ms>`      | `exec` only: give up on the command after this long. |
 | `-v, --version`       | Print version and exit. |
 | `-h, --help`          | Show help and exit. |
 
@@ -275,8 +423,21 @@ and never include command-line arguments (those routinely carry secrets).
   on the host — treat it like a password. It's a fresh 256-bit random value per
   run, so guessing is infeasible.
 - **Account mode is gated by GitHub identity.** A machine bound with
-  `switchboard login` can only be opened by the signed-in owner; sessions are
-  HMAC-signed cookies, and agent tokens are stored **hashed** (SHA-256) in D1.
+  `switchboard login` can only be opened by its owner or someone the owner has
+  shared it with; sessions are HMAC-signed cookies, and agent tokens are stored
+  **hashed** (SHA-256) in D1.
+- **Shares are grants, checked on every connect.** They're keyed on the grantee's
+  numeric GitHub id, so a share survives a rename and never lands on a stranger
+  who later claims a freed login. Revoking writes a tombstone rather than
+  deleting the row — who was let in, and when they were cut off, is worth
+  keeping. Deleting a machine takes its grants with it, because machine ids are
+  chosen by the CLI and re-registering the same host would otherwise resurrect
+  access the owner thought they'd thrown away.
+- **Automation is a separate permission.** A host's agent token authenticates it
+  to the relay as its own account, and a share must say `shell + commands` before
+  anyone else's software can drive your machine. Chaining agents across hosts
+  turns a prompt injection on one into code execution on another — decide that
+  deliberately rather than by default.
 - **The relay sees plaintext.** TLS terminates at the Worker, so the operator
   (you, when self-hosting) can see the stream. Switchboard is **not** end-to-end
   encrypted — self-hosting removes the third party, not the relay's visibility.
@@ -304,7 +465,11 @@ and never include command-line arguments (those routinely carry secrets).
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
 | `cli/` | `@switch-board/cli` — the host daemon |
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
+| `cli/target.js` | Resolving "which machine?" into how to dial it |
+| `cli/flow.js` | The flow runner — one command remotely, and the graph around it |
+| `cli/mcp.js` | The MCP stdio server: `list_machines`, `run_on`, `upload`, `download` |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
+| `docker/` | Agent Box — a shareable container with Claude Code and Codex in it (see [docker/README.md](docker/README.md)) |
 
 ---
 
