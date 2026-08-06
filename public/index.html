@@ -52,6 +52,16 @@
   .machine .m-head { display: flex; align-items: center; gap: 12px; }
   .machine .name { font-weight: 600; }
   .machine .meta { color: var(--muted); font-size: 12px; }
+  /* a machine someone else shared with you — same row, marked as borrowed */
+  .machine.shared { border-left: 3px solid var(--accent); }
+  .m-name { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; white-space: nowrap; }
+  /* who else can reach one of your machines (owner-only panel) */
+  .m-grants { display: flex; flex-direction: column; gap: 8px; margin-left: 20px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .grant-row { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+  .m-grants input, .m-grants select { padding: 5px 8px; font-size: 12px; }
+  .m-grants select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font-family: inherit; }
+  .m-grants button { padding: 4px 10px; font-size: 12px; }
   /* activity: what the host is actually doing, without opening a shell */
   .m-act { display: flex; flex-direction: column; gap: 4px; font-size: 12px; padding-left: 20px; }
   .m-act:empty { display: none; }
@@ -127,7 +137,7 @@
   <div class="view" id="view-dashboard">
     <div class="dash-wrap">
       <div class="dash-head">
-        <h1>Your machines</h1>
+        <h1>Machines</h1>
         <span class="spacer"></span>
         <button id="refreshBtn">Refresh</button>
       </div>
@@ -243,6 +253,13 @@
       if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m";
       if (s < 86400) return Math.floor(s / 3600) + "h"; return Math.floor(s / 86400) + "d";
     }
+    // A share can be open-ended, ticking down, or already dead — the owner's
+    // list keeps showing lapsed ones, so all three states need a name.
+    function expiryLabel(ts) {
+      if (ts == null) return "no expiry";
+      const left = ts - Date.now();
+      return left > 0 ? "expires in " + fmtDur(left) : "expired";
+    }
 
     // ---- activity ("what is this host doing?") -----------------------------
     // Flatten the daemon's activity blob into uniform rows so one renderer can
@@ -295,7 +312,13 @@
       const list = $("machineList");
       if (!silent && !machineEls.size) list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
       let machines = [];
-      try { machines = (await (await api("/api/machines")).json()).machines || []; }
+      try {
+        // Yours and shared-with-you are two queries but one list: fetch them
+        // together so the slower one can't leave the dashboard half-drawn.
+        const [rMine, rShared] = await Promise.all([api("/api/machines"), api("/api/machines/shared")]);
+        const mine = await rMine.json(), shared = await rShared.json();
+        machines = (mine.machines || []).concat((shared.machines || []).map((m) => ({ ...m, shared: true })));
+      }
       catch { if (!silent) { list.innerHTML = '<div class="empty">Could not load machines.</div>'; machineEls.clear(); } return; }
       if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switch-board/cli login</code> on a host to bind it.</div>'; machineEls.clear(); return; }
 
@@ -317,37 +340,56 @@
         if (!el) { // first sighting: build the row once, then reuse it
           el = document.createElement("div");
           el.className = "machine";
-          el.innerHTML = `<div class="m-head"><span class="dot"></span><div><div class="name"></div><div class="meta"></div></div><span class="spacer"></span><button class="primary">Open shell</button></div><div class="m-act"></div>`;
+          el.innerHTML = `<div class="m-head"><span class="dot"></span><div><div class="m-name"><span class="name"></span><span class="badge" hidden></span></div><div class="meta"></div></div><span class="spacer"></span><button class="primary">Open shell</button></div><div class="m-act"></div><div class="m-grants" hidden></div>`;
           machineEls.set(m.machine_id, el);
         }
         // Update fields in place — no teardown, so no flicker.
         const head = el.querySelector(".m-head");
+        el.classList.toggle("shared", !!m.shared);
         el.querySelector(".dot").className = "dot " + (online ? "on" : "off");
         el.querySelector(".name").textContent = label;
         el.querySelector(".meta").textContent = meta;
-        el.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        const badge = el.querySelector(".badge");
+        badge.hidden = !m.shared;
+        // Say "shell only" out loud on a borrowed machine: it's the difference
+        // between a machine you can work on and one you can also point a flow at.
+        if (m.shared) badge.textContent = `shared by @${m.owner_login} · ${expiryLabel(m.expires_at)}${m.can_exec ? "" : " · shell only"}`;
+        head.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
         // An offline machine's last-known activity is stale by definition.
         syncActivity(el.querySelector(".m-act"), online ? activityRows(m.activity) : []);
-        // The Delete button only exists while the machine is offline.
-        let del = head.querySelector(".danger");
-        if (!online) {
-          if (!del) {
-            del = document.createElement("button");
-            del.className = "danger";
-            del.textContent = "Delete";
-            del.title = "Remove this offline machine from your dashboard";
-            head.appendChild(del);
-          }
-          del.onclick = () => deleteMachine(m.machine_id, label, el);
-        } else if (del) { del.remove(); }
+        // Owner-only controls aren't built at all for a machine shared with
+        // you — the server refuses them either way, so this just avoids
+        // offering what it would reject. Delete stays offline-only, as before.
+        const share = rowBtn(head, "share", !m.shared, "Share", "Let another GitHub user open a shell here");
+        if (share) share.onclick = () => toggleGrants(m.machine_id, el);
+        const del = rowBtn(head, "del", !m.shared && !online, "Delete", "Remove this offline machine from your dashboard", "danger");
+        if (del) del.onclick = () => deleteMachine(m.machine_id, label, el);
+        const leave = rowBtn(head, "leave", !!m.shared, "Leave", "Give up your access to this machine", "danger");
+        if (leave) leave.onclick = () => leaveShare(m, label, el);
         // Place the row at its slot (only moves the node if the order actually changed).
         if (list.children[i] !== el) list.insertBefore(el, list.children[i] || null);
       });
     }
 
+    // Rows are reused across the 3s poll, so their buttons have to appear and
+    // disappear in place: Delete only exists while a machine is offline, Share
+    // only on machines you own. Returns the button when it should be there.
+    function rowBtn(head, cls, want, text, title, extra) {
+      let b = head.querySelector("." + cls);
+      if (!want) { if (b) b.remove(); return null; }
+      if (!b) {
+        b = document.createElement("button");
+        b.className = extra ? cls + " " + extra : cls;
+        b.textContent = text;
+        b.title = title;
+        head.appendChild(b);
+      }
+      return b;
+    }
+
     async function deleteMachine(machineId, label, el) {
-      if (!confirm(`Delete offline machine "${label}"?\n\nThis removes it from your dashboard. You can re-add it by running the CLI on that host again.`)) return;
-      const btn = el.querySelector(".danger");
+      if (!confirm(`Delete offline machine "${label}"?\n\nThis removes it from your dashboard, along with anyone you shared it with. You can re-add it by running the CLI on that host again.`)) return;
+      const btn = el.querySelector(".del");
       btn.disabled = true;
       try {
         const r = await api("/api/machines/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ machine_id: machineId }) });
@@ -362,6 +404,117 @@
           btn.disabled = false;
         }
       } catch { toast("Couldn't delete machine — network error.", "err"); btn.disabled = false; }
+    }
+
+    // ---- sharing -----------------------------------------------------------
+    // The grants panel is loaded when you open it and after every change, never
+    // on the 3s poll: a background refresh that rebuilt it would wipe out the
+    // login you were halfway through typing.
+    function toggleGrants(machineId, el) {
+      const box = el.querySelector(".m-grants");
+      box.hidden = !box.hidden;
+      if (!box.hidden) loadGrants(machineId, box);
+    }
+    async function loadGrants(machineId, box) {
+      box.textContent = "";
+      const status = document.createElement("div");
+      status.className = "muted"; status.textContent = "Loading shares…";
+      box.appendChild(status);
+      let grants = [];
+      try { grants = (await (await api("/api/machines/grants?machine_id=" + encodeURIComponent(machineId))).json()).grants || []; }
+      catch { status.textContent = "Could not load shares."; return; }
+      box.textContent = "";
+      if (!grants.length) {
+        const none = document.createElement("div");
+        none.className = "muted"; none.textContent = "Not shared with anyone.";
+        box.appendChild(none);
+      }
+      for (const g of grants) {
+        const row = document.createElement("div");
+        row.className = "grant-row";
+        row.innerHTML = '<span class="who"></span><span class="muted when"></span><span class="spacer"></span><button class="danger">Revoke</button>';
+        // textContent, not innerHTML: a login is someone else's string, and the
+        // only reason it can't carry markup today is a server-side regex.
+        row.querySelector(".who").textContent = "@" + g.grantee_login;
+        row.querySelector(".when").textContent =
+          `since ${fmtAgo(g.created_at)} · ${expiryLabel(g.expires_at)} · ${g.can_exec ? "shell + commands" : "shell only"}`;
+        row.querySelector(".danger").onclick = () => revokeShare(machineId, g, box, row);
+        box.appendChild(row);
+      }
+      box.appendChild(grantForm(machineId, box));
+    }
+    const GRANT_EXPIRY = [[0, "no expiry"], [1, "1 day"], [7, "7 days"], [30, "30 days"]];
+    // What the share is *for*. "Shell only" is first because it's the default and
+    // the smaller thing: letting someone sit at a terminal is not the same as
+    // letting their agents and flows drive the host while nobody is watching.
+    const GRANT_SCOPE = [[0, "shell only"], [1, "shell + commands"]];
+    function dropdown(options, title) {
+      const sel = document.createElement("select");
+      sel.title = title;
+      for (const [value, text] of options) {
+        const o = document.createElement("option");
+        o.value = String(value); o.textContent = text;
+        sel.appendChild(o);
+      }
+      return sel;
+    }
+    function grantForm(machineId, box) {
+      const add = document.createElement("div");
+      add.className = "grant-row";
+      const input = document.createElement("input");
+      input.type = "text"; input.placeholder = "github login"; input.autocomplete = "off"; input.spellcheck = false; input.style.flex = "1";
+      const sel = dropdown(GRANT_EXPIRY, "How long this share lasts");
+      const scope = dropdown(GRANT_SCOPE, "Whether their agents and flows may run commands here, or only a person may open a shell");
+      const btn = document.createElement("button");
+      btn.className = "primary"; btn.textContent = "Share";
+      const submit = async () => {
+        const login = input.value.trim().replace(/^@/, "");
+        if (!login) return;
+        btn.disabled = true;
+        const days = Number(sel.value);
+        try {
+          const r = await api("/api/machines/grant", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              machine_id: machineId, login,
+              expires_at: days ? Date.now() + days * 86400000 : null,
+              can_exec: scope.value === "1",
+            }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (r.ok) { toast(`Shared with @${body.grant ? body.grant.grantee_login : login}`, "ok"); loadGrants(machineId, box); return; }
+          toast(body.error === "no such github user" ? `No GitHub user “${login}”.` : "Couldn't share: " + (body.error || "failed"), "err");
+        } catch { toast("Couldn't share — network error.", "err"); }
+        btn.disabled = false;
+      };
+      btn.onclick = submit;
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+      add.append(input, sel, scope, btn);
+      return add;
+    }
+    async function revokeShare(machineId, g, box, row) {
+      // Say plainly what revoking does and doesn't do: access is checked when a
+      // browser connects, so an already-open shell survives until it drops.
+      if (!confirm(`Revoke @${g.grantee_login}'s access?\n\nThey can't connect again. A shell they already have open stays until it disconnects.`)) return;
+      const btn = row.querySelector(".danger");
+      btn.disabled = true;
+      try {
+        const r = await api("/api/machines/revoke", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ machine_id: machineId, grantee_id: g.grantee_id }) });
+        if (r.ok) { toast(`Revoked @${g.grantee_login}`, "ok"); loadGrants(machineId, box); }
+        else { toast("Couldn't revoke that share.", "err"); btn.disabled = false; }
+      } catch { toast("Couldn't revoke — network error.", "err"); btn.disabled = false; }
+    }
+    // Leaving a share you were given is the grantee's own call — same endpoint,
+    // with yourself as the grantee.
+    async function leaveShare(m, label, el) {
+      if (!confirm(`Leave “${label}”?\n\nYou lose access until @${m.owner_login} shares it with you again.`)) return;
+      const btn = el.querySelector(".leave");
+      btn.disabled = true;
+      try {
+        const r = await api("/api/machines/revoke", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ machine_id: m.machine_id, grantee_id: session.id }) });
+        if (r.ok) { toast(`Left “${label}”`, "ok"); el.remove(); machineEls.delete(m.machine_id); renderDashboard(true); }
+        else { toast("Couldn't leave that machine.", "err"); btn.disabled = false; }
+      } catch { toast("Couldn't leave — network error.", "err"); btn.disabled = false; }
     }
 
     // ===================== TERMINAL (multi-shell) ===========================
