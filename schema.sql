@@ -19,7 +19,12 @@ CREATE TABLE IF NOT EXISTS machines (
   -- What the machine is doing, as an opaque JSON blob (shells / top / agents).
   -- Display-only and always ephemeral: cleared the moment the daemon goes away.
   -- See migrations/ for applying this to a database created before it existed.
-  activity      TEXT
+  activity      TEXT,
+  -- Does this machine accept peer connections — a `switchboard exec/shell` from
+  -- another machine on the same account? Declared by the daemon on every connect
+  -- (never by a client), so the host itself decides. Defaults to 0 so a row
+  -- written by a daemon too old to have an opinion is closed, not open.
+  peer          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_machines_account ON machines(account_id);
 

@@ -6,16 +6,19 @@
  *   - bound:     /ws?role=…&machine=<id>        (account-gated)
  *       daemon  → header x-switchboard-agent: <agent token>  (→ account)
  *       browser → sb_session cookie             (→ account; must own machine)
+ *                 …or the same agent token, which is how one of your machines
+ *                 dials another (peer mode; the target must have opted in).
  *
  * HTTP: GitHub-OAuth sessions (/auth/*), the CLI-login handshake (/cli/*),
- * the dashboard API (/api/*), and static assets (the frontend in ./public).
+ * the dashboard API (/api/*), the CLI's own node list (/api/nodes), and static
+ * assets (the frontend in ./public).
  */
 
 import { Circuit } from "./circuit.js";
 import { handleLogin, handleSession, handleLogout, getSession, json } from "./auth.js";
 import {
   cliStart, cliComplete, cliPoll,
-  listMachines, deleteMachine, verifyAgentToken, registerMachine, machineOwner,
+  listMachines, deleteMachine, verifyAgentToken, registerMachine, machineAccess,
 } from "./registry.js";
 
 export { Circuit };
@@ -79,6 +82,20 @@ export default {
         : json({ error: "not found" }, 404);
     }
 
+    // ---- the CLI's view of the account ----
+    // Same list as /api/machines, but authenticated with the agent token a
+    // machine already holds instead of a browser session — this is how a host
+    // discovers its siblings without a human at a keyboard. `online` is decided
+    // here rather than by the caller: the relay's clock wrote last_seen, and a
+    // machine comparing it against its own would fold in every bit of skew.
+    if (p === "/api/nodes") {
+      const account = await verifyAgentToken(env, request.headers.get("x-switchboard-agent"));
+      if (!account) return json({ error: "invalid or missing agent token" }, 401);
+      // `now` travels with the rows for the same reason: "last seen 3m ago" is
+      // only true if it's measured against the clock that stamped last_seen.
+      return json({ login: account.login, now: Date.now(), nodes: await listMachines(env, account.id) });
+    }
+
     // ---- static assets (frontend) ----
     if (env.ASSETS) return env.ASSETS.fetch(request);
     return new Response("not found\n", { status: 404 });
@@ -101,16 +118,34 @@ async function routeWebSocket(request, env, url) {
   const machineId = url.searchParams.get("machine");
   if (machineId) {
     // ---- bound (account) mode ----
+    const agentToken = request.headers.get("x-switchboard-agent");
     if (role === "daemon") {
-      const account = await verifyAgentToken(env, request.headers.get("x-switchboard-agent"));
+      const account = await verifyAgentToken(env, agentToken);
       if (!account) return new Response("invalid or missing agent token\n", { status: 401 });
-      const ok = await registerMachine(env, machineId, account, url.searchParams.get("name") || "");
+      const ok = await registerMachine(
+        env, machineId, account,
+        url.searchParams.get("name") || "",
+        url.searchParams.get("peer") === "1",
+      );
       if (!ok) return new Response("machine is owned by another account\n", { status: 403 });
     } else {
-      const s = await getSession(request, env);
+      // A client is either a signed-in browser or one of the account's own
+      // machines dialling a sibling. Both must own the target; a machine must
+      // additionally find it willing to be dialled.
+      const peer = agentToken ? await verifyAgentToken(env, agentToken) : null;
+      if (agentToken && !peer) return new Response("invalid agent token\n", { status: 401 });
+      const s = peer || (await getSession(request, env));
       if (!s) return new Response("not signed in\n", { status: 401 });
-      if ((await machineOwner(env, machineId)) !== s.id) {
+      const target = await machineAccess(env, machineId);
+      if (!target || target.accountId !== s.id) {
         return new Response("not your machine\n", { status: 403 });
+      }
+      if (peer && !target.peer) {
+        return new Response(
+          "that machine does not accept connections from your other machines\n" +
+            "(restart its daemon without SWITCHBOARD_PEER=0 to allow it)\n",
+          { status: 403 },
+        );
       }
     }
     return env.CIRCUIT.get(env.CIRCUIT.idFromName("m:" + machineId)).fetch(request);

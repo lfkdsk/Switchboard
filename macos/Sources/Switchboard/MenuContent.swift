@@ -194,7 +194,11 @@ struct MenuContent: View {
                     Text("Couldn't change login item — only works from the bundled app.")
                         .font(.system(size: 9)).foregroundStyle(.secondary)
                 }
-                Text("Relay/Shell changes apply on the next Start.")
+                Toggle("Let my other machines run commands here", isOn: $prefs.peer)
+                    .font(.system(size: 11))
+                Text("`switchboard exec` / `shell` from the machines on your account.")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                Text("Relay/Shell/peer changes apply on the next Start.")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
 
                 Divider()

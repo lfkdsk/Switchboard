@@ -1,0 +1,15 @@
+-- Adds machines.peer — whether this machine accepts peer connections from your
+-- other machines (`switchboard exec <node>` / `switchboard shell <node>`).
+--
+-- The daemon declares it on every connect, so existing machines set their own
+-- value the next time they come up; 0 is the safe default for a row last written
+-- by a daemon that predates the flag.
+--
+-- schema.sql only uses CREATE TABLE IF NOT EXISTS, so it can't add a column to a
+-- database that already exists. Run this once against each:
+--   npx wrangler d1 execute switchboard_db --local  --file migrations/0002_add_peer.sql
+--   npx wrangler d1 execute switchboard_db --remote --file migrations/0002_add_peer.sql
+--
+-- Not idempotent: SQLite has no ADD COLUMN IF NOT EXISTS, so a second run fails
+-- with "duplicate column name: peer". That error means it was already applied.
+ALTER TABLE machines ADD COLUMN peer INTEGER NOT NULL DEFAULT 0;
