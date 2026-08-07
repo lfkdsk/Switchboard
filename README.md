@@ -63,7 +63,8 @@ quick remote help. No sign-in required; the token *is* the key (see
 ## What you get
 
 - **🖥️ A real terminal in the browser** — full xterm.js: 256-color, resize,
-  scrollback, copy/paste. Not a log viewer — your actual shell.
+  scrollback, copy/paste, and Nerd Font icons, so a Powerline/Starship prompt
+  looks the same as it does locally. Not a log viewer — your actual shell.
 - **📊 All your machines, one dashboard** — sign in with GitHub and every machine
   you've bound is listed with live status: online/offline, round-trip latency,
   CPU, memory, and last-seen.
@@ -299,6 +300,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `src/registry.js` | D1 bookkeeping: machines, agent tokens, CLI-login handshake |
 | `public/index.html` | The browser app — terminal, tabs, dashboard, file transfer |
 | `public/cli-login.html` | The `switchboard login` authorization page |
+| `public/fonts/` | Vendored Nerd Font symbol subsets (see [public/fonts/README.md](public/fonts/README.md)) |
 | `schema.sql` | D1 schema |
 | `migrations/` | Incremental D1 changes, for databases that predate a column |
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
