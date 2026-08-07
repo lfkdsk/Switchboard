@@ -27,11 +27,12 @@ const crypto = require("crypto");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { exec, spawnSync } = require("child_process");
+const { exec, spawn, spawnSync } = require("child_process");
 const WebSocket = require("ws");
 const pty = require("node-pty");
 const fixPtyPerms = require("./scripts/fix-pty-perms");
 const activity = require("./activity");
+const peer = require("./peer");
 const pkg = require("./package.json");
 
 // ---- logging -------------------------------------------------------------
@@ -79,12 +80,27 @@ Usage:
   switchboard service <verb>   Linux: run in the background via systemd, starting
                                at boot. Verbs: install, uninstall, status.
 
+Your other machines (signed in; the target must allow peers):
+  switchboard nodes            List every machine on your account and what it's doing.
+  switchboard exec <node> <cmd…>
+                               Run a command over there; its stdout, stderr and
+                               exit code come back here.
+  switchboard shell <node>     Open an interactive shell over there. Ctrl-] detaches.
+
+  <node> is a hostname or any unambiguous prefix of it (or of the machine id).
+
 Options:
   -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
   -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
+      --no-peer         Refuse commands from your other machines (see below).
   -v, --version         Print version and exit.
   -h, --help            Show this help and exit.
+
+  nodes: --json                Machine-readable output.
+  exec:  --cwd <dir>           Working directory over there. Default: its home.
+         --timeout <seconds>   Give up and kill the command after this long.
+  shell: [sid] | --attach      Reattach: to that session, or to the newest one.
 
 Environment (overridden by the flags above):
   SWITCHBOARD_TOKEN, SWITCHBOARD_SERVER, SWITCHBOARD_SHELL  (WEBTERM_* also accepted)
@@ -93,6 +109,10 @@ Environment (overridden by the flags above):
                                 Off by default: a session title summarises what
                                 you asked for, so it leaves this machine only
                                 when you opt in.
+  SWITCHBOARD_PEER=0            Refuse exec/shell from your other machines. On by
+                                default: they're yours, and your dashboard can
+                                already open a shell here. Turn it off for a host
+                                that should only ever be driven by hand.
 
 Notes:
   Logged in → this machine shows up in your dashboard; only you can open its shell.
@@ -112,6 +132,7 @@ function parseArgs(argv) {
       case "-t": case "--token": opts.token = inline !== null ? inline : argv[++i]; break;
       case "-s": case "--server": opts.server = inline !== null ? inline : argv[++i]; break;
       case "--shell": opts.shell = inline !== null ? inline : argv[++i]; break;
+      case "--no-peer": opts.noPeer = true; break;
       default:
         console.error(`Unknown option: ${a}\n`);
         printHelp();
@@ -121,11 +142,48 @@ function parseArgs(argv) {
   return opts;
 }
 
+// The peer subcommands take a machine, and `exec` takes a whole foreign command
+// line after it. Our flags may sit on either side of the machine name, but they
+// stop at the first bare word after it: that word starts the remote command, and
+// everything from there belongs to the far end — so `exec box ls -la` keeps its
+// -la instead of losing it to this parser. A literal `--` ends our flags too.
+function parsePeerArgs(argv) {
+  const opts = {};
+  let i = 0;
+  for (; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { i++; break; }
+    if (!a.startsWith("-")) {
+      if (opts.target === undefined) { opts.target = a; continue; }
+      break; // the command starts here
+    }
+    const eq = a.indexOf("=");
+    const inline = eq > -1 ? a.slice(eq + 1) : null;
+    const name = eq > -1 ? a.slice(0, eq) : a;
+    const take = () => (inline !== null ? inline : argv[++i]);
+    switch (name) {
+      case "-h": case "--help": opts.help = true; break;
+      case "-s": case "--server": opts.server = take(); break;
+      case "--json": opts.json = true; break;
+      case "--cwd": opts.cwd = take(); break;
+      case "--timeout": opts.timeout = Number(take()); break;
+      case "--attach": opts.attach = true; break;
+      default:
+        console.error(`Unknown option: ${a}\n`);
+        printHelp();
+        process.exit(1);
+    }
+  }
+  opts.rest = argv.slice(i);
+  return opts;
+}
+
 const rawArgs = process.argv.slice(2);
-const sub = ["login", "logout", "service"].includes(rawArgs[0]) ? rawArgs.shift() : null;
+const PEER_SUBS = ["nodes", "ls", "exec", "shell"];
+const sub = ["login", "logout", "service", ...PEER_SUBS].includes(rawArgs[0]) ? rawArgs.shift() : null;
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
-const args = parseArgs(rawArgs);
+const args = PEER_SUBS.includes(sub) ? parsePeerArgs(rawArgs) : parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
 
@@ -192,6 +250,62 @@ function doLogout() {
   process.exit(0);
 }
 
+// ---- peer commands -------------------------------------------------------
+// `nodes` / `exec` / `shell` don't expose anything: they spawn no PTY and
+// register nothing. They're this machine acting as a *client* of the relay,
+// using the same account credential the daemon does, to reach the machines the
+// dashboard would show you. The far end is the exec/session handling below.
+function peerContext() {
+  const c = loadConfig();
+  if (!c.agentToken) {
+    console.error("\nNot signed in on this machine.\n\n" +
+      "Your other machines are account-scoped, so reaching them needs the same\n" +
+      "credential the daemon uses:\n\n  switchboard login\n");
+    process.exit(1);
+  }
+  return {
+    // The agent token is only valid on the relay that issued it, so the saved
+    // one wins over the built-in default — an explicit --server/env still wins
+    // over both, for a self-hosted setup with more than one.
+    server: (args.server || process.env.SWITCHBOARD_SERVER || process.env.WEBTERM_SERVER ||
+      c.server || DEFAULT_SERVER).replace(/\/+$/, ""),
+    agentToken: c.agentToken,
+    machineId: c.machineId || null,
+    login: c.login || null,
+  };
+}
+
+function doPeer() {
+  const ctx = peerContext();
+  const run = (p) => p.catch((e) => { console.error("\n" + ((e && e.message) || e) + "\n"); process.exit(1); });
+
+  if (sub === "nodes" || sub === "ls") return run(peer.cmdNodes(ctx, { json: !!args.json }));
+
+  if (!args.target) {
+    console.error(`\nWhich machine? Usage: switchboard ${sub} <node>${sub === "exec" ? " <command…>" : ""}\n\n` +
+      "Run `switchboard nodes` to see them.\n");
+    process.exit(1);
+  }
+  if (sub === "shell") {
+    // An explicit session id is a positional, not a flag value: `--attach <sid>`
+    // sitting before the machine name would be ambiguous about which is which.
+    return run(peer.cmdShell(ctx, { target: args.target, sid: args.rest[0] || null, attach: !!args.attach }));
+  }
+  // Joined the way ssh joins it, so quoting is resolved once — over there.
+  const command = args.rest.join(" ").trim();
+  if (!command) {
+    console.error("\nNothing to run. Usage: switchboard exec <node> <command…>\n");
+    process.exit(1);
+  }
+  if (args.timeout !== undefined && !(args.timeout > 0)) {
+    console.error("\n--timeout takes a number of seconds.\n");
+    process.exit(1);
+  }
+  return run(peer.cmdExec(ctx, {
+    target: args.target, command, cwd: args.cwd || null, timeout: args.timeout || 0,
+  }));
+}
+
 // ---- background service (systemd --user) ---------------------------------
 // The Linux counterpart to the macOS app's "launch at login": a user-level unit
 // plus lingering, so the daemon comes up at boot and keeps running after you log
@@ -244,6 +358,9 @@ function unitBody() {
   // every session silently falls back to bash.
   if (shell) env.push(`Environment="SWITCHBOARD_SHELL=${shell}"`);
   if (token) env.push(`Environment="SWITCHBOARD_TOKEN=${token}"`);
+  // Same reasoning for peer access: the unit is the machine's standing answer,
+  // so a host you deliberately closed off must not come back open at boot.
+  if (!PEER) env.push(`Environment="SWITCHBOARD_PEER=0"`);
   return `[Unit]
 Description=Switchboard — a shell on this machine, in your browser
 Documentation=https://github.com/lfkdsk/Switchboard
@@ -352,6 +469,14 @@ let cfg = loadConfig();
 let BOUND = false;
 let TOKEN = null, MACHINE = null, AGENT = null, wsUrl, browseUrl;
 
+// May your *other* machines run things here (`switchboard exec`, `switchboard
+// shell`)? On by default in account mode: they're yours, and anyone who can
+// reach this host that way could already have opened a shell on it from the
+// dashboard. Turning it off is for a machine that should only ever be driven by
+// hand. Declared to the relay on every connect — the host decides, not the caller.
+const PEER = !args.noPeer &&
+  !["0", "off", "false", "no"].includes((process.env.SWITCHBOARD_PEER || "").toLowerCase());
+
 const SHELL =
   args.shell || process.env.SWITCHBOARD_SHELL || process.env.WEBTERM_SHELL || process.env.SHELL ||
   (process.platform === "win32" ? "powershell.exe" : "bash");
@@ -363,7 +488,7 @@ function setupConnection() {
     if (!cfg.machineId) { cfg.machineId = MACHINE; saveConfig(cfg); }
     AGENT = cfg.agentToken;
     wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&machine=" + encodeURIComponent(MACHINE) +
-      "&name=" + encodeURIComponent(os.hostname());
+      "&name=" + encodeURIComponent(os.hostname()) + (PEER ? "&peer=1" : "");
     browseUrl = SERVER + "/";
   } else {
     // 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
@@ -469,6 +594,9 @@ function banner() {
     console.log("  Account : " + (cfg.login || "(signed in)"));
     console.log("  Machine : " + MACHINE);
     console.log("  Open    : " + browseUrl + "   (your dashboard)");
+    console.log("  Peers   : " + (PEER
+      ? "on — your other machines can `switchboard exec " + os.hostname() + "`"
+      : "off — no exec/shell from your other machines"));
     console.log("");
     console.log("  Signed in — only you can open this machine's shell.");
   } else {
@@ -483,6 +611,7 @@ function banner() {
     machine: os.hostname(),
     account: BOUND ? (cfg.login || null) : null,
     machineId: BOUND ? MACHINE : null,
+    peer: BOUND ? PEER : null,
     dashboardUrl: browseUrl,
     shareUrl: BOUND ? null : browseUrl,
     token: BOUND ? null : TOKEN,
@@ -566,6 +695,10 @@ function connect() {
       case "list-sessions": broadcastSessions(); break;
       case "close": killSession(msg.sid); broadcastSessions(); break;
       case "ping": sendCtl({ type: "pong", t: msg.t }); break; // browser↔daemon RTT probe
+      case "exec": startExec(msg); break;
+      case "exec-stdin": execStdin(msg.id, msg.data); break;
+      case "exec-stdin-end": execStdinEnd(msg.id); break;
+      case "exec-kill": killExec(msg.id, msg.signal); break;
       case "dl-open": startDownload(msg.id, msg.path); break;
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
@@ -573,6 +706,10 @@ function connect() {
       case "peer-status":
         log("[relay] browser " + (msg.online ? "connected" : "disconnected"));
         emitStatus("peer", { online: !!msg.online });
+        // Nobody is left on this circuit, so no running command still has a
+        // caller: its output is going nowhere and nothing can stop it any more.
+        // This is the SIGHUP an ssh session would have delivered.
+        if (!msg.online) for (const id of [...activeExecs.keys()]) killExec(id, "SIGTERM");
         break;
     }
   });
@@ -593,6 +730,10 @@ function connect() {
     activeDownloads.clear();
     for (const up of activeUploads.values()) up.stream.destroy();
     activeUploads.clear();
+    // Exec dies with the link it was invoked over: its caller is already gone,
+    // and a command whose output has nowhere to go would fill a pipe and hang.
+    // (Long jobs belong in a session, which does survive a reconnect.)
+    for (const id of [...activeExecs.keys()]) { killExec(id, "SIGTERM"); activeExecs.delete(id); }
     log(`[relay] disconnected, retrying in ${reconnectDelay}ms`);
     emitStatus("disconnected", { code, retryInMs: reconnectDelay });
     setTimeout(connect, reconnectDelay);
@@ -731,6 +872,110 @@ function startDownload(id, rawPath) {
   });
 }
 
+// ---- remote exec ---------------------------------------------------------
+// What `switchboard exec <node> <cmd>` on one of your other machines lands on.
+// Deliberately *not* a session: a caller running one command — a script, or an
+// agent — wants clean stdout, clean stderr and a real exit code, not a PTY that
+// echoes its own input and paints escape sequences over the output.
+//
+// The relay only lets a peer reach here when this daemon declared `peer=1` on
+// connect (SWITCHBOARD_PEER), so the gate is upstream; by the time a message
+// arrives it has already been checked against the account that owns this host.
+const activeExecs = new Map(); // id -> child process
+const MAX_EXECS = 8;
+
+// A *login* shell. The daemon's own environment is not the user's: started by
+// systemd or launchd it inherits a stub PATH, so `node`, `claude` or `cargo`
+// installed by a version manager would simply not exist. -l reads the profile,
+// which is what makes a command behave the way it does when you type it.
+function shellCommandArgs(cmd) {
+  return process.platform === "win32"
+    ? ["-NoLogo", "-NoProfile", "-Command", cmd]
+    : ["-lc", cmd];
+}
+
+function execFail(id, message) {
+  sendCtl({ type: "exec-exit", id, code: 126, error: message });
+}
+
+function startExec(msg) {
+  const id = msg.id;
+  if (!id || activeExecs.has(id)) return;
+  const cmd = typeof msg.cmd === "string" ? msg.cmd.trim() : "";
+  if (!cmd) return execFail(id, "empty command");
+  // A peer is already trusted to run anything here; the cap is against a runaway
+  // loop on the other end, not against its author.
+  if (activeExecs.size >= MAX_EXECS) return execFail(id, `too many concurrent commands (max ${MAX_EXECS})`);
+
+  let cwd = msg.cwd ? String(msg.cwd) : os.homedir();
+  if (cwd === "~" || cwd.startsWith("~/")) cwd = path.join(os.homedir(), cwd.slice(1));
+
+  let child;
+  try {
+    child = spawn(SHELL, shellCommandArgs(cmd), {
+      cwd,
+      env: process.env,
+      // Its own process group, so a Ctrl-C on the far end can take down the
+      // whole pipeline rather than just the shell that spawned it.
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    return execFail(id, e.message);
+  }
+  activeExecs.set(id, child);
+  log(`[exec ${id.slice(0, 8)}] ${cmd}`);
+
+  // Same backpressure shape as a download: pause until the frame has flushed,
+  // so a command that floods stdout can't outrun the socket.
+  const pump = (stream, type) => {
+    stream.on("data", (chunk) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { killExec(id); return; }
+      stream.pause();
+      ws.send(JSON.stringify({ type, id, data: chunk.toString("base64") }), () => {
+        if (ws && ws.readyState === WebSocket.OPEN) stream.resume();
+      });
+    });
+  };
+  pump(child.stdout, "exec-out");
+  pump(child.stderr, "exec-err");
+
+  // Without stdin the caller is not going to send any, and a command that reads
+  // it (`cat`, `read`) would hang forever waiting on a pipe nobody will close.
+  child.stdin.on("error", () => {}); // the child may exit before we finish writing
+  if (!msg.stdin) child.stdin.end();
+
+  child.on("error", (e) => {
+    if (!activeExecs.delete(id)) return;
+    execFail(id, e.code === "ENOENT" ? `no such directory: ${cwd}` : e.message);
+  });
+  child.on("close", (code, signal) => {
+    if (!activeExecs.delete(id)) return;
+    sendCtl({ type: "exec-exit", id, code: code == null ? null : code, signal: signal || null });
+    log(`[exec ${id.slice(0, 8)}] exited (${signal || code})`);
+  });
+}
+
+function execStdin(id, b64) {
+  const child = activeExecs.get(id);
+  if (child && child.stdin.writable) child.stdin.write(Buffer.from(String(b64 || ""), "base64"));
+}
+function execStdinEnd(id) {
+  const child = activeExecs.get(id);
+  if (child && child.stdin.writable) child.stdin.end();
+}
+function killExec(id, signal) {
+  const child = activeExecs.get(id);
+  if (!child) return;
+  const sig = signal === "SIGKILL" ? "SIGKILL" : signal === "SIGTERM" ? "SIGTERM" : "SIGINT";
+  try {
+    // Negative pid = the whole process group (see `detached` above). Falls back
+    // to the direct child on Windows, which has no groups to signal.
+    if (process.platform === "win32") child.kill(sig);
+    else process.kill(-child.pid, sig);
+  } catch { try { child.kill(sig); } catch {} }
+}
+
 // ---- host metrics --------------------------------------------------------
 let prevCpu = cpuSample();
 function cpuSample() {
@@ -819,6 +1064,7 @@ function sendStats() {
 (async function main() {
   if (sub === "logout") return doLogout(); // remove creds and exit
   if (sub === "service") return doService(serviceAction); // install/remove the systemd unit and exit
+  if (PEER_SUBS.includes(sub)) return doPeer(); // client-side: talk to the *other* machines
   if (sub === "login") {
     // One step: sign in, then fall through to expose this machine's shell.
     await doLogin(); // saves config; fatal-exits on failure

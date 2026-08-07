@@ -78,6 +78,10 @@ final class DaemonSupervisor: ObservableObject {
         if !prefs.shell.trimmingCharacters(in: .whitespaces).isEmpty {
             env["SWITCHBOARD_SHELL"] = prefs.shell
         }
+        // Only ever set to decline: absent means the daemon's own default (on).
+        if !prefs.peer {
+            env["SWITCHBOARD_PEER"] = "0"
+        }
         if let np = rt.nodePathDir {
             env["NODE_PATH"] = np.path
         }

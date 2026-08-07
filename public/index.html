@@ -310,7 +310,9 @@
         const online = Date.now() - m.last_seen < 6000; // heartbeat freshness
         const label = m.name || m.machine_id.slice(0, 8);
         const meta = online
-          ? `online · ${m.rtt != null ? m.rtt + "ms" : "—"}${m.cpu != null ? " · cpu " + Math.round(m.cpu * 100) + "%" : ""}${m.mem_used != null && m.mem_total ? " · mem " + fmtBytes(m.mem_used) + "/" + fmtBytes(m.mem_total) : ""}`
+          // "peers off" only when it deviates: accepting `switchboard exec` from
+          // your other machines is the default, so saying so on every row is noise.
+          ? `online · ${m.rtt != null ? m.rtt + "ms" : "—"}${m.cpu != null ? " · cpu " + Math.round(m.cpu * 100) + "%" : ""}${m.mem_used != null && m.mem_total ? " · mem " + fmtBytes(m.mem_used) + "/" + fmtBytes(m.mem_total) : ""}${m.peer ? "" : " · peers off"}`
           : "offline · last seen " + fmtAgo(m.last_seen);
 
         let el = machineEls.get(m.machine_id);

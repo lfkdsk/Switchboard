@@ -14,6 +14,10 @@ Switchboard.app  (LSUIElement — menu bar only, no Dock icon)
 
 - **No Dock icon, no ⌘-Tab entry** — it lives only in the menu bar (`LSUIElement`).
 - **Launch at login** via `SMAppService` (macOS 13+).
+- **Settings → "Let my other machines run commands here"** is this app's
+  `SWITCHBOARD_PEER`. A GUI app inherits launchd's environment rather than your
+  shell's, so the env var isn't reachable here — the toggle is how a Mac declines
+  `switchboard exec` from the rest of your account. On by default, like the CLI.
 - **Self-contained** — bundles its own Node, so it doesn't depend on the user's
   `nvm`/`brew` Node being on a GUI process's minimal `PATH`.
 - Auto-starts the daemon on login **only when you're signed in** (an anonymous

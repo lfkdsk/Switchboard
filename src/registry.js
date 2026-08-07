@@ -35,17 +35,20 @@ export async function verifyAgentToken(env, token) {
 
 // ---- machines ------------------------------------------------------------
 // Returns false if the machine_id is already claimed by a different account.
-export async function registerMachine(env, machineId, account, name) {
+// `peer` is the host's own answer to "may my other machines run things here?",
+// re-stated on every connect — so flipping it is a daemon restart, not a support
+// ticket, and a machine that has gone away can't leave a stale `yes` behind.
+export async function registerMachine(env, machineId, account, name, peer) {
   const existing = await env.DB.prepare("SELECT account_id FROM machines WHERE machine_id=?").bind(machineId).first();
   if (existing && existing.account_id !== account.id) return false;
   const now = Date.now();
   if (existing) {
-    await env.DB.prepare("UPDATE machines SET online=1, last_seen=?, name=? WHERE machine_id=?")
-      .bind(now, name || "", machineId).run();
+    await env.DB.prepare("UPDATE machines SET online=1, last_seen=?, name=?, peer=? WHERE machine_id=?")
+      .bind(now, name || "", peer ? 1 : 0, machineId).run();
   } else {
     await env.DB.prepare(
-      "INSERT INTO machines (machine_id, account_id, account_login, name, online, created_at, last_seen) VALUES (?,?,?,?,1,?,?)",
-    ).bind(machineId, account.id, account.login, name || "", now, now).run();
+      "INSERT INTO machines (machine_id, account_id, account_login, name, online, created_at, last_seen, peer) VALUES (?,?,?,?,1,?,?,?)",
+    ).bind(machineId, account.id, account.login, name || "", now, now, peer ? 1 : 0).run();
   }
   return true;
 }
@@ -68,27 +71,35 @@ export async function updateMachineStats(env, machineId, s) {
     machineId,
   ).run();
 }
-export async function machineOwner(env, machineId) {
-  const row = await env.DB.prepare("SELECT account_id FROM machines WHERE machine_id=?").bind(machineId).first();
-  return row ? row.account_id : null;
+// Who owns this machine, and does it take peer connections? One row read answers
+// both questions the /ws gate asks, so it stays one round-trip to D1.
+export async function machineAccess(env, machineId) {
+  const row = await env.DB.prepare(
+    "SELECT account_id, peer FROM machines WHERE machine_id=?",
+  ).bind(machineId).first();
+  return row ? { accountId: row.account_id, peer: !!row.peer } : null;
 }
 export async function listMachines(env, accountId) {
   const { results } = await env.DB.prepare(
     // Stable order: created_at never changes, so rows keep a fixed position.
     // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
-    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
+    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity, peer FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
   ).bind(accountId).all();
   // Hand the client a parsed object; a row written by an older daemon has none.
   return (results || []).map((r) => {
     let activity = null;
     if (r.activity) { try { activity = JSON.parse(r.activity); } catch {} }
-    return { ...r, activity };
+    return { ...r, activity, peer: !!r.peer, online: isOnline(r.last_seen) };
   });
 }
 
-// A machine is "online" while its heartbeat stays fresh; mirror the dashboard's
-// freshness window so the two agree on what's deletable.
+// A machine is "online" while its heartbeat stays fresh — the `online` column is
+// only a hint, since a daemon that dies ungracefully never gets to clear it.
+// Mirrors the window the dashboard applies, so every caller agrees on who's up.
 const ONLINE_WINDOW_MS = 6000;
+export function isOnline(lastSeen) {
+  return Date.now() - lastSeen < ONLINE_WINDOW_MS;
+}
 
 // Remove one of the caller's own machines, but only while it's offline — a live
 // daemon would just re-register on its next heartbeat, so deleting it is futile
@@ -98,7 +109,7 @@ export async function deleteMachine(env, machineId, accountId) {
     "SELECT account_id, last_seen FROM machines WHERE machine_id=?",
   ).bind(machineId).first();
   if (!row || row.account_id !== accountId) return { ok: false, reason: "not-found" };
-  if (Date.now() - row.last_seen < ONLINE_WINDOW_MS) return { ok: false, reason: "online" };
+  if (isOnline(row.last_seen)) return { ok: false, reason: "online" };
   await env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId).run();
   return { ok: true };
 }

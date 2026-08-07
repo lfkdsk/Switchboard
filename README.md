@@ -73,6 +73,10 @@ quick remote help. No sign-in required; the token *is* the key (see
   running **Claude Code** sessions show up too: what each one is working on,
   which tool it's running, and whether it's mid-task or waiting on you — the
   thing cpu% can't tell you, since an agent blocked on an API call looks idle.
+- **🔗 Machines that can reach each other** — not just browser→machine. From any
+  host you've signed in: `switchboard nodes` lists the others, `switchboard exec
+  <node> <cmd>` runs something on one, `switchboard shell <node>` opens a shell
+  on one. The agent already running on your laptop can drive the build box.
 - **🗂️ Multiple shells, tmux-style** — open as many tabs as you want on a single
   machine. Shells survive tab reloads and flaky links; in account mode they keep
   running even after you close the browser, so you can reattach right where you
@@ -157,6 +161,69 @@ token you already hold, use `switchboard service install --token <token>`.
 
 ---
 
+## Your machines can reach each other
+
+Sign in on two machines and each one can see and drive the other — no browser in
+the middle:
+
+```bash
+switchboard nodes                      # every machine on your account, live
+switchboard exec build-box npm test    # run something over there
+switchboard shell build-box            # a shell over there, in this terminal
+```
+
+`<node>` is a hostname, or any unambiguous prefix of one (or of the machine id).
+An ambiguous prefix is an error, never a guess.
+
+This is the same trust boundary the dashboard has always had — your account —
+reached with the credential the machine already holds, so there are no keys to
+distribute and nothing new to expose. Both ends still dial out, which means it
+works to a machine you *couldn't* ssh to: behind NAT, on hotel wifi, on a
+corporate network with no inbound anything.
+
+### For the agent on the other end
+
+`exec` exists because an agent is already living on these machines. Claude Code
+knows how to use a shell, so another host becomes one more thing it can use:
+
+```bash
+switchboard exec gpu-box 'nvidia-smi --query-gpu=memory.used --format=csv'
+switchboard nodes --json               # machine-readable, for the agent to read
+```
+
+stdout and stderr come back unmixed, the exit code is the remote one, piped stdin
+is forwarded, and Ctrl-C reaches the remote *process group* — so it composes with
+everything else a shell does, including `&&`, pipes and `$?`. The command runs
+under a login shell over there, so `PATH` is the one you'd get in a terminal, not
+the stub a launchd/systemd daemon inherits. Arguments are joined the way `ssh`
+joins them and parsed by the far shell, so quote anything your local shell
+shouldn't touch:
+
+```bash
+switchboard exec build-box 'cd ~/app && git pull && npm test'   # one remote shell
+switchboard exec build-box --cwd ~/app --timeout 600 npm test   # same, spelled out
+```
+
+`shell` is the browser terminal in your terminal, on the same sessions: **Ctrl-]**
+detaches and leaves the shell running (it's still a tab in the dashboard), and
+`switchboard shell <node> --attach` picks the newest one back up.
+
+### Turning it off
+
+Peer access is **on by default** in account mode — these are your own machines,
+and anyone who could reach one this way could already have opened a shell on it
+from the dashboard. A host that should only ever be driven by hand opts out:
+
+```bash
+SWITCHBOARD_PEER=0 switchboard         # or: switchboard --no-peer
+```
+
+The target machine declares that on every connect and the **relay** enforces it,
+so it isn't a client-side courtesy — a peer that skips the check gets a 403. Its
+row on the dashboard and in `switchboard nodes` says `peers off`.
+
+---
+
 ## How it works
 
 ```
@@ -204,6 +271,15 @@ npx wrangler secret put SESSION_SECRET               # any long random string
 npm run deploy
 ```
 
+Already deployed and pulling a newer version? `schema.sql` only creates tables it
+doesn't have, so columns added since your database was created live in
+`migrations/`. Apply the ones you're missing, oldest first — each file says what
+it's for, and re-running an applied one fails loudly rather than silently:
+
+```bash
+npx wrangler d1 execute switchboard_db --remote --file migrations/0002_add_peer.sql
+```
+
 Wrangler prints your URL (e.g. `https://switchboard.<subdomain>.workers.dev`).
 Point the daemon at it:
 
@@ -245,6 +321,14 @@ switchboard                  Expose this shell using saved credentials, or an
 switchboard logout           Remove the stored account credential.
 switchboard service install  Linux: run in the background via systemd, starting
                              at boot. Also: uninstall, status.
+
+switchboard nodes            List every machine on your account and what it's
+                             doing. (Alias: ls.)
+switchboard exec <node> <cmd…>
+                             Run a command on one of your other machines; its
+                             stdout, stderr and exit code come back here.
+switchboard shell <node>     Open an interactive shell on one of your other
+                             machines. Ctrl-] detaches.
 ```
 
 | Option | Description |
@@ -252,13 +336,23 @@ switchboard service install  Linux: run in the background via systemd, starting
 | `-t, --token <token>` | Force anonymous mode with this token (min 24 chars). |
 | `-s, --server <url>`  | Relay origin. Default: `https://shell.lfkdsk.org`. |
 | `--shell <path>`      | Shell to spawn. Default: `$SHELL`, else `bash`/`powershell`. |
+| `--no-peer`           | Refuse `exec`/`shell` from your other machines. |
 | `-v, --version`       | Print version and exit. |
 | `-h, --help`          | Show help and exit. |
+| `nodes --json`        | Machine-readable node list. |
+| `exec --cwd <dir>`    | Working directory on the far machine. Default: its home. |
+| `exec --timeout <s>`  | Kill the remote command after this many seconds. |
+| `shell [sid]`, `shell --attach` | Reattach to that session, or to the newest one. |
 
 Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
 `SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`. The `WEBTERM_*` equivalents are also
 accepted for drop-in compatibility. Account credentials live in
 `~/.switchboard/config.json` (mode `0600`).
+
+`SWITCHBOARD_PEER=0` makes this machine refuse `exec`/`shell` from your other
+machines (see [above](#turning-it-off)). It's on by default in account mode, and
+`service install` pins your choice into the unit so a host you closed off doesn't
+come back open at boot.
 
 `SWITCHBOARD_ACTIVITY=claude` additionally reports running Claude Code sessions
 to your dashboard. It's off by default because a session's title summarises what
@@ -277,6 +371,14 @@ and never include command-line arguments (those routinely carry secrets).
 - **Account mode is gated by GitHub identity.** A machine bound with
   `switchboard login` can only be opened by the signed-in owner; sessions are
   HMAC-signed cookies, and agent tokens are stored **hashed** (SHA-256) in D1.
+- **The agent token is a full account credential**, and since peer mode it's a
+  *client* one too: whoever holds `~/.switchboard/config.json` on one machine can
+  `exec` on the others that allow peers. It was always account-scoped — that file
+  could already register or take over any of your machines' circuits — but the
+  blast radius is bigger now, so it stays mode `0600`, and a host you don't want
+  driven remotely should run with `SWITCHBOARD_PEER=0`. `switchboard logout`
+  removes the credential; the relay checks ownership on every single connection,
+  so revoking is immediate.
 - **The relay sees plaintext.** TLS terminates at the Worker, so the operator
   (you, when self-hosting) can see the stream. Switchboard is **not** end-to-end
   encrypted — self-hosting removes the third party, not the relay's visibility.
@@ -304,6 +406,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
 | `cli/` | `@switch-board/cli` — the host daemon |
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
+| `cli/peer.js` | The other machines: `nodes`, `exec`, `shell` (client side) |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 
 ---
