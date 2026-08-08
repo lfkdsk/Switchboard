@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Switchboard">
+  <defs>
+    <linearGradient id="sb-plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a241f"/>
+      <stop offset="1" stop-color="#1a1614"/>
+    </linearGradient>
+    <linearGradient id="sb-cord" x1="40" y1="30" x2="92" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e08966"/>
+      <stop offset="1" stop-color="#c66a4d"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="122" height="122" rx="29" fill="url(#sb-plate)" stroke="#4a4239" stroke-width="2"/>
+  <path d="M82 38 C52 30 38 52 64 64 C90 76 76 98 46 90"
+        fill="none" stroke="url(#sb-cord)" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="82" cy="38" r="11" fill="#1a1614"/>
+  <circle cx="82" cy="38" r="7.5" fill="#8ba668"/>
+  <circle cx="46" cy="90" r="11" fill="#1a1614"/>
+  <circle cx="46" cy="90" r="7.5" fill="#ede4d3"/>
+</svg>

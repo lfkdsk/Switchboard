@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard — a shell on any of your machines</title>
+<meta name="description" content="Run one command on a machine and it shows up in your browser dashboard as a real interactive terminal — even behind NAT. No SSH config, no inbound ports, no VPN.">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://lfkdsk.github.io/Switchboard/">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="Switchboard — a shell on any of your machines">
+<meta property="og:description" content="A real terminal in your browser, on any machine you own. Both ends dial out to a Cloudflare relay, so there is nothing to port-forward and nothing to expose.">
+<meta property="og:url" content="https://lfkdsk.github.io/Switchboard/">
+<meta property="og:image" content="https://lfkdsk.github.io/Switchboard/assets/terminal.png">
+<meta name="twitter:card" content="summary_large_image">
+
+<link rel="preload" href="fonts/fraunces-normal-300600-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/jetbrainsmono-normal-400-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles/fonts.css">
+<link rel="stylesheet" href="styles/inktype.tokens.css">
+<link rel="stylesheet" href="styles/inktype.components.css">
+<link rel="stylesheet" href="styles/site.css">
+<script>
+  /* Applied before first paint so the stored theme/language never flashes. */
+  try {
+    var d = document.documentElement;
+    var t = localStorage.getItem('sb-theme');
+    if (t === 'light' || t === 'dark') d.dataset.theme = t;
+    var l = localStorage.getItem('sb-lang');
+    if (!l) l = /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
+    d.dataset.lang = l;
+    d.lang = l === 'zh' ? 'zh-Hans' : 'en';
+  } catch (e) {}
+</script>
+</head>
+<body class="ink-noise">
+
+<a class="skip-link" href="#hero"><span class="en">Skip to content</span><span class="zh">跳到正文</span></a>
+
+<!-- ────────────────────────────────────────────────────────── nav -->
+<nav class="nav">
+  <a class="brand" href="#hero">
+    <img src="assets/mark.svg" alt="" width="28" height="28">
+    <span>Switch<em>board</em></span>
+  </a>
+
+  <div class="nav-links">
+    <a href="#features"><span class="en">Features</span><span class="zh">特性</span></a>
+    <a href="#connect"><span class="en">Connect</span><span class="zh">连接方式</span></a>
+    <a href="#how"><span class="en">How it works</span><span class="zh">原理</span></a>
+    <a href="#download"><span class="en">Download</span><span class="zh">下载</span></a>
+    <a href="https://github.com/lfkdsk/Switchboard">GitHub&nbsp;↗</a>
+  </div>
+
+  <div class="nav-tools">
+    <button type="button" class="tool" id="lang-toggle" aria-label="Switch language">
+      <span class="en">中文</span><span class="zh">EN</span>
+    </button>
+    <button type="button" class="tool tool--icon" id="theme-toggle" aria-label="Switch theme">
+      <!-- Drawn, not typed: ☾/☀ land in fonts that may not be installed. -->
+      <svg class="theme-dark" width="14" height="14" viewBox="0 0 16 16" fill="none"
+           stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+        <path d="M13.2 9.6A5.8 5.8 0 0 1 6.4 2.8a5.8 5.8 0 1 0 6.8 6.8Z" fill="currentColor" stroke="none"/>
+      </svg>
+      <svg class="theme-light" width="14" height="14" viewBox="0 0 16 16" fill="none"
+           stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.1" fill="currentColor" stroke="none"/>
+        <path d="M8 1v1.6M8 13.4V15M15 8h-1.6M2.6 8H1M12.95 3.05l-1.13 1.13M4.18 11.82l-1.13 1.13M12.95 12.95l-1.13-1.13M4.18 4.18 3.05 3.05"/>
+      </svg>
+    </button>
+  </div>
+</nav>
+
+<!-- ────────────────────────────────────────────────────────── hero -->
+<header class="hero" id="hero">
+  <div class="hero-copy">
+    <span class="ink-kicker">
+      <span class="en">Open source &middot; MIT &middot; runs on Cloudflare Workers</span>
+      <span class="zh">开源 &middot; MIT &middot; 跑在 Cloudflare Workers 上</span>
+    </span>
+
+    <h1>
+      <span class="en">A shell on <em>any</em> of your machines.</span>
+      <span class="zh">任意一台机器的终端<br><em>就在浏览器里</em></span>
+    </h1>
+
+    <p class="hero-lead">
+      <span class="en">Run one command on a machine and it shows up in your browser dashboard. Click it and you get a real interactive terminal — tabs, file transfer, live host stats — even when that machine sits behind NAT or a corporate firewall.</span>
+      <span class="zh">在一台机器上跑一条命令，它就出现在你的浏览器面板里。点开就是一个真正的交互式终端 —— 多标签、文件传输、实时主机状态 —— 哪怕这台机器藏在 NAT 或公司防火墙后面。</span>
+    </p>
+
+    <div class="hero-cta">
+      <a class="ink-btn ink-btn--primary ink-btn--lg" href="#start">
+        <span class="en">Try it in 30 seconds</span><span class="zh">30 秒上手</span>
+      </a>
+      <a class="ink-btn ink-btn--lg" href="#download">
+        <span class="en">Download</span><span class="zh">下载客户端</span>
+      </a>
+      <a class="ink-btn ink-btn--lg ink-btn--ghost" href="https://shell.lfkdsk.org">
+        <span class="en">Open dashboard&nbsp;↗</span><span class="zh">打开面板&nbsp;↗</span>
+      </a>
+    </div>
+
+    <p class="hero-meta ink-meta">
+      <span id="cli-version">@switch-board/cli</span>
+      &nbsp;&middot;&nbsp; node &ge; 18 &nbsp;&middot;&nbsp; MIT
+    </p>
+  </div>
+
+  <div class="hero-art">
+    <div class="ink-terminal">
+      <div class="ink-terminal__bar"><span></span><span></span><span></span></div>
+      <div class="ink-terminal__body">
+<span class="ink-terminal__prompt">$</span> npx @switch-board/cli login
+<span class="tl-ok">✓</span> <span class="tl-dim">signed in as</span> lfkdsk
+<span class="tl-ok">✓</span> <span class="tl-dim">circuit open &middot; relay</span> shell.lfkdsk.org
+<span class="tl-ok">✓</span> <span class="tl-dim">shell ready &middot; rtt</span> 24ms
+
+  <span class="tl-url">https://shell.lfkdsk.org</span>
+
+<span class="tl-dim">  no inbound ports were opened.</span>
+<span class="ink-terminal__prompt">$</span> <span class="caret">&nbsp;</span>
+      </div>
+    </div>
+    <p class="hero-art-note ink-footnote">
+      <span class="en">Both ends dial <em>out</em>. Nothing to port-forward, nothing to expose.</span>
+      <span class="zh">两端都是朝外<em>拨号</em>。没有端口转发，也不用暴露任何东西。</span>
+    </p>
+  </div>
+</header>
+
+<!-- ────────────────────────────────────────────────── command strip -->
+<div class="strip">
+  <div class="strip-inner">
+    <div class="strip-cmd">
+      <span class="strip-label">
+        <span class="en">One command, no install</span><span class="zh">一条命令，无需安装</span>
+      </span>
+      <code class="cmd" id="cmd-login">npx @switch-board/cli login</code>
+      <button type="button" class="ink-btn ink-btn--sm copy-btn" data-copy="npx @switch-board/cli login">
+        <span class="copy-idle"><span class="en">Copy</span><span class="zh">复制</span></span>
+        <span class="copy-done"><span class="en">Copied</span><span class="zh">已复制</span></span>
+      </button>
+    </div>
+    <ul class="strip-facts">
+      <li><span class="en">No SSH config</span><span class="zh">不配 SSH</span></li>
+      <li><span class="en">No inbound ports</span><span class="zh">不开入站端口</span></li>
+      <li><span class="en">No VPN</span><span class="zh">不用 VPN</span></li>
+      <li><span class="en">Free at idle</span><span class="zh">空闲零成本</span></li>
+    </ul>
+  </div>
+</div>
+
+<!-- ────────────────────────────────────────────────────── showcase -->
+<section class="showcase" id="showcase">
+  <figure class="shot shot--terminal">
+    <img src="assets/terminal.png" width="2560" height="1440" loading="lazy" decoding="async"
+         alt="A Switchboard browser terminal: tabbed multi-shell with a live header showing RTT, CPU, memory and IP">
+    <figcaption>
+      <span class="ink-meta">§ 01 &nbsp;the terminal</span>
+      <span class="en">A real shell in the browser — tabbed multi-shell, live RTT / CPU / memory, drag-and-drop file transfer.</span>
+      <span class="zh">浏览器里的真终端 —— 多标签、实时 RTT / CPU / 内存、拖拽传文件。</span>
+    </figcaption>
+  </figure>
+
+  <figure class="shot shot--dashboard">
+    <img src="assets/dashboard.png" width="2560" height="1520" loading="lazy" decoding="async"
+         alt="The Switchboard dashboard listing your machines with live online/offline status, latency, CPU and memory">
+    <figcaption>
+      <span class="ink-meta">§ 02 &nbsp;the dashboard</span>
+      <span class="en">Every machine you've signed in shows up here with live status — online, latency, CPU, memory.</span>
+      <span class="zh">每台登录过的机器都列在这里，状态实时刷新 —— 在线、延迟、CPU、内存。</span>
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ────────────────────────────────────────────────────── features -->
+<section class="features" id="features">
+  <div class="section-head">
+    <span class="ink-kicker"><span class="en">What you get</span><span class="zh">你会得到什么</span></span>
+    <h2>
+      <span class="en">Not a log viewer. <em>Your actual shell.</em></span>
+      <span class="zh">不是日志窗口，<em>是你真正的 shell。</em></span>
+    </h2>
+  </div>
+
+  <div class="feat-grid">
+    <article class="feat">
+      <div class="feat-num">§ 01</div>
+      <h3><span class="en">A real terminal in the <em>browser</em></span><span class="zh">浏览器里的<em>真终端</em></span></h3>
+      <p>
+        <span class="en">Full xterm.js: 256-color, resize, scrollback, copy/paste and Nerd Font icons — so a Powerline or Starship prompt looks the same as it does locally.</span>
+        <span class="zh">完整的 xterm.js：256 色、自适应尺寸、回滚缓冲、复制粘贴，还内置 Nerd Font 图标 —— Powerline / Starship 提示符和本地长得一模一样。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 02</div>
+      <h3><span class="en">All your machines, <em>one dashboard</em></span><span class="zh">所有机器，<em>一个面板</em></span></h3>
+      <p>
+        <span class="en">Sign in with GitHub and every machine you've bound is listed with live status: online/offline, round-trip latency, CPU, memory and last-seen.</span>
+        <span class="zh">用 GitHub 登录，绑定过的机器全部在列，状态实时：在线与否、往返延迟、CPU、内存、最后一次心跳。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 03</div>
+      <h3><span class="en">See what each host is <em>doing</em></span><span class="zh">看清每台机器<em>在忙什么</em></span></h3>
+      <p>
+        <span class="en">Without opening a shell: the foreground process of each session, how long it's been quiet, the busiest processes. Opt in and running Claude Code sessions show up too — what each one is working on, and whether it's mid-task or waiting on you.</span>
+        <span class="zh">不用开终端就能看到：每个会话的前台进程、空闲了多久、最占 CPU 的进程。开启开关后，正在跑的 Claude Code 会话也会出现 —— 它在做什么、正在执行哪个工具、是在干活还是在等你。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 04</div>
+      <h3><span class="en">Machines that reach <em>each other</em></span><span class="zh">机器之间<em>互相可达</em></span></h3>
+      <p>
+        <span class="en">Not just browser&rarr;machine. <code>switchboard nodes</code> lists the others, <code>exec</code> runs something over there, <code>shell</code> opens a session. The agent on your laptop can drive the build box.</span>
+        <span class="zh">不只是「浏览器 → 机器」。<code>switchboard nodes</code> 列出其它机器，<code>exec</code> 在那边跑命令，<code>shell</code> 直接开会话。笔记本上的 agent 可以指挥编译机。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 05</div>
+      <h3><span class="en">Multiple shells, <em>tmux-style</em></span><span class="zh">多开会话，<em>像 tmux</em></span></h3>
+      <p>
+        <span class="en">Open as many tabs as you want on one machine. Shells survive tab reloads and flaky links; in account mode they keep running after you close the browser.</span>
+        <span class="zh">同一台机器想开几个标签就开几个。刷新页面、断线重连都不会丢；账号模式下关掉浏览器它们还在跑，回来接着用。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 06</div>
+      <h3><span class="en">Drag-and-drop <em>file transfer</em></span><span class="zh">拖拽即<em>传文件</em></span></h3>
+      <p>
+        <span class="en">Drop a file onto the page to upload it into the active shell's working directory, or pull any file off the host with a click.</span>
+        <span class="zh">把文件拖到页面上，就传进当前 shell 的工作目录；想取回主机上的文件，点一下就行。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 07</div>
+      <h3><span class="en">Works behind <em>NAT</em></span><span class="zh">穿透 <em>NAT</em></span></h3>
+      <p>
+        <span class="en">The daemon dials out over WebSocket. No inbound ports, no firewall rules, no VPN, no tunnel to babysit.</span>
+        <span class="zh">守护进程通过 WebSocket 朝外拨号。不用开入站端口、不用改防火墙、不用 VPN，也没有隧道要盯着。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 08</div>
+      <h3><span class="en">Free <em>at idle</em></span><span class="zh"><em>空闲时</em>零成本</span></h3>
+      <p>
+        <span class="en">Built on Cloudflare's hibernatable WebSockets, so idle terminals cost nothing and the whole thing runs on the free Workers plan.</span>
+        <span class="zh">基于 Cloudflare 可休眠 WebSocket，空闲的终端不花钱，整套东西在 Workers 免费额度内就能跑。</span>
+      </p>
+    </article>
+
+    <article class="feat">
+      <div class="feat-num">§ 09</div>
+      <h3><span class="en">Self-hostable, <em>end to end</em></span><span class="zh">可自部署，<em>端到端全是你的</em></span></h3>
+      <p>
+        <span class="en">The relay is a few hundred lines of Worker code, and the repo ships both ends. Deploy your own and own the entire stack.</span>
+        <span class="zh">中继只有几百行 Worker 代码，而且仓库里两端都有。部署到自己的账号，整条链路都归你。</span>
+      </p>
+    </article>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────── two ways to connect -->
+<section class="connect" id="connect">
+  <div class="section-head">
+    <span class="ink-kicker"><span class="en">Two ways to connect</span><span class="zh">两种连接方式</span></span>
+    <h2>
+      <span class="en">Your machines, or <em>a link you hand out.</em></span>
+      <span class="zh">自己的机器，或者<em>发给别人的一条链接。</em></span>
+    </h2>
+    <p class="section-lead">
+      <span class="en">Both modes give you the multi-tab terminal and file transfer. They differ only in <em>who</em> can connect, and how long shells stick around.</span>
+      <span class="zh">两种模式都有多标签终端和文件传输，区别只在于<em>谁</em>能连进来，以及会话能留多久。</span>
+    </p>
+  </div>
+
+  <div class="table-wrap">
+    <table class="ink-table compare">
+      <thead>
+        <tr>
+          <th></th>
+          <th><span class="th-mode">Account</span> <code>switchboard login</code></th>
+          <th><span class="th-mode">Token</span> <code>switchboard</code></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="row-label"><span class="en">Sign-in</span><span class="zh">登录</span></td>
+          <td><span class="en">GitHub, once per machine</span><span class="zh">GitHub，每台机器一次</span></td>
+          <td><span class="en">none</span><span class="zh">不需要</span></td>
+        </tr>
+        <tr>
+          <td class="row-label"><span class="en">Who can open the shell</span><span class="zh">谁能开终端</span></td>
+          <td><span class="en">only you</span><span class="zh">只有你</span></td>
+          <td><span class="en">anyone holding the token</span><span class="zh">任何拿到 token 的人</span></td>
+        </tr>
+        <tr>
+          <td class="row-label"><span class="en">Appears in the dashboard</span><span class="zh">出现在面板里</span></td>
+          <td class="yes">✓ <span class="en">with live stats</span><span class="zh">带实时状态</span></td>
+          <td class="no">—</td>
+        </tr>
+        <tr>
+          <td class="row-label"><span class="en">Shell lifetime</span><span class="zh">会话存活</span></td>
+          <td><span class="en">persists — reattach anytime</span><span class="zh">一直在，随时接回</span></td>
+          <td><span class="en">survives reloads (60s grace)</span><span class="zh">刷新不掉线（60 秒宽限）</span></td>
+        </tr>
+        <tr>
+          <td class="row-label"><span class="en">Best for</span><span class="zh">适合</span></td>
+          <td><span class="en">your own machines</span><span class="zh">自己的机器</span></td>
+          <td><span class="en">sharing &middot; pairing &middot; one-offs</span><span class="zh">分享 &middot; 结对 &middot; 临时救急</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────────────────────── quote -->
+<section class="quote-section">
+  <blockquote>
+    <span class="en">Think of an old telephone switchboard: every connection is a <em>circuit</em>, and the operator patches your machine's line straight through to your browser's.</span>
+    <span class="zh">把它想成一台老式电话交换台：每条连接都是一路<em>线路</em>，接线员把你机器的那根线，直接插到你浏览器的那根上。</span>
+  </blockquote>
+  <div class="quote-cite ink-meta">
+    <span class="en">— the operator is a Cloudflare Worker + a Durable Object</span>
+    <span class="zh">— 这里的接线员，是一个 Cloudflare Worker 加一个 Durable Object</span>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── how it works -->
+<section class="how" id="how">
+  <div class="section-head">
+    <span class="ink-kicker"><span class="en">How it works</span><span class="zh">原理</span></span>
+    <h2>
+      <span class="en">Both ends dial <em>out.</em></span>
+      <span class="zh">两端都朝外<em>拨号。</em></span>
+    </h2>
+  </div>
+
+  <div class="wire" role="img"
+       aria-label="Your machine runs the @switch-board/cli daemon and dials out over WebSocket to a Cloudflare Worker and Durable Object called Circuit, one per token or per machine, backed by a D1 registry. Your browser dials in to the same Circuit and runs the xterm.js UI and dashboard. Neither end accepts inbound connections.">
+    <div class="wire-node">
+      <span class="wire-role"><span class="en">your machine(s)</span><span class="zh">你的机器</span></span>
+      <div class="wire-box">
+        <strong>@switch-board/cli</strong>
+        <span>daemon = your shell</span>
+      </div>
+      <span class="wire-foot"><span class="en">dials out &middot; no inbound ports</span><span class="zh">朝外拨号 &middot; 不开入站端口</span></span>
+    </div>
+
+    <div class="wire-link">
+      <span class="wire-proto">wss</span>
+      <span class="wire-arrow"></span>
+    </div>
+
+    <div class="wire-node wire-node--mid">
+      <span class="wire-role">Cloudflare <span class="en">(the operator)</span><span class="zh">（接线员）</span></span>
+      <div class="wire-box wire-box--accent">
+        <strong>Worker + Durable Object</strong>
+        <span>"Circuit" — one per token or per machine</span>
+        <span>+ D1 registry</span>
+      </div>
+      <span class="wire-foot"><span class="en">never parses your bytes</span><span class="zh">从不解析你的字节</span></span>
+    </div>
+
+    <div class="wire-link wire-link--rev">
+      <span class="wire-proto">wss</span>
+      <span class="wire-arrow"></span>
+    </div>
+
+    <div class="wire-node">
+      <span class="wire-role"><span class="en">your browser</span><span class="zh">你的浏览器</span></span>
+      <div class="wire-box">
+        <strong>xterm.js UI</strong>
+        <span>+ dashboard · tabs · files</span>
+      </div>
+      <span class="wire-foot"><span class="en">dials in</span><span class="zh">朝里拨号</span></span>
+    </div>
+  </div>
+
+  <div class="how-notes">
+    <div class="how-note">
+      <span class="ink-meta">¶ <span class="en">the wire</span><span class="zh">链路</span></span>
+      <p>
+        <span class="en">Both ends dial out over WebSocket — keystrokes flow one way, terminal output the other. Nothing listens for inbound connections on your machine.</span>
+        <span class="zh">两端都通过 WebSocket 朝外连 —— 按键往一个方向走，终端输出往另一个方向回。你的机器上不监听任何入站连接。</span>
+      </p>
+    </div>
+    <div class="how-note">
+      <span class="ink-meta">¶ <span class="en">the operator</span><span class="zh">接线员</span></span>
+      <p>
+        <span class="en"><code>idFromName(token-or-machine)</code> funnels every daemon and browser on the same circuit into a single Durable Object — the operator that patches them together and broadcasts host output to every open tab.</span>
+        <span class="zh"><code>idFromName(token 或机器 id)</code> 把同一路线路上的守护进程和浏览器都汇到同一个 Durable Object —— 由它把两端接通，并把主机输出广播给每个打开的标签页。</span>
+      </p>
+    </div>
+    <div class="how-note">
+      <span class="ink-meta">¶ <span class="en">the payload</span><span class="zh">载荷</span></span>
+      <p>
+        <span class="en">The relay is a transparent forwarder: it pairs the two ends and shovels frames between them. It never parses your terminal payload.</span>
+        <span class="zh">中继只是个透明转发器：把两端配对，然后来回搬运数据帧。它从不解析你的终端内容。</span>
+      </p>
+    </div>
+    <div class="how-note">
+      <span class="ink-meta">¶ <span class="en">the ledger</span><span class="zh">账本</span></span>
+      <p>
+        <span class="en">A small D1 database holds the bookkeeping — which machines belong to whom, hashed agent tokens, and the heartbeat behind the live dashboard. Terminal traffic never touches it.</span>
+        <span class="zh">一个小小的 D1 数据库只管记账 —— 哪台机器属于谁、哈希后的 agent token、以及支撑实时面板的心跳。终端流量完全不经过它。</span>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── get started -->
+<section class="start" id="start">
+  <div class="section-head">
+    <span class="ink-kicker"><span class="en">Get started</span><span class="zh">开始使用</span></span>
+    <h2>
+      <span class="en">Four steps, <em>no deploy.</em></span>
+      <span class="zh">四步，<em>不用部署。</em></span>
+    </h2>
+    <p class="section-lead">
+      <span class="en">This uses the hosted relay at <code>shell.lfkdsk.org</code>. Prefer to own it? <a href="#selfhost">Self-host the relay</a>.</span>
+      <span class="zh">下面用的是托管中继 <code>shell.lfkdsk.org</code>。想自己掌握？看 <a href="#selfhost">自部署中继</a>。</span>
+    </p>
+  </div>
+
+  <ol class="steps">
+    <li class="step">
+      <div class="step-num">01</div>
+      <h3><span class="en">Sign in from the machine</span><span class="zh">在机器上登录</span></h3>
+      <p>
+        <span class="en">It opens your browser, signs you in with GitHub, and exposes this machine's shell under your account — one step.</span>
+        <span class="zh">它会打开浏览器、用 GitHub 登录，并把这台机器的 shell 挂到你的账号下 —— 一步搞定。</span>
+      </p>
+      <div class="step-cmd">
+        <code>npx @switch-board/cli login</code>
+        <button type="button" class="ink-btn ink-btn--sm copy-btn" data-copy="npx @switch-board/cli login">
+          <span class="copy-idle"><span class="en">Copy</span><span class="zh">复制</span></span>
+          <span class="copy-done"><span class="en">Copied</span><span class="zh">已复制</span></span>
+        </button>
+      </div>
+    </li>
+
+    <li class="step">
+      <div class="step-num">02</div>
+      <h3><span class="en">Open the dashboard</span><span class="zh">打开面板</span></h3>
+      <p>
+        <span class="en">The URL it prints lists your machines. Click <strong>Open shell</strong> and you're in — tabs, file transfer, live stats.</span>
+        <span class="zh">命令打印出的地址会列出你的机器。点 <strong>Open shell</strong> 就进去了 —— 多标签、传文件、实时状态。</span>
+      </p>
+      <div class="step-cmd">
+        <code>https://shell.lfkdsk.org</code>
+        <a class="ink-btn ink-btn--sm" href="https://shell.lfkdsk.org">
+          <span class="en">Open&nbsp;↗</span><span class="zh">打开&nbsp;↗</span>
+        </a>
+      </div>
+    </li>
+
+    <li class="step">
+      <div class="step-num">03</div>
+      <h3><span class="en">Keep it running</span><span class="zh">让它常驻</span></h3>
+      <p>
+        <span class="en">Rather than leaving the CLI in a terminal window: the macOS menu-bar app on a Mac, a systemd user service on Linux.</span>
+        <span class="zh">别让 CLI 一直占着一个终端窗口：Mac 上用菜单栏 App，Linux 上装成 systemd 用户服务。</span>
+      </p>
+      <div class="step-cmd">
+        <code>switchboard service install</code>
+        <button type="button" class="ink-btn ink-btn--sm copy-btn" data-copy="switchboard service install">
+          <span class="copy-idle"><span class="en">Copy</span><span class="zh">复制</span></span>
+          <span class="copy-done"><span class="en">Copied</span><span class="zh">已复制</span></span>
+        </button>
+      </div>
+    </li>
+
+    <li class="step">
+      <div class="step-num">04</div>
+      <h3><span class="en">Reach the other machines</span><span class="zh">连到其它机器</span></h3>
+      <p>
+        <span class="en">Sign in on two machines and each can see and drive the other — no browser in the middle, and it works to a host you couldn't ssh to.</span>
+        <span class="zh">两台机器都登录后，彼此都能看见、也能驱动对方 —— 中间不需要浏览器，而且对那些你 ssh 不到的机器同样有效。</span>
+      </p>
+      <div class="step-cmd">
+        <code>switchboard exec build-box npm test</code>
+        <button type="button" class="ink-btn ink-btn--sm copy-btn" data-copy="switchboard exec build-box npm test">
+          <span class="copy-idle"><span class="en">Copy</span><span class="zh">复制</span></span>
+          <span class="copy-done"><span class="en">Copied</span><span class="zh">已复制</span></span>
+        </button>
+      </div>
+    </li>
+  </ol>
+</section>
+
+<!-- ────────────────────────────────────────────────────── download -->
+<section class="download" id="download">
+  <div class="section-head">
+    <span class="ink-kicker"><span class="en">Download</span><span class="zh">下载</span></span>
+    <h2>
+      <span class="en">Pick the end you want to <em>run.</em></span>
+      <span class="zh">挑一个你想<em>跑起来的</em>那一端。</span>
+    </h2>
+    <p class="section-lead">
+      <span class="en">The daemon runs on the machine you want to reach; the browser needs nothing installed.</span>
+      <span class="zh">守护进程装在你想连过去的那台机器上；浏览器这边什么都不用装。</span>
+    </p>
+  </div>
+
+  <div class="dl-grid">
+    <!-- macOS menu-bar app -->
+    <article class="dl-card dl-card--featured">
+      <header class="dl-head">
+        <span class="dl-plat"></span>
+        <span class="ink-badge ink-badge--solid"><span class="en">Recommended</span><span class="zh">推荐</span></span>
+      </header>
+      <h3><span class="en">macOS menu-bar app</span><span class="zh">macOS 菜单栏 App</span></h3>
+      <p>
+        <span class="en">Lives in the top-right — no Dock icon — shows live status, and can launch at login. It supervises the same daemon under the hood, and bundles its own Node.</span>
+        <span class="zh">住在右上角菜单栏，没有 Dock 图标，显示实时状态，支持开机自启。底层监管的是同一个守护进程，并且自带 Node 运行时。</span>
+      </p>
+      <ul class="dl-facts">
+        <li><span class="en">Signed &amp; notarized <code>.dmg</code></span><span class="zh">已签名并公证的 <code>.dmg</code></span></li>
+        <li><span class="en">Launch at login (macOS 13+)</span><span class="zh">开机自启（macOS 13+）</span></li>
+        <li><span class="en">Updates the daemon from npm</span><span class="zh">守护进程可从 npm 热更新</span></li>
+      </ul>
+      <div class="dl-buttons">
+        <a class="ink-btn ink-btn--primary" data-dl-asset="arm64"
+           href="https://github.com/lfkdsk/Switchboard/releases/latest">
+          <span class="en">Apple Silicon</span><span class="zh">Apple 芯片</span>
+          <span class="dl-arch">arm64</span>
+        </a>
+        <a class="ink-btn" data-dl-asset="x64"
+           href="https://github.com/lfkdsk/Switchboard/releases/latest">
+          <span class="en">Intel</span><span class="zh">Intel</span>
+          <span class="dl-arch">x64</span>
+        </a>
+      </div>
+      <p class="dl-note ink-footnote" data-release-note>
+        <span class="en">Both builds are attached to the latest GitHub release.</span>
+        <span class="zh">两个架构的安装包都挂在最新的 GitHub Release 上。</span>
+      </p>
+    </article>
+
+    <!-- CLI -->
+    <article class="dl-card">
+      <header class="dl-head">
+        <span class="dl-plat">macOS &middot; Linux &middot; Windows</span>
+      </header>
+      <h3><span class="en">The CLI, from npm</span><span class="zh">CLI，走 npm</span></h3>
+      <p>
+        <span class="en">The daemon itself. Nothing to install if you just want to try it — <code>npx</code> runs it in place.</span>
+        <span class="zh">守护进程本体。只是想试试的话什么都不用装 —— <code>npx</code> 直接就能跑。</span>
+      </p>
+      <pre class="ink-code">npm install -g @switch-board/cli
+switchboard login</pre>
+      <div class="dl-buttons">
+        <a class="ink-btn" href="https://www.npmjs.com/package/@switch-board/cli">
+          <span class="en">View on npm&nbsp;↗</span><span class="zh">在 npm 上查看&nbsp;↗</span>
+        </a>
+        <button type="button" class="ink-btn copy-btn" data-copy="npm install -g @switch-board/cli">
+          <span class="copy-idle"><span class="en">Copy install</span><span class="zh">复制安装命令</span></span>
+          <span class="copy-done"><span class="en">Copied</span><span class="zh">已复制</span></span>
+        </button>
+      </div>
+      <p class="dl-note ink-footnote">
+        <span class="en">Needs Node 18+. On Linux, <code>node-pty</code> compiles from source — install <code>python3 make g++</code> first.</span>
+        <span class="zh">需要 Node 18+。Linux 下 <code>node-pty</code> 会源码编译，先装好 <code>python3 make g++</code>。</span>
+      </p>
+    </article>
+
+    <!-- Linux service -->
+    <article class="dl-card">
+      <header class="dl-head">
+        <span class="dl-plat">Linux &middot; systemd</span>
+      </header>
+      <h3><span class="en">Linux background service</span><span class="zh">Linux 后台服务</span></h3>
+      <p>
+        <span class="en">Runs as a <em>user</em> service, so it starts at boot and survives logout — no terminal window, no root.</span>
+        <span class="zh">以<em>用户</em>级服务运行，开机自启、注销后依然存活 —— 不占终端窗口，也不需要 root。</span>
+      </p>
+      <pre class="ink-code">switchboard login
+switchboard service install</pre>
+      <div class="dl-buttons">
+        <button type="button" class="ink-btn copy-btn" data-copy="switchboard service install">
+          <span class="copy-idle"><span class="en">Copy</span><span class="zh">复制</span></span>
+          <span class="copy-done"><span class="en">Copied</span><span class="zh">已复制</span></span>
+        </button>
+        <a class="ink-btn" href="https://github.com/lfkdsk/Switchboard#keep-it-running--linux-background-service">
+          <span class="en">Read the docs&nbsp;↗</span><span class="zh">查看文档&nbsp;↗</span>
+        </a>
+      </div>
+      <p class="dl-note ink-footnote">
+        <span class="en">Writes <code>~/.config/systemd/user/switchboard.service</code> and enables lingering.</span>
+        <span class="zh">会写入 <code>~/.config/systemd/user/switchboard.service</code> 并开启 lingering。</span>
+      </p>
+    </article>
+
+    <!-- Self-host -->
+    <article class="dl-card" id="selfhost">
+      <header class="dl-head">
+        <span class="dl-plat">Cloudflare Workers</span>
+      </header>
+      <h3><span class="en">Self-host the relay</span><span class="zh">自部署中继</span></h3>
+      <p>
+        <span class="en">A few hundred lines of Worker code plus a D1 database. Deploy it to your own account and the third party is gone.</span>
+        <span class="zh">几百行 Worker 代码加一个 D1 数据库。部署到你自己的账号，中间就没有第三方了。</span>
+      </p>
+      <pre class="ink-code">git clone https://github.com/lfkdsk/Switchboard
+npm install &amp;&amp; npm run deploy</pre>
+      <div class="dl-buttons">
+        <a class="ink-btn" href="https://github.com/lfkdsk/Switchboard#self-host-your-own-relay">
+          <span class="en">Deploy guide&nbsp;↗</span><span class="zh">部署指南&nbsp;↗</span>
+        </a>
+      </div>
+      <p class="dl-note ink-footnote">
+        <span class="en">TLS terminates at the Worker, so the operator sees the stream. Self-hosting removes the third party, not the relay's visibility.</span>
+        <span class="zh">TLS 在 Worker 处终结，所以接线员是能看见流量的。自部署去掉的是第三方，不是中继本身的可见性。</span>
+      </p>
+    </article>
+  </div>
+</section>
+
+<!-- ───────────────────────────────────────────────────────── footer -->
+<footer class="site-footer">
+  <div class="foot-brand">
+    <img src="assets/mark.svg" alt="" width="32" height="32">
+    <p>
+      <span class="en">Switchboard — a shell on any of your machines. Set in Fraunces, Inter and JetBrains Mono.</span>
+      <span class="zh">Switchboard —— 任意一台机器的终端。排版用 Fraunces、Inter 与 JetBrains Mono。</span>
+    </p>
+  </div>
+
+  <nav class="foot-links" aria-label="Footer">
+    <div class="foot-col">
+      <span class="ink-meta"><span class="en">Project</span><span class="zh">项目</span></span>
+      <a href="https://github.com/lfkdsk/Switchboard">GitHub</a>
+      <a href="https://github.com/lfkdsk/Switchboard/releases"><span class="en">Releases</span><span class="zh">发布</span></a>
+      <a href="https://www.npmjs.com/package/@switch-board/cli">npm</a>
+    </div>
+    <div class="foot-col">
+      <span class="ink-meta"><span class="en">Use it</span><span class="zh">使用</span></span>
+      <a href="https://shell.lfkdsk.org"><span class="en">Dashboard</span><span class="zh">面板</span></a>
+      <a href="https://github.com/lfkdsk/Switchboard#cli-reference"><span class="en">CLI reference</span><span class="zh">CLI 手册</span></a>
+      <a href="https://github.com/lfkdsk/Switchboard#security"><span class="en">Security</span><span class="zh">安全说明</span></a>
+    </div>
+    <div class="foot-col">
+      <span class="ink-meta"><span class="en">Help</span><span class="zh">帮助</span></span>
+      <a href="https://github.com/lfkdsk/Switchboard/issues">Issues</a>
+      <a href="https://github.com/lfkdsk/Switchboard/discussions">Discussions</a>
+      <a href="https://github.com/lfkdsk/inktype">InkType</a>
+    </div>
+  </nav>
+
+  <div class="foot-bottom">
+    <span class="ink-version">MIT &middot; <span id="foot-version">@switch-board/cli</span> &middot; © MMXXVI lfkdsk</span>
+    <span class="ink-footnote">
+      <span class="en">Themed with <a href="https://inktype.lfkdsk.org/">InkType</a> — editorial dark UI for craft software.</span>
+      <span class="zh">主题取自 <a href="https://inktype.lfkdsk.org/">InkType</a> —— 为手作软件而生的编辑风暗色 UI。</span>
+    </span>
+  </div>
+</footer>
+
+<script src="scripts/site.js"></script>
+</body>
+</html>
