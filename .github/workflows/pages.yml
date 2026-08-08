@@ -4,7 +4,8 @@ name: Pages
 # just a staging copy so the screenshots that live in docs/ (where the README
 # points at them) are served from one place instead of a second copy in git.
 #
-# One-time setup: Settings → Pages → Source: "GitHub Actions".
+# No repository setting to flip first: configure-pages runs with enablement,
+# so the first run turns Pages on (source: GitHub Actions) and deploys.
 
 on:
   push:
@@ -45,7 +46,12 @@ jobs:
           touch _site/.nojekyll
           ls -R _site
 
+      # enablement lets the first run switch Pages on itself (build type
+      # "workflow"). Without it the action 404s on a repo where Pages has
+      # never been configured, and the deploy needs a manual settings change.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:
