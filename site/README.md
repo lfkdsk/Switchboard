@@ -68,7 +68,13 @@ README and the site share one copy.
 `site/`, the shared screenshots, or the workflow itself; it can also be run by
 hand from the Actions tab.
 
-Nothing to configure by hand: `configure-pages` runs with `enablement: true`,
-so the first run switches Pages on (source: GitHub Actions) and deploys.
-Without that flag the action 404s on a repository where Pages has never been
-set up, which is how the very first deploy of this page failed.
+**One-time repository setting:** Settings → Pages → Source: **GitHub Actions**.
+Until that is switched over, `configure-pages` fails with `Get Pages site
+failed … Not Found` and nothing deploys.
+
+That step cannot be automated away. `actions/configure-pages` takes an
+`enablement: true` option that looks like it would, but creating a Pages site
+requires a PAT — with the Actions `GITHUB_TOKEN` the call comes back
+`Resource not accessible by integration` regardless of the job's
+`permissions:` block. Flipping the setting by hand, once, is the whole fix;
+afterwards every push deploys on its own.
