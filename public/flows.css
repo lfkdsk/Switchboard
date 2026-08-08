@@ -1,0 +1,151 @@
+/* The flow editor. Colour variables come from index.html's :root, so the canvas
+   belongs to the same page it opens from rather than looking like a guest. */
+
+#view-flows { flex-direction: column; min-height: 0; }
+.fl-bar {
+  display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+  background: var(--panel); border-bottom: 1px solid var(--border); flex: none; flex-wrap: wrap;
+}
+.fl-bar .fl-name {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 9px; font: inherit; width: 190px;
+}
+.fl-bar .fl-name:focus { outline: none; border-color: var(--accent); }
+.fl-bar button { padding: 5px 11px; }
+.fl-where { color: var(--muted); font-size: 12px; }
+.fl-where b { color: var(--fg); font-weight: 600; }
+.fl-dirty { color: var(--warn); font-size: 12px; }
+
+.fl-main { display: flex; flex: 1; min-height: 0; }
+
+/* left rail: the flows saved on this machine */
+.fl-rail { width: 194px; flex: none; border-right: 1px solid var(--border); overflow: auto; padding: 8px; }
+.fl-rail h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 4px 6px 8px; font-weight: 600; }
+.fl-item { padding: 7px 9px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+.fl-item:hover { background: #1b2230; }
+.fl-item.on { border-color: var(--accent); background: #1b2230; }
+.fl-item .n { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fl-item .s { color: var(--muted); font-size: 11px; }
+.fl-item.bad .s { color: var(--err); }
+.fl-item.live .s { color: var(--accent); }
+.fl-rail .empty-rail { color: var(--muted); font-size: 12px; padding: 6px; }
+
+/* the canvas itself */
+.fl-canvas-wrap { flex: 1; min-width: 0; position: relative; overflow: auto; background:
+  radial-gradient(circle at 1px 1px, #1a2130 1px, transparent 0) 0 0 / 22px 22px; }
+.fl-canvas { position: relative; width: 3200px; height: 2200px; }
+.fl-canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.fl-canvas svg .hit { stroke: transparent; stroke-width: 14px; fill: none; pointer-events: stroke; cursor: pointer; }
+.fl-canvas svg .wire { fill: none; stroke-width: 1.6px; }
+.fl-canvas svg .wire.ok { stroke: var(--ok); }
+.fl-canvas svg .wire.fail { stroke: var(--err); }
+.fl-canvas svg .wire.stdin { stroke: var(--accent); stroke-dasharray: 2 3; }
+.fl-canvas svg .wire.implicit { stroke: #3a4454; stroke-dasharray: 5 4; }
+.fl-canvas svg .wire.taken { stroke-width: 2.6px; filter: drop-shadow(0 0 4px currentColor); }
+.fl-canvas svg .ghost { fill: none; stroke: var(--accent); stroke-width: 1.6px; stroke-dasharray: 4 3; }
+.fl-canvas svg text.elabel { fill: var(--muted); font: 10px ui-monospace, Menlo, monospace; }
+
+/* a step */
+.fl-node {
+  position: absolute; width: 260px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.35);
+}
+.fl-node.sel { border-color: var(--accent); }
+.fl-node.bad { border-color: var(--err); }
+.fl-node.running { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 2px 14px rgba(47,129,247,.35); }
+.fl-node.done { border-color: var(--ok); }
+.fl-node.failed { border-color: var(--err); }
+.fl-node.skipped { opacity: .5; }
+.fl-n-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); cursor: move; }
+.fl-n-id {
+  flex: 1; min-width: 0; background: transparent; border: 1px solid transparent; border-radius: 4px;
+  color: var(--fg); font: inherit; font-weight: 600; padding: 2px 4px;
+}
+.fl-n-id:hover { border-color: var(--border); }
+.fl-n-id:focus { outline: none; border-color: var(--accent); background: var(--bg); }
+.fl-n-state { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.fl-node.running .fl-n-state { color: var(--accent); }
+.fl-node.done .fl-n-state { color: var(--ok); }
+.fl-node.failed .fl-n-state { color: var(--err); }
+.fl-n-del { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0 3px; font: inherit; }
+.fl-n-del:hover { color: var(--err); }
+.fl-n-kind { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; color: var(--muted); cursor: pointer; font: inherit; font-size: 11px; padding: 1px 7px; white-space: nowrap; }
+.fl-n-kind:hover { border-color: var(--accent); color: var(--fg); }
+
+/* an agent step: the AI sits here, the machines it drives are elsewhere */
+.fl-node.agent { border-color: rgba(210,153,34,.45); }
+.fl-node.agent .fl-n-kind { color: var(--warn); border-color: rgba(210,153,34,.45); }
+.fl-node.agent.running { border-color: var(--accent); }
+.fl-node.agent.done { border-color: var(--ok); }
+.fl-node.agent.failed, .fl-node.agent.bad { border-color: var(--err); }
+.fl-drives { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: 11px; }
+.fl-drives-label { color: var(--muted); margin-right: 2px; }
+.fl-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: 10px; padding: 1px 7px 1px 5px; cursor: pointer; color: var(--muted); }
+.fl-chip.on { border-color: rgba(210,153,34,.5); color: var(--fg); }
+.fl-chip input { width: auto; accent-color: var(--warn); margin: 0; }
+.fl-gen { font-size: 11px; }
+.fl-gen summary { color: var(--muted); cursor: pointer; list-style: none; }
+.fl-gen summary::before { content: "▸ "; }
+.fl-gen[open] summary::before { content: "▾ "; }
+.fl-gen summary:hover { color: var(--fg); }
+.fl-gen pre { margin: 5px 0 0; padding: 6px 7px; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 130px; overflow: auto; }
+.fl-n-body { padding: 7px 8px 9px; display: flex; flex-direction: column; gap: 6px; }
+.fl-n-body select, .fl-n-body textarea, .fl-n-body input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 5px; padding: 4px 6px; font: inherit; font-size: 12px; width: 100%;
+}
+.fl-n-body select:focus, .fl-n-body textarea:focus, .fl-n-body input:focus { outline: none; border-color: var(--accent); }
+.fl-n-body textarea { resize: vertical; min-height: 42px; }
+.fl-n-err { color: var(--err); font-size: 11px; }
+.fl-n-foot { display: flex; gap: 6px; padding: 0 8px 7px; align-items: center; }
+
+/* ports: the things you drag between */
+.fl-port { font-size: 11px; border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px; cursor: crosshair; color: var(--muted); background: var(--bg); white-space: nowrap; }
+.fl-port:hover { border-color: var(--accent); color: var(--fg); }
+.fl-port.ok { border-color: rgba(46,160,67,.5); color: var(--ok); }
+.fl-port.fail { border-color: rgba(248,81,73,.45); color: var(--err); }
+.fl-port.wired { background: #1b2230; }
+.fl-port.stdout { position: absolute; right: -12px; top: 50%; transform: translateY(-50%); padding: 1px 5px; font-size: 10px; }
+.fl-in { position: absolute; left: 50%; top: -5px; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: var(--border); border: 1px solid var(--panel); }
+.fl-node.droppable .fl-in { background: var(--accent); }
+.fl-node.droppable { border-color: var(--accent); }
+.fl-stdin { position: absolute; left: -6px; top: 50%; transform: translateY(-50%); width: 10px; height: 10px; border-radius: 50%; background: var(--border); border: 1px solid var(--panel); }
+.fl-node.stdin-wired .fl-stdin { background: var(--accent); }
+
+/* the terminal sink every unhandled failure falls into */
+.fl-stop {
+  position: absolute; padding: 5px 12px; border: 1px dashed var(--border); border-radius: 16px;
+  color: var(--muted); background: var(--panel); font-size: 12px;
+}
+.fl-stop.droppable { border-color: var(--accent); color: var(--fg); }
+
+/* problems + legend */
+.fl-side { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; pointer-events: none; }
+.fl-legend { background: rgba(17,21,31,.92); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 11px; color: var(--muted); }
+.fl-legend span { margin-right: 10px; }
+.fl-legend i { display: inline-block; width: 16px; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+.fl-problems { background: rgba(17,21,31,.95); border: 1px solid rgba(248,81,73,.4); border-left: 3px solid var(--err); border-radius: 6px; padding: 8px 11px; font-size: 12px; max-width: 380px; pointer-events: auto; }
+.fl-problems div { color: var(--err); }
+.fl-problems div + div { margin-top: 3px; }
+
+/* the run drawer */
+.fl-drawer { flex: none; border-top: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; max-height: 46%; }
+.fl-d-head { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid var(--border); flex: none; }
+.fl-d-head .fl-d-title { font-weight: 600; }
+.fl-d-tabs { display: flex; gap: 4px; overflow-x: auto; }
+.fl-d-tab { padding: 2px 9px; border: 1px solid var(--border); border-radius: 5px; font-size: 12px; cursor: pointer; color: var(--muted); white-space: nowrap; }
+.fl-d-tab.on { color: var(--fg); border-color: var(--accent); }
+.fl-d-tab.ok { border-color: rgba(46,160,67,.5); }
+.fl-d-tab.failed { border-color: rgba(248,81,73,.5); }
+.fl-out { flex: 1; overflow: auto; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; font-size: 12px; min-height: 90px; }
+.fl-out .e { color: var(--err); }
+.fl-out .muted { color: var(--muted); }
+
+/* raw JSON, for when the canvas isn't the fastest way to say it */
+.fl-json { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.fl-json textarea {
+  flex: 1; background: var(--bg); color: var(--fg); border: none; border-left: 1px solid var(--border);
+  padding: 12px; font: inherit; resize: none; tab-size: 2;
+}
+.fl-json textarea:focus { outline: none; }
+.fl-json .fl-j-err { padding: 6px 12px; color: var(--err); font-size: 12px; border-left: 1px solid var(--border); }

@@ -65,26 +65,34 @@ export class Circuit extends DurableObject {
       for (const b of this.ctx.getWebSockets("browser")) this.safeSend(b, message);
     } else {
       // A shell-only share can open a terminal but must not drive the machine
-      // through the exec channel. Only such an attachment pays for the parse:
-      // every other browser frame — and every byte of terminal payload, which is
-      // binary — is forwarded without being looked at, so the relay stays opaque
-      // where opacity is the point.
+      // by other means. Only such an attachment pays for the parse: every other
+      // browser frame — and every byte of terminal payload, which is binary — is
+      // forwarded without being looked at, so the relay stays opaque where
+      // opacity is the point.
       if (att.noExec && typeof message === "string" && !this.allowFromRestricted(ws, message)) return;
       const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);
       if (daemon) this.safeSend(daemon, message);
     }
   }
 
-  // False when this frame is an exec-channel message the attachment isn't
-  // allowed to send. Unparseable frames are passed through: the daemon is the
-  // one that has to make sense of them, and inventing a second opinion here
-  // would mean the relay deciding what valid traffic looks like.
+  // False when this frame asks the machine to do something a shell-only share
+  // may not ask for. Both families count: `exec` runs one command, `flow` saves
+  // and conducts whole graphs of them, and a share that withholds the first
+  // while handing over the second would mean nothing at all.
+  //
+  // Unparseable frames are passed through: the daemon is the one that has to
+  // make sense of them, and inventing a second opinion here would mean the relay
+  // deciding what valid traffic looks like.
   allowFromRestricted(ws, str) {
     let m;
     try { m = JSON.parse(str); } catch { return true; }
-    if (typeof m?.type !== "string" || !m.type.startsWith("exec")) return true;
+    if (typeof m?.type !== "string") return true;
+    const family = m.type.startsWith("exec") ? "exec-error" : m.type.startsWith("flow") ? "flow-error" : null;
+    if (!family) return true;
+    // Answered in the same family it was asked in, so the caller's own error
+    // path handles it instead of it vanishing into a channel nobody is reading.
     this.safeSend(ws, JSON.stringify({
-      type: "exec-error", id: m.id,
+      type: family, id: m.id, run: m.run, op: m.type.replace(/^flow-/, ""),
       message: "this machine is shared with you for shell access only",
     }));
     return false;

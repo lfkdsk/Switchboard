@@ -296,6 +296,52 @@ Orchestration lives in the CLI, never in the relay. Teaching the relay to
 sequence steps would mean teaching it to parse payloads, and that forecloses
 layering end-to-end encryption underneath it.
 
+### Drawing one in the browser
+
+Every online machine has a **Flows** button in the dashboard. It opens a canvas
+of that machine's flows: drag from a step's `ok` or `fail` port onto another step
+to wire it, drag `stdout` onto a step's left edge to pipe into its stdin, click a
+wire to cut it. The dashed grey edges are the ones nobody wrote down — a step
+with no `on_success` falls through to the next in document order, and an editor
+that didn't draw that would be showing you a different graph than the one that
+runs.
+
+Flows are files on the machine that conducts them, in `~/.switchboard/flows`.
+What you draw in a tab is what `switchboard flow run <name>` picks up in a
+terminal there; there is no export step and no second copy. A machine that's
+offline can't show you its flows, which is honest — it couldn't have run them
+either.
+
+**The browser never conducts.** Press Run and the page asks that machine to do
+it, then watches: steps light up as they start, the edge actually taken glows,
+and each step's output is a click away. Close the tab and the flow carries on —
+open it again and it re-attaches to the run in progress, replaying what you
+missed. The relay still forwards these frames without knowing a flow exists, and
+a machine shared for shell access only refuses them exactly as it refuses `exec`.
+
+### An agent on one machine, driving another
+
+`+ agent` makes a step that runs Claude Code or Codex on one machine and hands it
+the others:
+
+```jsonc
+{ "id": "triage", "target": "buildbox",          // the AI runs here
+  "cmd": "claude -p '…' --mcp-config '…' --allowedTools '…'",
+  "ui": { "agent": { "tool": "claude", "prompt": "Find out why the build broke.",
+                     "drives": ["pi"] } } }      // and works on these
+```
+
+Tick the machines it may drive and the editor writes that command for you —
+[`switchboard mcp`](#mcp--hand-the-machines-to-an-agent) started on the agent's
+own host, so it reaches exactly what that host can reach, under the same grants
+the dashboard shows. Revoking a share in the browser takes it away from the agent
+too.
+
+The step is an ordinary step: a target and a `cmd`, which the runner already
+knows how to run. The pieces it was built from live under `ui`, which the runner
+and the validator ignore. Nothing in the flow format learned what an agent is,
+and the command is right there in the file to read, edit, or run by hand.
+
 ### MCP — hand the machines to an agent
 
 ```bash
@@ -388,9 +434,12 @@ switchboard exec <machine> -- <command…>
                              and stderr stay apart and the exit code is the
                              command's own. <machine> is a name or id from
                              `switchboard list`, or a share token.
-switchboard flow <run|check> <file.json>
+switchboard flow <run|check|ls|cat|rm> [flow]
                              Run a graph of commands across several machines.
-                             Whichever host you run it on conducts it.
+                             Whichever host you run it on conducts it. A flow is
+                             a saved name or a path; saved ones live in
+                             ~/.switchboard/flows and are the same files the
+                             dashboard's editor draws into.
 switchboard mcp              Serve those machines to an agent over MCP (stdio).
 ```
 
@@ -459,6 +508,8 @@ and never include command-line arguments (those routinely carry secrets).
 | `src/auth.js` | GitHub OAuth sessions (HMAC-signed cookies) |
 | `src/registry.js` | D1 bookkeeping: machines, agent tokens, CLI-login handshake |
 | `public/index.html` | The browser app — terminal, tabs, dashboard, file transfer |
+| `public/flows.js` | The flow editor: the canvas, the wires, and watching a run |
+| `public/flows.css` | Its styles, on the same variables as the rest of the page |
 | `public/cli-login.html` | The `switchboard login` authorization page |
 | `schema.sql` | D1 schema |
 | `migrations/` | Incremental D1 changes, for databases that predate a column |
@@ -467,6 +518,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
 | `cli/target.js` | Resolving "which machine?" into how to dial it |
 | `cli/flow.js` | The flow runner — one command remotely, and the graph around it |
+| `cli/flowstore.js` | Flows on disk: `~/.switchboard/flows`, shared by the CLI and the editor |
 | `cli/mcp.js` | The MCP stdio server: `list_machines`, `run_on`, `upload`, `download` |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 | `docker/` | Agent Box — a shareable container with Claude Code and Codex in it (see [docker/README.md](docker/README.md)) |

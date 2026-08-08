@@ -19,6 +19,9 @@ const MIN_TOKEN_LEN = 24;
 
 // One list per process, not per step: a flow with twenty steps resolves its
 // targets against the same answer rather than asking the relay twenty times.
+// `fresh` re-reads it, for the one caller that outlives the answer: a daemon
+// serving the flow editor would otherwise offer the same targets for weeks,
+// long after the machine you just added should have appeared in the list.
 let cache = null;
 
 /**
@@ -26,8 +29,8 @@ let cache = null;
  * the CLI isn't logged in — targets then have to be raw tokens, which is what an
  * anonymous host can dial anyway.
  */
-async function machines(server, agentToken) {
-  if (cache) return cache;
+async function machines(server, agentToken, opts = {}) {
+  if (cache && !opts.fresh) return cache;
   if (!agentToken) return (cache = []);
   const headers = { "x-switchboard-agent": agentToken };
   const get = async (path) => {

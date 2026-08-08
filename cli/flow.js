@@ -24,19 +24,18 @@ const DEFAULT_STEP_TIMEOUT_MS = 600000;
 
 // ---- spec ----------------------------------------------------------------
 /**
- * Read and validate a flow. Every problem found is reported at once rather than
- * one per run: a flow is usually edited by hand, and fixing a typo only to hit
+ * Every problem with a flow, as a list. Reported all at once rather than one per
+ * run: a flow is edited by hand as often as not, and fixing a typo only to hit
  * the next one is the slowest possible way to learn the schema.
+ *
+ * Separate from loadFlow because three places need the same verdict — the CLI
+ * reading a file, the store refusing to save one, and the browser editor
+ * greying out its Run button — and a rulebook with three copies has three
+ * different opinions within a month.
  */
-function loadFlow(file) {
-  let raw;
-  try { raw = fs.readFileSync(file, "utf8"); }
-  catch (e) { throw new Error(`cannot read ${file}: ${e.message}`); }
-  let flow;
-  try { flow = JSON.parse(raw); }
-  catch (e) { throw new Error(`${path.basename(file)} is not valid JSON: ${e.message}`); }
-
+function validateFlow(flow) {
   const errs = [];
+  if (!flow || typeof flow !== "object") return ["a flow must be a JSON object"];
   if (flow.conductor != null && typeof flow.conductor !== "string") {
     errs.push("conductor must be the name or id of the machine this flow is meant to run on");
   }
@@ -60,6 +59,19 @@ function loadFlow(file) {
     }
     if (s && s.stdin_from && !ids.has(s.stdin_from)) errs.push(`step ${s.id}: stdin_from points at unknown step "${s.stdin_from}"`);
   }
+  if (flow.start != null && !ids.has(flow.start)) errs.push(`start points at unknown step "${flow.start}"`);
+  return errs;
+}
+
+/** Read one flow off disk, or explain why it can't be run. */
+function loadFlow(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch (e) { throw new Error(`cannot read ${file}: ${e.message}`); }
+  let flow;
+  try { flow = JSON.parse(raw); }
+  catch (e) { throw new Error(`${path.basename(file)} is not valid JSON: ${e.message}`); }
+  const errs = validateFlow(flow);
   if (errs.length) throw new Error(`${path.basename(file)} is not a valid flow:\n  - ` + errs.join("\n  - "));
   return flow;
 }
@@ -81,15 +93,34 @@ function execRemote(server, how, cmd, opts = {}) {
     let settled = false;
     const started = Date.now();
 
+    let unlisten = null;
     const done = (fn, arg) => {
       if (settled) return;
       settled = true;
+      if (unlisten) unlisten();
       // terminate() rather than close(): close() waits for the peer's closing
       // handshake, and ws gives that 30 seconds. A flow of twenty steps would
       // spend ten minutes doing nothing at all.
       try { sock.terminate(); } catch {}
       fn(arg);
     };
+
+    // Cancellation has to reach the far machine, not just this end: dropping the
+    // socket would leave the command running on someone else's host with nobody
+    // watching it. Send exec-kill first and only tear down once it has gone out
+    // — terminate() would destroy the socket with the frame still queued — with
+    // a deadline so a wedged connection can't make "stop" hang.
+    if (opts.signal) {
+      const abort = () => {
+        const finish = () => done(reject, new Error("cancelled"));
+        const bail = setTimeout(finish, 1000);
+        try { sock.send(JSON.stringify({ type: "exec-kill", id }), () => { clearTimeout(bail); finish(); }); }
+        catch { clearTimeout(bail); finish(); }
+      };
+      if (opts.signal.aborted) return done(reject, new Error("cancelled"));
+      opts.signal.addEventListener("abort", abort, { once: true });
+      unlisten = () => opts.signal.removeEventListener("abort", abort);
+    }
 
     sock.on("open", () => {
       sock.send(JSON.stringify({ type: "exec", id, cmd, cwd: opts.cwd || undefined, timeout: opts.timeout ?? DEFAULT_STEP_TIMEOUT_MS }));
@@ -184,8 +215,10 @@ async function runFlow(flow, opts = {}) {
   let cur = flow.start || order[0];
   const seen = new Set();
   let last = null; // the step the flow actually ended on — see the verdict below
+  let cancelled = false;
 
   while (cur && cur !== "stop") {
+    if (opts.signal && opts.signal.aborted) { cancelled = true; log("halt", { id: cur, reason: "cancelled" }); break; }
     if (seen.has(cur)) { log("halt", { id: cur, reason: "already ran; flows do not loop" }); break; }
     seen.add(cur);
 
@@ -203,11 +236,23 @@ async function runFlow(flow, opts = {}) {
         timeout: step.timeout ?? flow.timeout ?? DEFAULT_STEP_TIMEOUT_MS,
         stdin: upstream ? upstream.stdout : null,
         onOutput: opts.onOutput ? (s, b) => opts.onOutput(step.id, s, b) : null,
+        signal: opts.signal,
       });
     } catch (e) {
       // An unreachable node is a failed step, not a crashed flow: the on_failure
       // edge is exactly where "the machine is down" wants to be handled.
       r = { code: null, signal: null, stdout: "", stderr: String(e.message), ms: 0, unreachable: true };
+    }
+
+    // A cancel is not a failure to recover from. Following on_failure here would
+    // let "stop this flow" start the cleanup step it was written to run when the
+    // machine is down — which is the one thing the person clicking stop is
+    // trying to prevent.
+    if (opts.signal && opts.signal.aborted) {
+      cancelled = true;
+      results.set(step.id, { ...r, cancelled: true });
+      log("step-end", { id: step.id, ok: false, code: null, signal: null, ms: r.ms || 0, cancelled: true });
+      break;
     }
 
     results.set(step.id, r);
@@ -226,8 +271,8 @@ async function runFlow(flow, opts = {}) {
   // Steps that failed along the way are still listed, because "it recovered"
   // and "nothing went wrong" are not the same thing worth knowing.
   const failed = [...results.entries()].filter(([, r]) => r.code !== 0 || r.unreachable).map(([id]) => id);
-  const ok = !!last && last.code === 0 && !last.unreachable;
-  return { results, failed, ok };
+  const ok = !cancelled && !!last && last.code === 0 && !last.unreachable;
+  return { results, failed, ok, cancelled };
 }
 
-module.exports = { loadFlow, runFlow, execRemote, DEFAULT_STEP_TIMEOUT_MS };
+module.exports = { loadFlow, validateFlow, runFlow, execRemote, DEFAULT_STEP_TIMEOUT_MS };

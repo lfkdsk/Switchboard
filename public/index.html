@@ -7,6 +7,7 @@
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <meta name="theme-color" content="#0b0e14" />
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+<link rel="stylesheet" href="/flows.css" />
 <style>
   :root {
     --bg: #0b0e14; --panel: #11151f; --border: #1e2430; --fg: #c9d1d9;
@@ -157,6 +158,9 @@
     <div id="termHost"></div>
   </div>
 
+  <!-- FLOWS (built by flows.js) -->
+  <div class="view" id="view-flows"></div>
+
   <!-- CLI AUTHORIZED -->
   <div class="view center" id="view-cli">
     <div class="card" style="text-align:center">
@@ -170,6 +174,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="/flows.js"></script>
   <script>
   (function () {
     "use strict";
@@ -190,6 +195,10 @@
       $("userBox").hidden = !(name === "dashboard" && session);
       if (session) $("userLogin").textContent = session.login;
       if (name !== "dashboard" && dashTimer) { clearInterval(dashTimer); dashTimer = null; }
+      // The flow editor holds a circuit of its own to the machine that conducts.
+      // Leaving the view is what closes it — otherwise signing out, or clicking
+      // the brand, would walk away from a live socket.
+      if (name !== "flows" && window.Flows) Flows.leave();
     }
 
     $("brand").onclick = () => { if (session) goDashboard(); else showView("landing"); };
@@ -207,6 +216,9 @@
 
     // ---- init / OAuth return ----------------------------------------------
     async function init() {
+      // Guarded so a flows.js that failed to load costs you the flow editor and
+      // not the terminal: this runs before anything else the page does.
+      if (window.Flows) Flows.mount($("view-flows"), { showView, goDashboard, toast });
       const hash = new URLSearchParams(location.hash.slice(1));
       const query = new URLSearchParams(location.search);
       if (hash.get("oauth_token")) {
@@ -355,6 +367,13 @@
         // between a machine you can work on and one you can also point a flow at.
         if (m.shared) badge.textContent = `shared by @${m.owner_login} · ${expiryLabel(m.expires_at)}${m.can_exec ? "" : " · shell only"}`;
         head.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        // Flows are stored on the machine that conducts them, so this is also
+        // the answer to "which machine runs it?" — you enter the editor through
+        // a host, not through a global list that would then have to ask.
+        const canDrive = !m.shared || m.can_exec;
+        const flowsBtn = rowBtn(head, "flows", online && canDrive && !!window.Flows, "Flows",
+          "Draw and run a graph of commands, conducted by this machine");
+        if (flowsBtn) flowsBtn.onclick = () => Flows.open({ machineId: m.machine_id, label: label });
         // An offline machine's last-known activity is stale by definition.
         syncActivity(el.querySelector(".m-act"), online ? activityRows(m.activity) : []);
         // Owner-only controls aren't built at all for a machine shared with

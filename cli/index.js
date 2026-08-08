@@ -88,9 +88,12 @@ Usage:
                                the door for scripts and agents; the browser
                                terminal is the one for people. <machine> is a name
                                or id from "switchboard list", or a share token.
-  switchboard flow <run|check> <file.json>
+  switchboard flow <run|check|ls|cat|rm> [flow]
                                Run a graph of commands across several machines.
-                               Whichever host you run it on conducts it.
+                               Whichever host you run it on conducts it. A flow
+                               is a saved name or a path; saved ones live in
+                               ~/.switchboard/flows and are the same files the
+                               dashboard's editor draws into.
   switchboard mcp              Serve the machines to an agent over MCP (stdio):
                                list them, run commands, move files. Point Claude
                                Code or Codex at this command.
@@ -627,6 +630,168 @@ function killAllExecs() {
   }
 }
 
+// ---- flow conductor (the daemon's half) ----------------------------------
+/**
+ * Conducting a flow *here*, asked for from a browser *there*.
+ *
+ * The web editor never conducts anything itself; it asks a machine to. That buys
+ * two things. The graph walk stays in one place — flow.js, the same code
+ * `switchboard flow run` has always used — instead of being reimplemented in the
+ * page and drifting. And the conductor becomes a process on a machine rather
+ * than a tab: close the tab and the flow carries on, come back and flow-attach
+ * replays what was missed. A browser is a window onto a run, never the thing
+ * running it.
+ *
+ * None of this reaches the relay. These frames are forwarded exactly like
+ * keystrokes, and the relay still doesn't know that a flow is a thing.
+ */
+const flowStore = require("./flowstore");
+
+const flowRuns = new Map(); // runId -> { id, name, startedAt, events, out, done, ok, ctl }
+const FLOW_MAX_RUNS = 4;         // conducted at once; a browser can queue clicks faster than a flow finishes
+const FLOW_KEEP_FINISHED = 8;    // finished runs held for a browser that comes back
+const FLOW_OUT_CAP = 64 * 1024;  // kept per step per stream, for the replay
+
+function flowFail(op, extra, message) { sendCtl({ type: "flow-error", op, ...extra, message }); }
+
+// Structural events are kept for the whole run; output is not. A step's own
+// output can be gigabytes and it is already streaming to whoever is watching —
+// what a returning browser needs is the shape of the run plus enough of the tail
+// to see what a step said, which is what the cap leaves it.
+function flowEmit(run, ev) {
+  run.events.push(ev);
+  sendCtl({ type: "flow-ev", run: run.id, ev });
+}
+function flowEmitOut(run, id, stream, buf) {
+  const slot = run.out[id] || (run.out[id] = { stdout: "", stderr: "" });
+  slot[stream] = (slot[stream] + buf.toString("utf8")).slice(-FLOW_OUT_CAP);
+  sendCtl({ type: "flow-out", run: run.id, id, stream, data: buf.toString("base64") });
+}
+
+function flowSendList() {
+  sendCtl({
+    type: "flow-list",
+    flows: flowStore.listFlows(),
+    dir: flowStore.FLOWS_DIR,
+    runs: [...flowRuns.values()].map((r) => ({ id: r.id, name: r.name, startedAt: r.startedAt, done: r.done, ok: r.ok })),
+  });
+}
+
+function startFlowRun(name, runId) {
+  if (!runId || typeof runId !== "string") return flowFail("run", { name }, "a run needs an id to report against");
+  if (flowRuns.has(runId)) return flowFail("run", { name, run: runId }, "that run id is already in use");
+  const live = [...flowRuns.values()].filter((r) => !r.done).length;
+  if (live >= FLOW_MAX_RUNS) return flowFail("run", { name, run: runId }, `already conducting ${live} flows on this machine`);
+
+  let spec;
+  try { spec = flowStore.readFlow(name); }
+  catch (e) { return flowFail("run", { name, run: runId }, e.message); }
+  const problems = require("./flow").validateFlow(spec);
+  if (problems.length) return flowFail("run", { name, run: runId }, `this flow would not run:\n  - ${problems.join("\n  - ")}`);
+
+  const ctl = new AbortController();
+  const run = { id: runId, name, startedAt: Date.now(), events: [], out: {}, done: false, ok: null, ctl };
+  flowRuns.set(runId, run);
+  // Oldest finished runs fall off the back, never a live one: a flow still
+  // running is the one thing here that can't be reconstructed by re-reading it.
+  const finished = [...flowRuns.values()].filter((r) => r.done);
+  for (const r of finished.slice(0, Math.max(0, finished.length - FLOW_KEEP_FINISHED))) flowRuns.delete(r.id);
+
+  log(`[flow ${name}] conducting (run ${runId.slice(0, 8)})`);
+  flowEmit(run, { ev: "flow-start", name, steps: spec.steps.map((s) => s.id), t: run.startedAt });
+
+  const { runFlow } = require("./flow");
+  runFlow(spec, {
+    server: SERVER,
+    agentToken: cfg.agentToken,
+    self: { machineId: cfg.machineId, name: os.hostname() },
+    signal: ctl.signal,
+    onOutput: (id, stream, buf) => flowEmitOut(run, id, stream, buf),
+    log: (ev, d) => flowEmit(run, { ev, ...d }),
+  }).then((r) => {
+    run.done = true;
+    run.ok = r.ok;
+    flowEmit(run, {
+      ev: "flow-end", ok: r.ok, cancelled: !!r.cancelled,
+      failed: r.failed, ms: Date.now() - run.startedAt,
+    });
+    log(`[flow ${name}] ${r.cancelled ? "cancelled" : r.ok ? "finished" : "failed"} (run ${runId.slice(0, 8)})`);
+  }).catch((e) => {
+    // Everything runFlow throws is a refusal to start — an unresolvable target,
+    // a credential the relay won't take. The run ends without a single step.
+    run.done = true;
+    run.ok = false;
+    flowEmit(run, { ev: "flow-end", ok: false, error: e.message, failed: [], ms: Date.now() - run.startedAt });
+    logErr(`[flow ${name}] ${e.message}`);
+  });
+}
+
+function attachFlowRun(runId) {
+  const run = flowRuns.get(runId);
+  if (!run) return flowFail("attach", { run: runId }, "no such run on this machine");
+  sendCtl({
+    type: "flow-attached", run: run.id, name: run.name, startedAt: run.startedAt,
+    done: run.done, ok: run.ok, events: run.events, out: run.out,
+  });
+}
+
+function killFlowRun(runId) {
+  const run = flowRuns.get(runId);
+  if (!run) return flowFail("kill", { run: runId }, "no such run on this machine");
+  if (run.done) return;
+  run.ctl.abort();
+  log(`[flow ${run.name}] stop requested (run ${runId.slice(0, 8)})`);
+}
+
+// Only on the way out, and deliberately not on an ordinary relay disconnect: the
+// conductor is this process, not the browser that asked, so a relay blip should
+// cost a flow its audience and nothing else.
+function abortAllFlows() {
+  for (const run of flowRuns.values()) if (!run.done) run.ctl.abort();
+}
+
+function handleFlowMessage(msg) {
+  try {
+    switch (msg.type) {
+      case "flow-ls": return flowSendList();
+      // What *this* machine can reach, which is not the same question as what
+      // the person editing can reach. A flow's targets are resolved by its
+      // conductor, so the editor's dropdown has to be filled from here or it
+      // will happily offer machines that step one can't dial.
+      case "flow-targets":
+        return reachableMachines(SERVER, cfg.agentToken, { fresh: true })
+          .then((list) => sendCtl({
+            type: "flow-targets",
+            machines: list.map((m) => ({
+              machine_id: m.machine_id, name: m.name, owned: !!m.owned,
+              can_exec: m.owned || !!m.can_exec, last_seen: m.last_seen,
+            })),
+          }))
+          .catch((e) => flowFail("targets", {}, e.message));
+      case "flow-get": return sendCtl({ type: "flow-spec", name: msg.name, spec: flowStore.readFlow(msg.name) });
+      case "flow-save": {
+        flowStore.saveFlow(msg.name, msg.spec);
+        log(`[flow ${msg.name}] saved`);
+        sendCtl({ type: "flow-saved", name: msg.name });
+        return flowSendList();
+      }
+      case "flow-rm": {
+        flowStore.removeFlow(msg.name);
+        log(`[flow ${msg.name}] deleted`);
+        sendCtl({ type: "flow-removed", name: msg.name });
+        return flowSendList();
+      }
+      case "flow-run": return startFlowRun(msg.name, msg.run);
+      case "flow-attach": return attachFlowRun(msg.run);
+      case "flow-kill": return killFlowRun(msg.run);
+    }
+  } catch (e) {
+    // A bad name, an unparseable file, a disk that's full. The browser asked for
+    // one thing and gets one answer about it, rather than silence.
+    flowFail(msg.type.replace(/^flow-/, ""), { name: msg.name, run: msg.run }, e.message);
+  }
+}
+
 // ---- `switchboard exec` (the client end) ---------------------------------
 // The other side of the channel above, so a script or an agent can drive a
 // machine without a browser. It joins the circuit exactly as the web UI does —
@@ -756,15 +921,62 @@ async function doList() {
 // only the person writing the flow knows that. The spec's optional `conductor`
 // is that person writing it down, so running it in the wrong place is noticed
 // rather than silently slower.
-function doFlow(action, file) {
-  const { loadFlow, runFlow } = require("./flow");
-  if (action !== "run" && action !== "check") {
-    die("Usage: switchboard flow <run|check> <file.json> [--server <url>]\n\n" +
-      "  run     Execute the flow, streaming each step's output as it happens.\n" +
-      "  check   Validate the file and print the plan without running anything.\n");
-  }
-  if (!file) die("switchboard flow " + action + ": which file?\n");
+function fmtAgoShort(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
 
+function doFlow(action, ref) {
+  const { loadFlow, runFlow } = require("./flow");
+  const store = require("./flowstore");
+
+  // The store — the same ~/.switchboard/flows the browser editor writes into.
+  // These verbs exist so the two ways of reaching a flow are the same flow: what
+  // you drew in a tab is what `flow run` here picks up, with no export step and
+  // no second copy to wonder about.
+  if (action === "ls") {
+    const flows = store.listFlows();
+    if (!flows.length) {
+      console.log(`No flows on this machine yet (${store.FLOWS_DIR}).\n\n` +
+        "  Draw one in the dashboard, or drop a .json in that directory.");
+      return;
+    }
+    const width = Math.max(...flows.map((f) => f.name.length), 4);
+    for (const f of flows) {
+      const when = fmtAgoShort(Date.now() - f.updated);
+      console.log(`${f.name.padEnd(width)}  ${String(f.steps).padStart(2)} step${f.steps === 1 ? " " : "s"}  ` +
+        `${when.padStart(7)}  ${f.invalid ? "⚠ " + f.invalid : f.conductor ? "conductor: " + f.conductor : ""}`.trimEnd());
+    }
+    return;
+  }
+  if (action === "cat") {
+    if (!ref) die("switchboard flow cat: which flow?\n");
+    try { console.log(JSON.stringify(store.readFlow(ref), null, 2)); }
+    catch (e) { die("switchboard flow cat: " + e.message + "\n"); }
+    return;
+  }
+  if (action === "rm") {
+    if (!ref) die("switchboard flow rm: which flow?\n");
+    try { console.log("removed " + store.removeFlow(ref)); }
+    catch (e) { die("switchboard flow rm: " + e.message + "\n"); }
+    return;
+  }
+
+  if (action !== "run" && action !== "check") {
+    die("Usage: switchboard flow <run|check|ls|cat|rm> [flow] [--server <url>]\n\n" +
+      "  run     Execute the flow, streaming each step's output as it happens.\n" +
+      "  check   Validate it and print the plan without running anything.\n" +
+      "  ls      List the flows saved on this machine.\n" +
+      "  cat     Print one of them.\n" +
+      "  rm      Delete one of them.\n\n" +
+      "  A flow is a saved name (`nightly`) or a path to a file (`./nightly.json`).\n");
+  }
+  if (!ref) die("switchboard flow " + action + ": which flow?\n\n  Run `switchboard flow ls` to see what's saved here.\n");
+
+  const file = store.resolveFlowRef(ref);
   let flow;
   try { flow = loadFlow(file); }
   catch (e) { console.error(e.message); process.exit(1); }
@@ -886,6 +1098,7 @@ function connect() {
       emitStatus("fatal", { reason: "conflict", code: res.statusCode });
       for (const sid of sessions.keys()) killSession(sid);
       killAllExecs();
+      abortAllFlows();
       process.exit(1);
     }
     if (res.statusCode === 401 || res.statusCode === 403) {
@@ -896,6 +1109,7 @@ function connect() {
       emitStatus("fatal", { reason: "auth", code: res.statusCode });
       for (const sid of sessions.keys()) killSession(sid);
       killAllExecs();
+      abortAllFlows();
       process.exit(1);
     }
     log(`[relay] server responded ${res.statusCode}; will retry`);
@@ -936,6 +1150,12 @@ function connect() {
       case "exec-stdin": execStdin(msg.id, msg.data); break;
       case "exec-stdin-end": execStdinEnd(msg.id); break;
       case "exec-kill": killExec(msg.id, msg.signal); break;
+      // The flow store and the conductor. One entry point rather than seven
+      // cases, because they share their error reporting: whatever goes wrong,
+      // the browser that asked gets one flow-error naming the operation.
+      case "flow-ls": case "flow-get": case "flow-save": case "flow-rm":
+      case "flow-run": case "flow-attach": case "flow-kill": case "flow-targets":
+        handleFlowMessage(msg); break;
       case "dl-open": startDownload(msg.id, msg.path); break;
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
@@ -957,6 +1177,7 @@ function connect() {
       emitStatus("fatal", { reason: "replaced", code });
       for (const sid of sessions.keys()) killSession(sid);
       killAllExecs();
+      abortAllFlows();
       process.exit(0);
     }
     // Sessions are kept across reconnects; their onData handlers check ws state.
@@ -1215,6 +1436,7 @@ function sendStats() {
     emitStatus("stopping", { signal: sig });
     for (const sid of sessions.keys()) killSession(sid);
     killAllExecs();
+    abortAllFlows();
     process.exit(0);
   };
   process.on("SIGINT", shutdown("SIGINT"));
