@@ -68,5 +68,7 @@ README and the site share one copy.
 `site/`, the shared screenshots, or the workflow itself; it can also be run by
 hand from the Actions tab.
 
-**One-time repository setting:** Settings → Pages → Source: **GitHub Actions**.
-Until that is switched over, the workflow's deploy step fails.
+Nothing to configure by hand: `configure-pages` runs with `enablement: true`,
+so the first run switches Pages on (source: GitHub Actions) and deploys.
+Without that flag the action 404s on a repository where Pages has never been
+set up, which is how the very first deploy of this page failed.
