@@ -1,0 +1,151 @@
+/* ============================================================
+   InkType — Design Tokens
+   v0.1.0 · build 88a3f
+   Editorial dark UI for craft software.
+   ============================================================ */
+
+:root,
+[data-theme="dark"] {
+  /* — Surfaces ————————————————————————————————— */
+  --ink-bg:           #1a1614;   /* page background */
+  --ink-surface:      #211c19;   /* card, panel */
+  --ink-surface-2:    #2a241f;   /* raised, hover */
+  --ink-surface-3:    #342d27;   /* pressed, selected */
+  --ink-overlay:      rgba(15, 12, 10, 0.72);
+
+  /* — Ink (text) ———————————————————————————————— */
+  --ink-fg:           #ede4d3;   /* primary text */
+  --ink-fg-muted:     #b3a896;   /* secondary text */
+  --ink-fg-subtle:    #8a7f6f;   /* tertiary, captions */
+  --ink-fg-faint:     #5a5147;   /* metadata, footnotes */
+
+  /* — Lines ————————————————————————————————————— */
+  --ink-line:         #36302a;   /* hairline borders */
+  --ink-line-strong:  #4a4239;   /* visible borders */
+  --ink-rule:         #2c2622;   /* dividers */
+
+  /* — Accent (warm orange) ————————————————————— */
+  --ink-accent:       #d97757;
+  --ink-accent-hover: #e08966;
+  --ink-accent-press: #c66a4d;
+  --ink-accent-fg:    #1a1614;   /* text ON accent */
+  --ink-accent-soft:  rgba(217, 119, 87, 0.14);
+
+  /* — Semantic ————————————————————————————————— */
+  --ink-success:      #8ba668;
+  --ink-warning:      #d4a04a;
+  --ink-danger:       #c8553d;
+  --ink-info:         #6b8ca3;
+
+  --ink-success-soft: rgba(139, 166, 104, 0.14);
+  --ink-warning-soft: rgba(212, 160, 74, 0.14);
+  --ink-danger-soft:  rgba(200, 85, 61, 0.14);
+  --ink-info-soft:    rgba(107, 140, 163, 0.14);
+
+  /* — Type ————————————————————————————————————— */
+  --ink-font-serif:   "Fraunces", "EB Garamond", "Iowan Old Style",
+                      "Apple Garamond", Georgia, "Times New Roman", serif;
+  --ink-font-sans:    "Inter", ui-sans-serif, system-ui, -apple-system,
+                      "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --ink-font-mono:    "JetBrains Mono", "IBM Plex Mono", "SF Mono",
+                      ui-monospace, Menlo, Consolas, monospace;
+
+  /* Type scale — major-third (1.25) anchored on 16px */
+  --ink-text-xs:      11px;   /* meta, micro */
+  --ink-text-sm:      13px;   /* captions, labels */
+  --ink-text-base:    15px;   /* body */
+  --ink-text-md:      18px;   /* lead body */
+  --ink-text-lg:      22px;   /* h4 */
+  --ink-text-xl:      28px;   /* h3 */
+  --ink-text-2xl:     38px;   /* h2 */
+  --ink-text-3xl:     52px;   /* h1 */
+  --ink-text-4xl:     72px;   /* display */
+  --ink-text-5xl:     104px;  /* hero */
+
+  --ink-leading-tight: 1.12;
+  --ink-leading-snug:  1.32;
+  --ink-leading-base:  1.55;
+  --ink-leading-loose: 1.72;
+
+  --ink-tracking-tight:  -0.02em;
+  --ink-tracking-normal:  0;
+  --ink-tracking-wide:    0.04em;
+  --ink-tracking-wider:   0.12em;   /* mono caps */
+
+  /* — Spacing — 4px base ————————————————————— */
+  --ink-space-1:   4px;
+  --ink-space-2:   8px;
+  --ink-space-3:   12px;
+  --ink-space-4:   16px;
+  --ink-space-5:   24px;
+  --ink-space-6:   32px;
+  --ink-space-7:   48px;
+  --ink-space-8:   64px;
+  --ink-space-9:   96px;
+  --ink-space-10:  128px;
+
+  /* — Radius (small, restrained) —————————————— */
+  --ink-radius-xs:   2px;
+  --ink-radius-sm:   4px;
+  --ink-radius-md:   6px;
+  --ink-radius-lg:   10px;
+  --ink-radius-xl:   16px;
+  --ink-radius-pill: 999px;
+
+  /* — Shadows (almost none) ———————————————————— */
+  --ink-shadow-sm:  0 1px 0 rgba(0,0,0,0.25);
+  --ink-shadow-md:  0 4px 16px -8px rgba(0,0,0,0.5);
+  --ink-shadow-lg:  0 24px 48px -16px rgba(0,0,0,0.6);
+  --ink-ring:       0 0 0 2px var(--ink-bg), 0 0 0 4px var(--ink-accent);
+
+  /* — Motion ———————————————————————————————————— */
+  --ink-ease:       cubic-bezier(0.2, 0, 0, 1);
+  --ink-dur-fast:   120ms;
+  --ink-dur-base:   180ms;
+  --ink-dur-slow:   320ms;
+
+  /* — Layout ———————————————————————————————————— */
+  --ink-container:  1200px;
+  --ink-prose:      68ch;
+  --ink-baseline:   8px;
+}
+
+/* ============================================================
+   Light theme — paper & ink
+   ============================================================ */
+[data-theme="light"] {
+  --ink-bg:           #f5f0e6;
+  --ink-surface:      #ede6d8;
+  --ink-surface-2:    #e3dbcb;
+  --ink-surface-3:    #d6cdba;
+  --ink-overlay:      rgba(245, 240, 230, 0.78);
+
+  --ink-fg:           #2a221a;
+  --ink-fg-muted:     #5a4f42;
+  --ink-fg-subtle:    #7a6f60;
+  --ink-fg-faint:     #a89e8c;
+
+  --ink-line:         #d4cab4;
+  --ink-line-strong:  #b8ad94;
+  --ink-rule:         #ddd2bc;
+
+  --ink-accent:       #c25a3a;
+  --ink-accent-hover: #b14e30;
+  --ink-accent-press: #9b4226;
+  --ink-accent-fg:    #f5f0e6;
+  --ink-accent-soft:  rgba(194, 90, 58, 0.10);
+
+  --ink-success:      #5e7a3a;
+  --ink-warning:      #a87a20;
+  --ink-danger:       #a83820;
+  --ink-info:         #466478;
+
+  --ink-success-soft: rgba(94, 122, 58, 0.10);
+  --ink-warning-soft: rgba(168, 122, 32, 0.10);
+  --ink-danger-soft:  rgba(168, 56, 32, 0.10);
+  --ink-info-soft:    rgba(70, 100, 120, 0.10);
+
+  --ink-shadow-sm:  0 1px 0 rgba(70, 50, 30, 0.06);
+  --ink-shadow-md:  0 4px 16px -8px rgba(70, 50, 30, 0.18);
+  --ink-shadow-lg:  0 24px 48px -16px rgba(70, 50, 30, 0.22);
+}

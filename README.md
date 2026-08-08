@@ -15,6 +15,14 @@
 </p>
 
 <p align="center">
+  <a href="https://lfkdsk.github.io/Switchboard/"><strong>Project page &amp; downloads</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://shell.lfkdsk.org">Dashboard</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/lfkdsk/Switchboard/releases">Releases</a>
+</p>
+
+<p align="center">
   <img src="docs/terminal.png" alt="A Switchboard browser terminal: tabbed multi-shell with a live header showing RTT, CPU, memory, and IP" width="880">
   <br><sub><em>A real shell in the browser — tabbed multi-shell, live RTT / CPU / memory, drag-and-drop file transfer.</em></sub>
 </p>
@@ -410,6 +418,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
 | `cli/peer.js` | The other machines: `nodes`, `exec`, `shell` (client side) |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
+| `site/` | The GitHub Pages project page — intro + downloads (see [site/README.md](site/README.md)) |
 
 ---
 

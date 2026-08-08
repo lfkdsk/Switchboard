@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Switchboard">
+  <!-- The Switchboard mark, re-inked in the InkType palette: warm neutrals,
+       one rust accent. Same patch cord bent into an S as docs/logo.svg. -->
+  <defs>
+    <linearGradient id="sb-plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a241f"/>
+      <stop offset="1" stop-color="#1a1614"/>
+    </linearGradient>
+    <linearGradient id="sb-cord" x1="80" y1="60" x2="184" y2="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e08966"/>
+      <stop offset="1" stop-color="#c66a4d"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="244" height="244" rx="58" fill="url(#sb-plate)" stroke="#4a4239" stroke-width="4"/>
+  <!-- the patch cord -->
+  <path d="M164 76 C104 60 76 104 128 128 C180 152 152 196 92 180"
+        fill="none" stroke="url(#sb-cord)" stroke-width="24" stroke-linecap="round"/>
+  <!-- host jack -->
+  <circle cx="164" cy="76" r="22" fill="#1a1614"/>
+  <circle cx="164" cy="76" r="15" fill="#8ba668"/>
+  <!-- browser jack -->
+  <circle cx="92" cy="180" r="22" fill="#1a1614"/>
+  <circle cx="92" cy="180" r="15" fill="#ede4d3"/>
+</svg>

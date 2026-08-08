@@ -7,3 +7,6 @@ node_modules/
 # macOS menu-bar app (SwiftPM build output + assembled bundle)
 macos/.build/
 macos/build/
+
+# Landing page staging output (site/preview.sh, .github/workflows/pages.yml)
+_site/
