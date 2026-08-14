@@ -430,8 +430,9 @@
     // every font load: that covers the core subset warmed below, and the Material
     // Design one that the browser fetches lazily if a prompt happens to use it.
     document.fonts.addEventListener("loadingdone", () => {
-      for (const s of shells.values()) {
-        try { s.fit.fit(); s.term.refresh(0, s.term.rows - 1); } catch {}
+      for (const [sid, s] of shells) {
+        fitShell(sid, s);
+        try { s.term.refresh(0, s.term.rows - 1); } catch {}
       }
     });
     // Warm the core subset (sampled with a Powerline separator) so the common
@@ -451,9 +452,26 @@
       const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
       tab.append(lbl, x); tab.onclick = (e) => { if (e.target === x) closeShell(sid); else activate(sid); };
       $("tabbar").insertBefore(tab, $("newTab"));
-      const sh = { term, fit, host, tab, label: lbl, opened: false };
+      const sh = { term, fit, host, tab, label: lbl, opened: false, cols: 0, rows: 0 };
       shells.set(sid, sh);
       return sh;
+    }
+    // Re-measure a shell and tell the daemon, so the PTY and the terminal never
+    // disagree about how wide a line is. They diverge silently otherwise: the
+    // shell wraps and repaints at the width it believes it has, so a mismatch
+    // draws the characters you type a second time, at the wrong place.
+    //
+    // A hidden shell can't be measured — fit() is a no-op on display:none — so a
+    // background tab keeps its old size while the window resizes around it, and
+    // is re-fitted here when it's activated. `cols`/`rows` are the last size the
+    // daemon was told, so switching tabs doesn't send a frame per click.
+    function fitShell(sid, sh) {
+      try { sh.fit.fit(); } catch {}
+      if (!sh.opened) return; // not attached yet: the `open` frame carries the size
+      if (sh.term.cols === sh.cols && sh.term.rows === sh.rows) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return; // a reconnect re-opens with the current size
+      sh.cols = sh.term.cols; sh.rows = sh.term.rows;
+      sendJson({ type: "resize", sid, cols: sh.cols, rows: sh.rows });
     }
     function removeShell(sid) {
       const sh = shells.get(sid); if (!sh) return;
@@ -464,8 +482,12 @@
       const sh = shells.get(sid); if (!sh) return;
       activeSid = sid;
       for (const [id, s] of shells) { s.host.hidden = id !== sid; s.tab.classList.toggle("active", id === sid); }
-      try { sh.fit.fit(); } catch {}
-      if (!sh.opened && ws && ws.readyState === WebSocket.OPEN) { sh.opened = true; sendJson({ type: "open", sid, cols: sh.term.cols, rows: sh.term.rows }); }
+      fitShell(sid, sh); // it may have been hidden while the window resized
+      if (!sh.opened && ws && ws.readyState === WebSocket.OPEN) {
+        sh.opened = true;
+        sh.cols = sh.term.cols; sh.rows = sh.term.rows;
+        sendJson({ type: "open", sid, cols: sh.cols, rows: sh.rows });
+      }
       sh.term.focus();
     }
     function newShell() { const sid = crypto.randomUUID(); ensureShell(sid); activate(sid); }
@@ -569,7 +591,7 @@
     window.addEventListener("dragover", (e) => { if (ws) e.preventDefault(); });
     window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); } });
     window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
-    window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh && ws && ws.readyState === WebSocket.OPEN) { try { sh.fit.fit(); } catch {} sendJson({ type: "resize", sid: activeSid, cols: sh.term.cols, rows: sh.term.rows }); } });
+    window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh) fitShell(activeSid, sh); });
     window.addEventListener("beforeunload", () => { for (const sid of shells.keys()) sendJson({ type: "client-gone", sid }); });
     function toast(text, kind) { const el = document.createElement("div"); el.className = "toast " + (kind || ""); el.textContent = text; $("toasts").appendChild(el); setTimeout(() => el.remove(), 4000); }
 
