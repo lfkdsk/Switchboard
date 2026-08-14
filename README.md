@@ -164,6 +164,41 @@ token you already hold, use `switchboard service install --token <token>`.
 > instead. It handles `SIGTERM` cleanly and exits 0 when the relay hands its
 > circuit to a newer daemon, so `Restart=on-failure` semantics work anywhere.
 
+### One daemon at a time
+
+Circuits are last-writer-wins: whoever dials in last gets the line, and the
+daemon that was serving this machine is dropped — taking the shells open in it
+along. That's the right answer for a restart and the wrong one for a forgotten
+terminal, so when you start one by hand and something is already up — the
+menu-bar app, the systemd service, another window — the CLI says what it found
+and asks first:
+
+```
+! Switchboard is already running on this machine.
+
+    Started   2h 11m ago by the menu-bar app (pid 4821)
+    Serving   lfkdsk at https://shell.lfkdsk.org
+
+  Starting another one takes this machine's circuit over from it:
+  the relay hands the line to the newcomer, that daemon exits, and every
+  shell open in it closes with it.
+
+Take over? [y/N]
+```
+
+The default is **no**: Enter leaves the running daemon alone and starts nothing.
+`--force` (or `SWITCHBOARD_FORCE=1`) skips the question, and a launch with no
+terminal to ask — the app, the unit, a script — logs the takeover and carries on
+as it always has. `switchboard login` asks before sending you to the browser, and
+`service install` asks before `enable --now` starts the unit.
+
+Each daemon records itself in `~/.switchboard/daemons.json` (mode `0600`) and
+takes itself off again on the way out. It's a record, not a lock: entries are
+checked against the live process, so one left behind by a `kill -9` never blocks
+a start. Two daemons on *different* circuits — a signed-in one and a `--token`
+share — are legal, and the prompt says so rather than warning about a takeover
+that wouldn't happen.
+
 <p align="center">
   <img src="docs/landing.png" alt="The Switchboard landing page: sign in with GitHub, or paste a one-off token" width="720">
 </p>
@@ -216,6 +251,16 @@ switchboard exec build-box --cwd ~/app --timeout 600 npm test   # same, spelled 
 `shell` is the browser terminal in your terminal, on the same sessions: **Ctrl-]**
 detaches and leaves the shell running (it's still a tab in the dashboard), and
 `switchboard shell <node> --attach` picks the newest one back up.
+
+The repo ships a [Claude Code skill](.claude/skills/switchboard/SKILL.md) for
+exactly this: which command to reach for, what the exit codes mean, when `exec`
+beats `shell`, and what the error messages are telling you. It's picked up
+automatically in a session opened here, and works anywhere else if you copy or
+symlink it into `~/.claude/skills/`:
+
+```bash
+ln -s "$PWD/.claude/skills/switchboard" ~/.claude/skills/switchboard
+```
 
 ### Turning it off
 
@@ -346,6 +391,7 @@ switchboard shell <node>     Open an interactive shell on one of your other
 | `-s, --server <url>`  | Relay origin. Default: `https://shell.lfkdsk.org`. |
 | `--shell <path>`      | Shell to spawn. Default: `$SHELL`, else `bash`/`powershell`. |
 | `--no-peer`           | Refuse `exec`/`shell` from your other machines. |
+| `--force`             | Start without asking, even if a daemon is already running here. |
 | `-v, --version`       | Print version and exit. |
 | `-h, --help`          | Show help and exit. |
 | `nodes --json`        | Machine-readable node list. |
@@ -354,9 +400,11 @@ switchboard shell <node>     Open an interactive shell on one of your other
 | `shell [sid]`, `shell --attach` | Reattach to that session, or to the newest one. |
 
 Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
-`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`. The `WEBTERM_*` equivalents are also
-accepted for drop-in compatibility. Account credentials live in
-`~/.switchboard/config.json` (mode `0600`).
+`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`, `SWITCHBOARD_FORCE`. The `WEBTERM_*`
+equivalents are also accepted for drop-in compatibility. Account credentials live
+in `~/.switchboard/config.json` (mode `0600`), and whoever is currently serving
+this machine in `~/.switchboard/daemons.json` (see
+[One daemon at a time](#one-daemon-at-a-time)).
 
 `SWITCHBOARD_PEER=0` makes this machine refuse `exec`/`shell` from your other
 machines (see [above](#turning-it-off)). It's on by default in account mode, and
@@ -419,6 +467,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `cli/peer.js` | The other machines: `nodes`, `exec`, `shell` (client side) |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 | `site/` | The GitHub Pages project page — intro + downloads (see [site/README.md](site/README.md)) |
+| `.claude/skills/switchboard/` | Claude Code skill: driving the CLI (`nodes`, `exec`, `shell`, `login`, `service`) |
 
 ---
 
