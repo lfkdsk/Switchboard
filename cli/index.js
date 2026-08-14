@@ -1298,8 +1298,10 @@ function sendStats() {
     // Ask before the browser round-trip rather than after it: signing in here
     // ends with this machine exposed, which is exactly what a daemon already
     // running would lose. The machine id survives a login, so the circuit this
-    // run would land on is knowable now — unless there's never been one.
-    await confirmSoleDaemon(cfg.machineId ? circuitId(true, cfg.machineId) : null);
+    // run lands on is knowable now — and when there isn't one yet, login mints
+    // it, which means nothing running can be on that circuit. A stand-in random
+    // id says precisely that.
+    await confirmSoleDaemon(circuitId(true, cfg.machineId || crypto.randomUUID()));
     // One step: sign in, then fall through to expose this machine's shell.
     await doLogin(); // saves config; fatal-exits on failure
     cfg = loadConfig();
