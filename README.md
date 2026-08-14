@@ -252,6 +252,16 @@ switchboard exec build-box --cwd ~/app --timeout 600 npm test   # same, spelled 
 detaches and leaves the shell running (it's still a tab in the dashboard), and
 `switchboard shell <node> --attach` picks the newest one back up.
 
+The repo ships a [Claude Code skill](.claude/skills/switchboard/SKILL.md) for
+exactly this: which command to reach for, what the exit codes mean, when `exec`
+beats `shell`, and what the error messages are telling you. It's picked up
+automatically in a session opened here, and works anywhere else if you copy or
+symlink it into `~/.claude/skills/`:
+
+```bash
+ln -s "$PWD/.claude/skills/switchboard" ~/.claude/skills/switchboard
+```
+
 ### Turning it off
 
 Peer access is **on by default** in account mode — these are your own machines,
@@ -457,6 +467,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `cli/peer.js` | The other machines: `nodes`, `exec`, `shell` (client side) |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 | `site/` | The GitHub Pages project page — intro + downloads (see [site/README.md](site/README.md)) |
+| `.claude/skills/switchboard/` | Claude Code skill: driving the CLI (`nodes`, `exec`, `shell`, `login`, `service`) |
 
 ---
 
