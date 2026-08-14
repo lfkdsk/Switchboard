@@ -27,6 +27,7 @@ const crypto = require("crypto");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 const { exec, spawn, spawnSync } = require("child_process");
 const WebSocket = require("ws");
 const pty = require("node-pty");
@@ -94,6 +95,8 @@ Options:
   -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
       --no-peer         Refuse commands from your other machines (see below).
+      --force           Start even if this machine already has a daemon running,
+                        without asking first (see below).
   -v, --version         Print version and exit.
   -h, --help            Show this help and exit.
 
@@ -113,10 +116,14 @@ Environment (overridden by the flags above):
                                 default: they're yours, and your dashboard can
                                 already open a shell here. Turn it off for a host
                                 that should only ever be driven by hand.
+  SWITCHBOARD_FORCE=1           Same as --force.
 
 Notes:
   Logged in → this machine shows up in your dashboard; only you can open its shell.
-  Anonymous → the token is the credential; anyone who has it gets a shell here.`);
+  Anonymous → the token is the credential; anyone who has it gets a shell here.
+  One daemon serves this machine at a time. If another one is already up — the
+  menu-bar app, the systemd service, another terminal — starting this one takes
+  its circuit over and closes the shells open in it, so you're asked first.`);
 }
 
 function parseArgs(argv) {
@@ -133,6 +140,7 @@ function parseArgs(argv) {
       case "-s": case "--server": opts.server = inline !== null ? inline : argv[++i]; break;
       case "--shell": opts.shell = inline !== null ? inline : argv[++i]; break;
       case "--no-peer": opts.noPeer = true; break;
+      case "--force": opts.force = true; break;
       default:
         console.error(`Unknown option: ${a}\n`);
         printHelp();
@@ -382,7 +390,7 @@ WantedBy=default.target
 `;
 }
 
-function serviceInstall() {
+async function serviceInstall() {
   requireSystemd();
   requireStablePath();
   // Same rule the macOS app applies to silent launches: an anonymous token
@@ -397,6 +405,15 @@ function serviceInstall() {
       "Or pin a fixed token you already hold:\n\n" +
       "  switchboard service install --token <token>\n");
   }
+
+  // `enable --now` is about to start a daemon, so the same question applies as
+  // for a hand-started one — minus the unit itself, which is what we're here to
+  // manage and which `--now` leaves alone when it's already up.
+  const pinned = args.token || process.env.SWITCHBOARD_TOKEN || process.env.WEBTERM_TOKEN || null;
+  const willBind = !!cfg.agentToken && !pinned;
+  await confirmSoleDaemon(
+    willBind ? circuitId(true, cfg.machineId) : circuitId(false, pinned),
+    { ignoreService: true, intent: "service" });
 
   fs.mkdirSync(path.dirname(UNIT_PATH), { recursive: true });
   // 0600: the unit may carry a token, and the token *is* the shell credential.
@@ -461,6 +478,218 @@ function doService(action) {
         `  uninstall   Stop it and remove the unit.\n` +
         `  status      Show whether it's running.\n`);
   }
+}
+
+// ---- who's already serving this machine (~/.switchboard/daemons.json) ----
+// A second daemon is not an error on the relay: circuits are last-writer-wins,
+// so a newcomer silently takes the line and whoever was serving this machine —
+// the menu-bar app, the systemd unit, the terminal in the next tab — is closed
+// with 4001, taking every shell open in it along. That's exactly right when you
+// meant it and a nasty surprise when you didn't, and the relay can't tell the
+// difference. So every daemon records itself here and the next one asks first.
+//
+// Records, not a lock: the daemon must still start when the file is stale (a
+// `kill -9` leaves an entry behind) or unwritable, so every entry read back is
+// checked against the live process and every write failure is survivable. A
+// list rather than one slot because two daemons here are legal — a bound one
+// and a `--token` share are different circuits — and neither should erase the
+// other's entry on the way out.
+const RUN_FILE = path.join(CONFIG_DIR, "daemons.json");
+
+const FORCE = !!args.force ||
+  ["1", "true", "yes", "on"].includes((process.env.SWITCHBOARD_FORCE || "").toLowerCase());
+
+// Which of the three ways in was taken, so the prompt can name it. systemd
+// stamps INVOCATION_ID on every unit it starts; the macOS app (and any other
+// supervisor) is the reason the status sinks exist at all.
+const LAUNCHER = (process.env.INVOCATION_ID || process.env.JOURNAL_STREAM) ? "service"
+  : STATUS_ON ? "app"
+  : "cli";
+function launcherLabel(kind) {
+  switch (kind) {
+    case "service": return "the systemd user service";
+    case "app": return process.platform === "darwin" ? "the menu-bar app" : "a supervisor";
+    default: return "a terminal";
+  }
+}
+
+// What the relay keys a circuit by — the machine id when bound to an account,
+// the token itself when anonymous — so two daemons can tell whether they'd be
+// fighting over one line or just sharing a host. Hashed, because in anonymous
+// mode that key *is* the shell credential and it has no business in a second
+// file; a digest compares just as well.
+function circuitId(bound, key) {
+  if (!key) return null;
+  return crypto.createHash("sha256")
+    .update(`${SERVER}|${bound ? "machine" : "token"}:${key}`).digest("hex").slice(0, 16);
+}
+
+function readRunRecords() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(RUN_FILE, "utf8"));
+    return Array.isArray(raw.daemons) ? raw.daemons : [];
+  } catch { return []; }
+}
+
+function writeRunRecords(list) {
+  try {
+    if (!list.length) { fs.rmSync(RUN_FILE, { force: true }); return; }
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(RUN_FILE, JSON.stringify({ daemons: list }, null, 2) + "\n", { mode: 0o600 });
+  } catch { /* a courtesy to the next launch; never worth failing to start over */ }
+}
+
+// Everyone on file who is still there — which excludes us, so this is exactly
+// "the other daemons". Entries left by a crash are dropped on the way past.
+function liveRunRecords() {
+  return readRunRecords().filter((r) => pidAlive(r.pid) && pidIsDaemon(r.pid, r));
+}
+
+function claimRunRecord() {
+  writeRunRecords([...liveRunRecords(), {
+    pid: process.pid,
+    startedAt: Date.now(),
+    launcher: LAUNCHER,
+    version: pkg.version,
+    cli: CLI_PATH,
+    server: SERVER,
+    mode: BOUND ? "account" : "token",
+    account: BOUND ? (cfg.login || null) : null,
+    circuit: circuitId(BOUND, BOUND ? MACHINE : TOKEN),
+  }]);
+}
+
+// Drop our own entry on the way out and keep everyone else's: a daemon that
+// exits — replaced, or just stopped — must not take a live sibling's record
+// with it, or the next launch would see an empty file and ask nothing.
+function releaseRunRecord() {
+  writeRunRecords(liveRunRecords().filter((r) => r.pid !== process.pid));
+}
+
+function pidAlive(pid) {
+  if (!(pid > 0) || pid === process.pid) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === "EPERM"; } // running, just not ours to signal
+}
+
+// Pids get recycled and a record outlives a `kill -9`, so a live pid alone
+// proves nothing. Where the OS hands over a command line cheaply, insist it
+// still looks like our daemon; where it won't answer, believe the record — a
+// question we didn't need to ask is cheaper than a takeover nobody saw coming.
+function pidIsDaemon(pid, rec) {
+  const looks = (s) => !!s && ((rec.cli && s.includes(rec.cli)) || /switch-?board/i.test(s));
+  try {
+    if (process.platform === "linux") {
+      // /proc/<pid>/cmdline is NUL-separated, one entry per argv element.
+      return looks(fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" "));
+    }
+    if (process.platform === "darwin") {
+      const r = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+      return r.status === 0 && r.stdout ? looks(r.stdout) : true;
+    }
+  } catch { return true; }
+  return true;
+}
+
+// The daemons already serving this machine. `ignoreService` is for `service
+// install`, where the unit is the thing being managed rather than a stranger to
+// warn about (and `enable --now` leaves an already-running one alone).
+function findRunningDaemons(ignoreService) {
+  const live = liveRunRecords().filter((r) => !(ignoreService && r.launcher === "service"));
+  if (live.length) return live;
+  // Version skew: a daemon older than these records keeps no trace of itself,
+  // but on Linux the unit it runs under does. Only worth asking systemd when
+  // we're the one barging in — a unit restarting itself would find itself.
+  if (!ignoreService && LAUNCHER === "cli" && process.platform === "linux" &&
+      spawnSync("systemctl", ["--user", "is-active", "--quiet", UNIT_NAME]).status === 0) {
+    return [{ launcher: "service", unit: UNIT_NAME }];
+  }
+  return [];
+}
+
+function ago(t) {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ${m % 60}m ago`;
+}
+
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    // Settle before closing: rl.close() emits "close" synchronously, so an
+    // answer handed over after it would lose the race to the empty default.
+    let settled = false;
+    const done = (answer) => { if (!settled) { settled = true; resolve(answer); } };
+    rl.on("close", () => done("")); // Ctrl-D, or stdin closed under us: no
+    rl.question(question, (answer) => {
+      done(answer);
+      rl.close();
+      try { process.stdin.pause(); } catch {}
+    });
+  });
+}
+
+// The gate itself. `circuit` is the line this run would take, when it's known
+// early enough to say whether the daemon already up would be replaced by it or
+// merely joined on the same host.
+async function confirmSoleDaemon(circuit, { ignoreService = false, intent = "start" } = {}) {
+  const others = findRunningDaemons(ignoreService);
+  if (!others.length) return;
+  // Unknown on either side means we can't rule out a takeover — describe the
+  // outcome that costs somebody their shells rather than the comfortable one.
+  const shares = (r) => !circuit || !r.circuit || circuit === r.circuit;
+  const takeover = others.some(shares);
+  // The one that would actually lose its line, when we can tell which that is.
+  const other = others.find(shares) || others[0];
+
+  const who = [launcherLabel(other.launcher), other.pid ? `pid ${other.pid}` : null,
+    others.length > 1 ? `${others.length} running in all` : null].filter(Boolean).join(", ");
+  emitStatus("duplicate", { pid: other.pid || null, launcher: other.launcher || null, takeover });
+
+  // Nobody is watching a supervised start — the app, the unit, a CI script —
+  // and a prompt into a closed stdin would just hang. Say what's happening and
+  // carry on: this is the behaviour those callers have always had.
+  if (FORCE || !(process.stdin.isTTY && process.stdout.isTTY)) {
+    logErr(`! Switchboard is already running on this machine (${who})` +
+      (takeover ? " — taking over its circuit; the shells open in it will close."
+                : " — on a different circuit; both will run."));
+    return;
+  }
+
+  console.log("\n! Switchboard is already running on this machine.\n");
+  console.log(`    Started   ${other.startedAt ? ago(other.startedAt) : "some time ago"} by ` +
+    `${launcherLabel(other.launcher)}${other.pid ? ` (pid ${other.pid})` : ""}`);
+  if (other.mode) {
+    console.log(`    Serving   ${other.mode === "account" ? (other.account || "your account") : "a one-off token"}` +
+      ` at ${other.server || SERVER}`);
+  }
+  if (others.length > 1) console.log(`    Also      ${others.length - 1} more running here`);
+  console.log("");
+  const what = intent === "service" ? "The service would start a second daemon, which" : "Starting another one";
+  console.log(takeover
+    ? `  ${what} takes this machine's circuit over from it:\n` +
+      "  the relay hands the line to the newcomer, that daemon exits, and every\n" +
+      "  shell open in it closes with it."
+    : `  ${what} would use a different circuit (another relay, or a\n` +
+      "  one-off token), so the two would run side by side rather than one\n" +
+      "  replacing the other.");
+  console.log("");
+
+  const answer = await ask(intent === "service" ? "Install and start it anyway? [y/N] "
+    : takeover ? "Take over? [y/N] " : "Start a second one? [y/N] ");
+  if (!/^y(es)?$/i.test(answer.trim())) {
+    // Echo back the command they actually typed, so --force lands somewhere
+    // that works: `switchboard login --force`, `service install --force`, …
+    const self = ["switchboard", sub, sub === "service" ? serviceAction : null].filter(Boolean).join(" ");
+    console.log("\nLeft the running daemon alone — nothing was started.\n");
+    if (other.launcher === "service") console.log(`  systemctl --user status ${UNIT_NAME}   # what it's doing`);
+    else if (other.pid) console.log(`  kill ${other.pid}   # stop it, if it's the one you don't want`);
+    console.log(`  ${self} --force   # start anyway, without this question\n`);
+    process.exit(0);
+  }
+  console.log("");
 }
 
 // Connection state, resolved by setupConnection() at startup — after any login —
@@ -1066,11 +1295,25 @@ function sendStats() {
   if (sub === "service") return doService(serviceAction); // install/remove the systemd unit and exit
   if (PEER_SUBS.includes(sub)) return doPeer(); // client-side: talk to the *other* machines
   if (sub === "login") {
+    // Ask before the browser round-trip rather than after it: signing in here
+    // ends with this machine exposed, which is exactly what a daemon already
+    // running would lose. The machine id survives a login, so the circuit this
+    // run would land on is knowable now — unless there's never been one.
+    await confirmSoleDaemon(cfg.machineId ? circuitId(true, cfg.machineId) : null);
     // One step: sign in, then fall through to expose this machine's shell.
     await doLogin(); // saves config; fatal-exits on failure
     cfg = loadConfig();
+    setupConnection();
+  } else {
+    setupConnection(); // resolves the circuit this run would take…
+    await confirmSoleDaemon(circuitId(BOUND, BOUND ? MACHINE : TOKEN)); // …so we can name it
   }
-  setupConnection();
+  // We're going ahead: put this daemon on the record, and take it off again on
+  // the way out. `exit` covers every path out of here — the signal handlers
+  // below, a fatal relay response, the 4001 handover — since they all end in
+  // process.exit().
+  claimRunRecord();
+  process.on("exit", releaseRunRecord);
   refreshMemAvailable();
   setInterval(sendStats, 2000);
   setInterval(refreshCwds, 10000);
