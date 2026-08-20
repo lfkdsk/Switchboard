@@ -851,6 +851,16 @@ let ws = null;
 let reconnectDelay = 1000;
 let announced = false;
 let lastRtt = null, pingSentAt = 0; // relay-edge round-trip (ms), reported in stats
+let lastPongAt = 0; // when the relay edge last answered; 0 while no link is up
+const STATS_INTERVAL_MS = 2000;
+// The relay answers "ping" from the edge, without waking the Durable Object
+// (src/circuit.js: setWebSocketAutoResponse), so a pong is owed on every tick
+// even while the DO hibernates. Five missed ticks means the link is gone, not
+// that the other end is busy.
+const PONG_TIMEOUT_MS = 5 * STATS_INTERVAL_MS;
+// A TCP connection that opens but never completes the upgrade would otherwise
+// sit in CONNECTING with no deadline of its own.
+const HANDSHAKE_TIMEOUT_MS = 15000;
 const activeDownloads = new Map(); // id -> fs.ReadStream
 const activeUploads = new Map(); // id -> { stream, finalPath }
 
@@ -859,10 +869,14 @@ function sendCtl(obj) {
 }
 
 function connect() {
-  ws = new WebSocket(wsUrl, AGENT ? { headers: { "x-switchboard-agent": AGENT } } : undefined);
+  ws = new WebSocket(wsUrl, {
+    handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
+    ...(AGENT ? { headers: { "x-switchboard-agent": AGENT } } : {}),
+  });
 
   ws.on("open", () => {
     reconnectDelay = 1000;
+    lastPongAt = Date.now(); // start the liveness clock; no pong is owed yet
     if (!announced) { banner(); announced = true; }
     log("[relay] connected");
     emitStatus("connected", { mode: BOUND ? "account" : "token" });
@@ -912,7 +926,11 @@ function connect() {
       return;
     }
     const text = data.toString("utf8");
-    if (text === "pong") { if (pingSentAt) lastRtt = Date.now() - pingSentAt; return; } // relay-edge RTT
+    if (text === "pong") { // relay-edge RTT, and proof the link still carries traffic
+      if (pingSentAt) lastRtt = Date.now() - pingSentAt;
+      lastPongAt = Date.now();
+      return;
+    }
     let msg;
     try { msg = JSON.parse(text); } catch { return; }
     switch (msg.type) {
@@ -1266,6 +1284,19 @@ function refreshMemAvailable() {
 }
 function sendStats() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // A half-open link still accepts ws.send() — the frames go into the kernel's
+  // send buffer and TCP retransmits them for ~15 minutes before giving up. For
+  // all that time readyState stays OPEN, no `close` fires, the reconnect timer
+  // never runs, and this daemon reports itself Online while the relay has long
+  // since written the machine off. The unanswered pings are the only evidence,
+  // so act on them: terminate() destroys the socket now and emits the `close`
+  // the reconnect path is waiting for.
+  if (lastPongAt && Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
+    logErr(`[relay] no pong for ${PONG_TIMEOUT_MS}ms; link is half-open, reconnecting`);
+    lastPongAt = 0; // don't fire again while the close is in flight
+    ws.terminate();
+    return;
+  }
   refreshMemAvailable();
   const total = os.totalmem();
   // cpuUsage() advances the sampling window, so compute these once and reuse
@@ -1325,7 +1356,7 @@ function sendStats() {
   claimRunRecord();
   process.on("exit", releaseRunRecord);
   refreshMemAvailable();
-  setInterval(sendStats, 2000);
+  setInterval(sendStats, STATS_INTERVAL_MS);
   setInterval(refreshCwds, 10000);
   log(`connecting to ${SERVER} …`);
   if (activity.agentsEnabled) log("[activity] reporting Claude Code sessions (SWITCHBOARD_ACTIVITY)");
