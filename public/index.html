@@ -91,8 +91,14 @@
   input.share-code { min-width: 230px; text-transform: uppercase; letter-spacing: .08em; }
   .share-code-value { white-space: nowrap; letter-spacing: .06em; user-select: all; }
   .share-code-result { display: flex; flex: 1 0 100%; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .dash-onboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; margin-top: 18px; }
-  .dash-onboard .card { width: auto; margin: 0; }
+  .dash-onboard { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
+  .dash-onboard .card { width: 100%; margin: 0; padding: 18px 20px; }
+  .redeem-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+  .redeem-form .share-code { width: 100%; min-width: 0; }
+  @media (max-width: 520px) {
+    .redeem-form { grid-template-columns: 1fr; }
+    .redeem-form button { width: 100%; }
+  }
   /* activity: what the host is actually doing, without opening a shell */
   .m-act { display: flex; flex-direction: column; gap: 4px; font-size: 12px; padding-left: 20px; }
   .m-act:empty { display: none; }
@@ -183,7 +189,7 @@
         <div class="card">
           <h1 style="font-size:15px">Redeem a share code</h1>
           <p>Paste the one-time code from the machine owner.</p>
-          <div class="row">
+          <div class="redeem-form">
             <input class="share-code" id="shareCodeInput" type="text" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX" maxlength="24" autocomplete="off" autocapitalize="characters" spellcheck="false" />
             <button class="primary" id="redeemShareBtn">Redeem</button>
           </div>
