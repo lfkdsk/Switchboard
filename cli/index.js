@@ -81,8 +81,8 @@ Usage:
   switchboard service <verb>   Linux: run in the background via systemd, starting
                                at boot. Verbs: install, uninstall, status.
 
-Your other machines (signed in; the target must allow peers):
-  switchboard nodes            List every machine on your account and what it's doing.
+Reachable machines (signed in; the target must allow peers):
+  switchboard nodes            List machines you own or that were shared with you.
   switchboard exec <node> <cmd…>
                                Run a command over there; its stdout, stderr and
                                exit code come back here.
@@ -94,7 +94,7 @@ Options:
   -t, --token <token>   Force anonymous mode with this token (min ${MIN_TOKEN_LEN} chars).
   -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
-      --no-peer         Refuse commands from your other machines (see below).
+      --no-peer         Refuse commands from peer machines (see below).
       --force           Start even if this machine already has a daemon running,
                         without asking first (see below).
   -v, --version         Print version and exit.
@@ -112,14 +112,13 @@ Environment (overridden by the flags above):
                                 Off by default: a session title summarises what
                                 you asked for, so it leaves this machine only
                                 when you opt in.
-  SWITCHBOARD_PEER=0            Refuse exec/shell from your other machines. On by
-                                default: they're yours, and your dashboard can
-                                already open a shell here. Turn it off for a host
-                                that should only ever be driven by hand.
+  SWITCHBOARD_PEER=0            Refuse exec/shell from peer machines. Browser
+                                terminals still work for you and anyone you have
+                                explicitly shared this machine with.
   SWITCHBOARD_FORCE=1           Same as --force.
 
 Notes:
-  Logged in → this machine shows up in your dashboard; only you can open its shell.
+  Logged in → this machine shows up in your dashboard; you may share it there.
   Anonymous → the token is the credential; anyone who has it gets a shell here.
   One daemon serves this machine at a time. If another one is already up — the
   menu-bar app, the systemd service, another terminal — starting this one takes
@@ -267,7 +266,7 @@ function peerContext() {
   const c = loadConfig();
   if (!c.agentToken) {
     console.error("\nNot signed in on this machine.\n\n" +
-      "Your other machines are account-scoped, so reaching them needs the same\n" +
+      "Reachable machines are identity-scoped, so reaching them needs the same\n" +
       "credential the daemon uses:\n\n  switchboard login\n");
     process.exit(1);
   }
@@ -824,10 +823,10 @@ function banner() {
     console.log("  Machine : " + MACHINE);
     console.log("  Open    : " + browseUrl + "   (your dashboard)");
     console.log("  Peers   : " + (PEER
-      ? "on — your other machines can `switchboard exec " + os.hostname() + "`"
-      : "off — no exec/shell from your other machines"));
+      ? "on — authorized peers can `switchboard exec " + os.hostname() + "`"
+      : "off — no exec/shell from peer machines"));
     console.log("");
-    console.log("  Signed in — only you can open this machine's shell.");
+    console.log("  Signed in — manage machine sharing from your dashboard.");
   } else {
     console.log("  Token : " + TOKEN);
     console.log("  Open  : " + browseUrl);

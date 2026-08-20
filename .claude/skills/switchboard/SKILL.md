@@ -17,14 +17,16 @@ description: >-
 
 A Switchboard daemon runs on a machine and dials *out* to a relay, so that
 machine is reachable without inbound ports or a VPN. Whoever holds the right
-credential — a browser, or another machine on the same account — connects to the
+credential — a browser, or an authorized peer machine — connects to the
 relay and is patched through. One machine + one relay = one **circuit**.
 
 Two credentials, and they behave differently:
 
 - **Account** (`switchboard login`) — the machine is bound to the user's GitHub
-  account, shows up in their dashboard, and *their other machines can reach it*.
-  This is what makes `nodes` / `exec` / `shell` work.
+  account, shows up in their dashboard, and can be shared through a ten-minute,
+  single-use code redeemed by another GitHub account. Owned and shared machines
+  both appear in `nodes`; `exec` / `shell`
+  additionally require the target's peer opt-in.
 - **Token** (`switchboard`, no login) — a one-off share. Anyone holding the token
   gets a shell there. No dashboard, no peer access. Good for pairing; not a
   thing to leave running.
@@ -46,7 +48,8 @@ what exists, what's online, and what each box is busy with.
   ● this-box    5aa71e33  this machine · peer off · 6ms · cpu 12%
 ```
 
-`--json` gives the same list machine-readably (`id`, `name`, `online`, `peer`,
+`--json` gives the same list machine-readably (`id`, `name`, `shared`, `owner`,
+`expiresAt`, `online`, `peer`,
 `lastSeenMsAgo`, `rtt`, `cpu`, `memUsed`, `memTotal`, `activity`) — use it when
 you need to branch on the answer rather than show it to someone.
 
@@ -164,7 +167,7 @@ to ask (a unit, the app, CI) logs the takeover and proceeds.
 | `SWITCHBOARD_SERVER` | relay origin (`-s/--server`). Default `https://shell.lfkdsk.org` |
 | `SWITCHBOARD_TOKEN` | force token mode with a fixed token (`-t/--token`, min 24 chars) |
 | `SWITCHBOARD_SHELL` | shell to spawn (`--shell`). Default `$SHELL` |
-| `SWITCHBOARD_PEER=0` | refuse `exec`/`shell` from the user's other machines (`--no-peer`) |
+| `SWITCHBOARD_PEER=0` | refuse `exec`/`shell` from peer machines (`--no-peer`) |
 | `SWITCHBOARD_FORCE=1` | start without the duplicate-daemon question (`--force`) |
 | `SWITCHBOARD_ACTIVITY=claude` | also report live Claude Code sessions to the dashboard (off by default: titles summarise what was asked) |
 | `~/.switchboard/config.json` | account credential + machine id (0600) |
@@ -177,14 +180,14 @@ to ask (a unit, the app, CI) logs the takeover and proceeds.
 | What you see | What it means | What to do |
 | --- | --- | --- |
 | `Not signed in on this machine.` | `nodes`/`exec`/`shell` need the account credential, not a token | `switchboard login` here |
-| `does not accept connections from your other machines` | the *target* was started with `SWITCHBOARD_PEER=0` | restart it without that; the relay enforces this, so there's no client-side way around it |
+| `does not accept peer connections` | the *target* was started with `SWITCHBOARD_PEER=0` | restart it without that; the relay enforces this, so there's no client-side way around it |
 | `“x” is offline (last seen …)` | no daemon connected there | start one over there, or check the box is awake |
 | `“x” matches 3 machines` | ambiguous prefix | use a longer prefix or the full id from `nodes` |
 | `already has a daemon connected on the relay` (409) | a relay that refuses newcomers rather than handing the circuit over (older or self-hosted) | stop the other daemon, or pick a different `--token` |
 | `relay rejected this machine (401)` | the stored credential is invalid or expired | `switchboard login` again |
 | `relay rejected this machine (403)` | this machine id is already owned by another account, and ownership doesn't transfer | log in as that account, or drop `machineId` from `~/.switchboard/config.json` so the next login mints a new one (the old row stays in that account's dashboard) |
 | `replaced by a newer daemon; exiting` | something else took the circuit — normal after a restart, suspicious otherwise | see who: `~/.switchboard/daemons.json` |
-| `doesn't support reaching your other machines yet` | the relay is older than peer support | deploy the relay first, then the CLI |
+| `doesn't support reaching peer machines yet` | the relay is older than peer support | deploy the relay first, then the CLI |
 | `npm install` fails building node-pty on Linux | no toolchain (there are no Linux prebuilds) | `apt install -y python3 make g++`, or the distro equivalent |
 | unit vanishes after a while | it was installed from npx's cache, which npm evicts | `npm i -g @switch-board/cli`, then reinstall the service |
 

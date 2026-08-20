@@ -1,5 +1,6 @@
 /**
- * D1-backed registry: machines, agent tokens, and the CLI-login handshake.
+ * D1-backed registry: machines, delegated access, agent tokens, and the
+ * CLI-login handshake.
  * The relay stays a transparent forwarder for terminal traffic; this module is
  * only the account/ownership bookkeeping around it.
  */
@@ -71,26 +72,67 @@ export async function updateMachineStats(env, machineId, s) {
     machineId,
   ).run();
 }
-// Who owns this machine, and does it take peer connections? One row read answers
-// both questions the /ws gate asks, so it stays one round-trip to D1.
-export async function machineAccess(env, machineId) {
+// Owner or live grantee. A browser grant is full shell access; `peer` remains a
+// separate host-side opt-in that the Worker applies to agent-token clients.
+// Re-evaluated on every connection so a week-long session cookie never caches a
+// revoked grant.
+export async function machineAccess(env, machineId, accountId) {
   const row = await env.DB.prepare(
     "SELECT account_id, peer FROM machines WHERE machine_id=?",
   ).bind(machineId).first();
-  return row ? { accountId: row.account_id, peer: !!row.peer } : null;
+  if (!row) return null;
+  if (row.account_id === accountId) {
+    return { accountId: row.account_id, peer: !!row.peer, via: "owner", expiresAt: null };
+  }
+  const grant = await env.DB.prepare(
+    `SELECT expires_at FROM machine_grants
+      WHERE machine_id=? AND grantee_id=? AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ?)`,
+  ).bind(machineId, accountId, Date.now()).first();
+  return grant
+    ? { accountId: row.account_id, peer: !!row.peer, via: "grant", expiresAt: grant.expires_at ?? null }
+    : null;
 }
-export async function listMachines(env, accountId) {
-  const { results } = await env.DB.prepare(
-    // Stable order: created_at never changes, so rows keep a fixed position.
-    // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
-    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity, peer FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
-  ).bind(accountId).all();
-  // Hand the client a parsed object; a row written by an older daemon has none.
+
+const MACHINE_COLS = "machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity, peer";
+
+function withActivity(results) {
   return (results || []).map((r) => {
     let activity = null;
     if (r.activity) { try { activity = JSON.parse(r.activity); } catch {} }
     return { ...r, activity, peer: !!r.peer, online: isOnline(r.last_seen) };
   });
+}
+
+export async function listMachines(env, accountId) {
+  const { results } = await env.DB.prepare(
+    // Stable order: created_at never changes, so rows keep a fixed position.
+    // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
+    `SELECT ${MACHINE_COLS} FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC`,
+  ).bind(accountId).all();
+  return withActivity(results);
+}
+
+// Machines shared with an account, shaped like owned machines plus the owner
+// and expiry labels the dashboard/CLI need to explain why each row is visible.
+export async function listSharedWithMe(env, accountId) {
+  const cols = MACHINE_COLS.split(", ").map((c) => "m." + c).join(", ");
+  const { results } = await env.DB.prepare(
+    `SELECT ${cols}, m.account_login AS owner_login, g.expires_at
+       FROM machine_grants g JOIN machines m ON m.machine_id=g.machine_id
+      WHERE g.grantee_id=? AND g.revoked_at IS NULL
+        AND (g.expires_at IS NULL OR g.expires_at > ?)
+      ORDER BY m.created_at ASC, m.machine_id ASC`,
+  ).bind(accountId, Date.now()).all();
+  return withActivity(results).map((m) => ({ ...m, shared: true }));
+}
+
+export async function listReachableMachines(env, accountId) {
+  const [owned, shared] = await Promise.all([
+    listMachines(env, accountId),
+    listSharedWithMe(env, accountId),
+  ]);
+  return owned.concat(shared);
 }
 
 // A machine is "online" while its heartbeat stays fresh — the `online` column is
@@ -110,8 +152,156 @@ export async function deleteMachine(env, machineId, accountId) {
   ).bind(machineId).first();
   if (!row || row.account_id !== accountId) return { ok: false, reason: "not-found" };
   if (isOnline(row.last_seen)) return { ok: false, reason: "online" };
-  await env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId).run();
+  // A host keeps its machine id across reinstalls. Delete grants with the row so
+  // re-registering that id cannot revive access the owner believed was removed.
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM machine_share_codes WHERE machine_id=?").bind(machineId),
+    env.DB.prepare("DELETE FROM machine_grants WHERE machine_id=?").bind(machineId),
+    env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId),
+  ]);
   return { ok: true };
+}
+
+// ---- delegated machine access -------------------------------------------
+// A grant widens who may open the machine; ownership never moves. Only the
+// owner may create a share code. The signed-in recipient redeems it into a
+// grant, and may later leave, but cannot share onward.
+
+async function machineOwner(env, machineId) {
+  const row = await env.DB.prepare(
+    "SELECT account_id, account_login FROM machines WHERE machine_id=?",
+  ).bind(machineId).first();
+  return row || null;
+}
+
+const SHARE_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const SHARE_CODE_LENGTH = 20; // 100 bits; compact enough to copy, infeasible to guess
+const SHARE_CODE_TTL_MS = 10 * 60 * 1000;
+
+function newShareCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(SHARE_CODE_LENGTH));
+  return [...bytes].map((b) => SHARE_CODE_ALPHABET[b & 31]).join("");
+}
+function normalizeShareCode(code) {
+  const raw = String(code || "").toUpperCase().replace(/[\s-]/g, "");
+  return raw.length === SHARE_CODE_LENGTH && [...raw].every((c) => SHARE_CODE_ALPHABET.includes(c)) ? raw : null;
+}
+function formatShareCode(raw) {
+  return raw.match(/.{1,4}/g).join("-");
+}
+function changed(result) {
+  return Number(result?.meta?.changes ?? result?.changes ?? 0);
+}
+
+export async function createShareCode(env, machineId, ownerId, accessExpiresAt = null) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || owner.account_id !== ownerId) return { ok: false, reason: "not-found" };
+
+  const now = Date.now();
+  if (accessExpiresAt != null && (!Number.isFinite(accessExpiresAt) || accessExpiresAt <= now)) {
+    return { ok: false, reason: "bad-expiry" };
+  }
+  const raw = newShareCode();
+  const codeHash = await sha256hex(raw);
+  const expiresAt = now + SHARE_CODE_TTL_MS;
+
+  await env.DB.prepare(
+    `INSERT INTO machine_share_codes
+       (code_hash, machine_id, created_by_id, created_by_login, created_at, expires_at, access_expires_at)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).bind(codeHash, machineId, owner.account_id, owner.account_login, now, expiresAt, accessExpiresAt).run();
+  // Opportunistic cleanup keeps this ephemeral table small without a cron.
+  await env.DB.prepare(
+    "DELETE FROM machine_share_codes WHERE expires_at<=? OR (redeemed_at IS NOT NULL AND redeemed_at<=?)",
+  ).bind(now, now - 86400000).run();
+
+  return {
+    ok: true,
+    share: { code: formatShareCode(raw), expires_at: expiresAt, access_expires_at: accessExpiresAt },
+  };
+}
+
+export async function redeemShareCode(env, code, account) {
+  const raw = normalizeShareCode(code);
+  if (!raw || !account?.id || !account?.login) return { ok: false, reason: "invalid" };
+  const codeHash = await sha256hex(raw);
+  const now = Date.now();
+  const share = await env.DB.prepare(
+    `SELECT machine_id, access_expires_at
+       FROM machine_share_codes
+      WHERE code_hash=? AND redeemed_at IS NULL AND expires_at>?
+        AND (access_expires_at IS NULL OR access_expires_at>?)`,
+  ).bind(codeHash, now, now).first();
+  if (!share) return { ok: false, reason: "invalid" };
+
+  const owner = await machineOwner(env, share.machine_id);
+  if (!owner) return { ok: false, reason: "invalid" };
+  if (owner.account_id === account.id) return { ok: false, reason: "self" };
+
+  // Claim first with a conditional write. A concurrent redeemer then changes
+  // zero rows and cannot receive a grant.
+  const claim = await env.DB.prepare(
+    `UPDATE machine_share_codes
+        SET redeemed_at=?, redeemed_by_id=?, redeemed_by_login=?
+      WHERE code_hash=? AND redeemed_at IS NULL AND expires_at>?
+        AND (access_expires_at IS NULL OR access_expires_at>?)`,
+  ).bind(now, account.id, account.login, codeHash, now, now).run();
+  if (changed(claim) !== 1) return { ok: false, reason: "invalid" };
+
+  await env.DB.prepare(
+    `INSERT INTO machine_grants
+       (machine_id, grantee_id, grantee_login, granted_by_id, granted_by_login, created_at, expires_at, revoked_at)
+     VALUES (?,?,?,?,?,?,?,NULL)
+     ON CONFLICT (machine_id, grantee_id) DO UPDATE SET
+       grantee_login=excluded.grantee_login,
+       granted_by_id=excluded.granted_by_id,
+       granted_by_login=excluded.granted_by_login,
+       created_at=excluded.created_at,
+       expires_at=excluded.expires_at,
+       revoked_at=NULL`,
+  ).bind(
+    share.machine_id, account.id, account.login, owner.account_id, owner.account_login,
+    now, share.access_expires_at ?? null,
+  ).run();
+
+  return {
+    ok: true,
+    grant: {
+      machine_id: share.machine_id,
+      owner_login: owner.account_login,
+      grantee_id: account.id,
+      grantee_login: account.login,
+      created_at: now,
+      expires_at: share.access_expires_at ?? null,
+    },
+  };
+}
+
+export async function revokeGrant(env, machineId, granteeId, callerId) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || (owner.account_id !== callerId && granteeId !== callerId)) {
+    return { ok: false, reason: "not-found" };
+  }
+  const row = await env.DB.prepare(
+    "SELECT revoked_at FROM machine_grants WHERE machine_id=? AND grantee_id=?",
+  ).bind(machineId, granteeId).first();
+  if (!row || row.revoked_at != null) return { ok: false, reason: "not-found" };
+  await env.DB.prepare(
+    "UPDATE machine_grants SET revoked_at=? WHERE machine_id=? AND grantee_id=?",
+  ).bind(Date.now(), machineId, granteeId).run();
+  return { ok: true };
+}
+
+export async function listGrants(env, machineId, ownerId) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || owner.account_id !== ownerId) return null;
+  const { results } = await env.DB.prepare(
+    `SELECT grantee_id, grantee_login, created_at, expires_at
+       FROM machine_grants
+      WHERE machine_id=? AND revoked_at IS NULL
+      ORDER BY created_at ASC`,
+  ).bind(machineId).all();
+  return results || [];
 }
 
 // ---- CLI-login handshake (PKCE-like) -------------------------------------

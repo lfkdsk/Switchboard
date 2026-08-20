@@ -28,6 +28,40 @@ CREATE TABLE IF NOT EXISTS machines (
 );
 CREATE INDEX IF NOT EXISTS idx_machines_account ON machines(account_id);
 
+-- Delegated access. A machine still has exactly one owner; a live row here lets
+-- another GitHub account open its terminal and, when peer is enabled on the
+-- host, reach it through `switchboard exec` / `switchboard shell` as well.
+-- Numeric GitHub ids are the authority; logins are display-only snapshots.
+CREATE TABLE IF NOT EXISTS machine_grants (
+  machine_id       TEXT NOT NULL,
+  grantee_id       TEXT NOT NULL,
+  grantee_login    TEXT NOT NULL,
+  granted_by_id    TEXT NOT NULL,
+  granted_by_login TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  expires_at       INTEGER,            -- NULL = no automatic expiry
+  revoked_at       INTEGER,            -- NULL = live
+  PRIMARY KEY (machine_id, grantee_id)
+);
+CREATE INDEX IF NOT EXISTS idx_machine_grants_grantee ON machine_grants(grantee_id);
+
+-- Short-lived, single-use invitations. Only the SHA-256 hash is stored; the
+-- plaintext code is shown once to the owner and becomes a grant only when a
+-- signed-in recipient redeems it.
+CREATE TABLE IF NOT EXISTS machine_share_codes (
+  code_hash         TEXT PRIMARY KEY,
+  machine_id        TEXT NOT NULL,
+  created_by_id     TEXT NOT NULL,
+  created_by_login  TEXT NOT NULL,
+  created_at        INTEGER NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  access_expires_at INTEGER,
+  redeemed_at       INTEGER,
+  redeemed_by_id    TEXT,
+  redeemed_by_login TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_machine_share_codes_machine ON machine_share_codes(machine_id);
+
 -- Account-scoped agent tokens the CLI presents to register/connect a machine.
 -- Only the SHA-256 hash is stored; the plaintext lives in the CLI's config.
 CREATE TABLE IF NOT EXISTS agent_tokens (

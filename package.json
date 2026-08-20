@@ -3,12 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "description": "Switchboard — a self-hosted Cloudflare relay for the @elsetech/webterm daemon.",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "node --experimental-default-type=module --test tests/*.test.mjs"
   },
   "devDependencies": {
-    "wrangler": "^4.20.0"
+    "wrangler": "^4.124.0"
   }
 }

@@ -1,5 +1,5 @@
 /**
- * Peer commands — the machines on your account, from a machine on your account.
+ * Peer commands — machines this account can reach, from a signed-in machine.
  *
  * The dashboard has always been able to see every host you've bound and open a
  * shell on any of them. This is the same capability without the browser: the
@@ -11,8 +11,8 @@
  * a real exit code, so Claude Code running on your laptop can use another host
  * the same way it uses a local shell.
  *
- * Reaching a machine needs two yeses: the relay checks that the target belongs
- * to the same account, and the target itself must have declared `peer` on
+ * Reaching a machine needs two yeses: the relay checks ownership or an explicit
+ * cross-account grant, and the target itself must have declared `peer` on
  * connect (SWITCHBOARD_PEER). We are only ever the client here — the daemon in
  * index.js is what answers.
  */
@@ -34,11 +34,11 @@ async function fetchNodes(ctx) {
   // A relay that predates peer support has no /api/nodes at all, and "404" on
   // its own would send you looking for a missing machine instead of an old relay.
   if (r.status === 404) {
-    fail(`The relay at ${ctx.server} doesn't support reaching your other machines yet.\n\n` +
+    fail(`The relay at ${ctx.server} doesn't support reaching peer machines yet.\n\n` +
       "It needs deploying from a version of Switchboard that has it (relay first,\n" +
       "then the CLI — the machines themselves can update whenever).");
   }
-  if (!r.ok) fail(`Relay error ${r.status} listing your machines.`);
+  if (!r.ok) fail(`Relay error ${r.status} listing reachable machines.`);
   let body;
   // Anything but JSON here means we're not talking to a Switchboard relay — a
   // captive portal, a proxy error page, a typo'd --server. Say that, rather than
@@ -85,7 +85,7 @@ function match(nodes, selector) {
 async function pickNode(ctx, selector, { needOnline = true } = {}) {
   const { nodes, skew } = await fetchNodes(ctx);
   if (!nodes.length) {
-    fail("No machines on this account yet.\nRun `switchboard login` on the machines you want to reach.");
+    fail("No reachable machines yet.\nRun `switchboard login` on a machine, or ask its owner to share one with you.");
   }
   const hits = match(nodes, selector);
   if (!hits.length) {
@@ -101,7 +101,7 @@ async function pickNode(ctx, selector, { needOnline = true } = {}) {
     fail(`“${label(node, ctx)}” is offline (last seen ${ago(node.last_seen, skew)}).`);
   }
   if (needOnline && !node.peer) {
-    fail(`“${label(node, ctx)}” does not accept connections from your other machines.\n\n` +
+    fail(`“${label(node, ctx)}” does not accept peer connections.\n\n` +
       "Its daemon was started with SWITCHBOARD_PEER=0 (or predates peer support).\n" +
       "Restart it without that to allow this.");
   }
@@ -111,7 +111,8 @@ async function pickNode(ctx, selector, { needOnline = true } = {}) {
 function label(n, ctx) {
   const short = n.machine_id.slice(0, 8);
   const name = n.name || "(unnamed)";
-  return n.machine_id === ctx.machineId ? `${name} [${short}] (this machine)` : `${name} [${short}]`;
+  if (n.machine_id === ctx.machineId) return `${name} [${short}] (this machine)`;
+  return `${name} [${short}]${n.shared ? ` (shared by @${n.owner_login})` : ""}`;
 }
 
 // ---- switchboard nodes ---------------------------------------------------
@@ -122,6 +123,9 @@ async function cmdNodes(ctx, opts) {
       id: n.machine_id,
       name: n.name || null,
       self: n.machine_id === ctx.machineId,
+      shared: !!n.shared,
+      owner: n.shared ? n.owner_login : null,
+      expiresAt: n.shared ? (n.expires_at ?? null) : null,
       online: !!n.online,
       peer: !!n.peer,
       lastSeenMsAgo: Math.max(0, Date.now() - skew - n.last_seen),
@@ -147,6 +151,7 @@ async function cmdNodes(ctx, opts) {
     // Both, when both apply: "this machine" on its own would quietly hide that
     // this is the one host on the list refusing the commands you're about to type.
     if (!n.peer) notes.unshift("peer off");
+    if (n.shared) notes.unshift(`shared by @${n.owner_login}`);
     if (self) notes.unshift("this machine");
     console.log(`  ${dot} ${name}  ${n.machine_id.slice(0, 8)}  ${notes.join(" · ")}`);
   }
@@ -213,8 +218,11 @@ async function cmdExec(ctx, opts) {
     if (text === "pong") return;
     let m;
     try { m = JSON.parse(text); } catch { return; }
-    if (m.type === "_relay" && m.event === "daemon-offline") {
-      return finish(255, `\nHost ${node.name || node.machine_id} went offline.`);
+    if (m.type === "_relay") {
+      if (m.event === "daemon-offline") return finish(255, `\nHost ${node.name || node.machine_id} went offline.`);
+      if (m.event === "access-revoked" || m.event === "access-expired") {
+        return finish(255, `\nMachine access ${m.event === "access-expired" ? "expired" : "was revoked"}.`);
+      }
     }
     if (m.id !== id) return; // stats, other callers' output, someone else's shell
     switch (m.type) {
@@ -312,6 +320,9 @@ async function cmdShell(ctx, opts) {
         break;
       case "_relay":
         if (m.event === "daemon-offline") leave(`[${name} went offline]`, 255);
+        else if (m.event === "access-revoked" || m.event === "access-expired") {
+          leave(`[machine access ${m.event === "access-expired" ? "expired" : "was revoked"}]`, 255);
+        }
         break;
     }
   });
