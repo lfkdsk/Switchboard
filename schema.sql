@@ -45,6 +45,23 @@ CREATE TABLE IF NOT EXISTS machine_grants (
 );
 CREATE INDEX IF NOT EXISTS idx_machine_grants_grantee ON machine_grants(grantee_id);
 
+-- Short-lived, single-use invitations. Only the SHA-256 hash is stored; the
+-- plaintext code is shown once to the owner and becomes a grant only when a
+-- signed-in recipient redeems it.
+CREATE TABLE IF NOT EXISTS machine_share_codes (
+  code_hash         TEXT PRIMARY KEY,
+  machine_id        TEXT NOT NULL,
+  created_by_id     TEXT NOT NULL,
+  created_by_login  TEXT NOT NULL,
+  created_at        INTEGER NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  access_expires_at INTEGER,
+  redeemed_at       INTEGER,
+  redeemed_by_id    TEXT,
+  redeemed_by_login TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_machine_share_codes_machine ON machine_share_codes(machine_id);
+
 -- Account-scoped agent tokens the CLI presents to register/connect a machine.
 -- Only the SHA-256 hash is stored; the plaintext lives in the CLI's config.
 CREATE TABLE IF NOT EXISTS agent_tokens (

@@ -23,8 +23,9 @@ relay and is patched through. One machine + one relay = one **circuit**.
 Two credentials, and they behave differently:
 
 - **Account** (`switchboard login`) — the machine is bound to the user's GitHub
-  account, shows up in their dashboard, and can be shared with another GitHub
-  account. Owned and shared machines both appear in `nodes`; `exec` / `shell`
+  account, shows up in their dashboard, and can be shared through a ten-minute,
+  single-use code redeemed by another GitHub account. Owned and shared machines
+  both appear in `nodes`; `exec` / `shell`
   additionally require the target's peer opt-in.
 - **Token** (`switchboard`, no login) — a one-off share. Anyone holding the token
   gets a shell there. No dashboard, no peer access. Good for pairing; not a

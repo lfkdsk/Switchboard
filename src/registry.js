@@ -5,8 +5,6 @@
  * only the account/ownership bookkeeping around it.
  */
 
-import { githubUserByLogin } from "./auth.js";
-
 const enc = new TextEncoder();
 
 async function sha256hex(str) {
@@ -157,6 +155,7 @@ export async function deleteMachine(env, machineId, accountId) {
   // A host keeps its machine id across reinstalls. Delete grants with the row so
   // re-registering that id cannot revive access the owner believed was removed.
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM machine_share_codes WHERE machine_id=?").bind(machineId),
     env.DB.prepare("DELETE FROM machine_grants WHERE machine_id=?").bind(machineId),
     env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId),
   ]);
@@ -165,7 +164,8 @@ export async function deleteMachine(env, machineId, accountId) {
 
 // ---- delegated machine access -------------------------------------------
 // A grant widens who may open the machine; ownership never moves. Only the
-// owner may grant/re-grant. The grantee may leave, but cannot share onward.
+// owner may create a share code. The signed-in recipient redeems it into a
+// grant, and may later leave, but cannot share onward.
 
 async function machineOwner(env, machineId) {
   const row = await env.DB.prepare(
@@ -174,17 +174,79 @@ async function machineOwner(env, machineId) {
   return row || null;
 }
 
-export async function grantMachine(env, machineId, ownerId, granteeLogin, expiresAt = null) {
+const SHARE_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const SHARE_CODE_LENGTH = 20; // 100 bits; compact enough to copy, infeasible to guess
+const SHARE_CODE_TTL_MS = 10 * 60 * 1000;
+
+function newShareCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(SHARE_CODE_LENGTH));
+  return [...bytes].map((b) => SHARE_CODE_ALPHABET[b & 31]).join("");
+}
+function normalizeShareCode(code) {
+  const raw = String(code || "").toUpperCase().replace(/[\s-]/g, "");
+  return raw.length === SHARE_CODE_LENGTH && [...raw].every((c) => SHARE_CODE_ALPHABET.includes(c)) ? raw : null;
+}
+function formatShareCode(raw) {
+  return raw.match(/.{1,4}/g).join("-");
+}
+function changed(result) {
+  return Number(result?.meta?.changes ?? result?.changes ?? 0);
+}
+
+export async function createShareCode(env, machineId, ownerId, accessExpiresAt = null) {
   const owner = await machineOwner(env, machineId);
   if (!owner || owner.account_id !== ownerId) return { ok: false, reason: "not-found" };
 
   const now = Date.now();
-  if (expiresAt != null && (!Number.isFinite(expiresAt) || expiresAt <= now)) {
+  if (accessExpiresAt != null && (!Number.isFinite(accessExpiresAt) || accessExpiresAt <= now)) {
     return { ok: false, reason: "bad-expiry" };
   }
-  const gh = await githubUserByLogin(String(granteeLogin || "").trim());
-  if (!gh) return { ok: false, reason: "unknown-login" };
-  if (gh.id === ownerId) return { ok: false, reason: "self" };
+  const raw = newShareCode();
+  const codeHash = await sha256hex(raw);
+  const expiresAt = now + SHARE_CODE_TTL_MS;
+
+  await env.DB.prepare(
+    `INSERT INTO machine_share_codes
+       (code_hash, machine_id, created_by_id, created_by_login, created_at, expires_at, access_expires_at)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).bind(codeHash, machineId, owner.account_id, owner.account_login, now, expiresAt, accessExpiresAt).run();
+  // Opportunistic cleanup keeps this ephemeral table small without a cron.
+  await env.DB.prepare(
+    "DELETE FROM machine_share_codes WHERE expires_at<=? OR (redeemed_at IS NOT NULL AND redeemed_at<=?)",
+  ).bind(now, now - 86400000).run();
+
+  return {
+    ok: true,
+    share: { code: formatShareCode(raw), expires_at: expiresAt, access_expires_at: accessExpiresAt },
+  };
+}
+
+export async function redeemShareCode(env, code, account) {
+  const raw = normalizeShareCode(code);
+  if (!raw || !account?.id || !account?.login) return { ok: false, reason: "invalid" };
+  const codeHash = await sha256hex(raw);
+  const now = Date.now();
+  const share = await env.DB.prepare(
+    `SELECT machine_id, access_expires_at
+       FROM machine_share_codes
+      WHERE code_hash=? AND redeemed_at IS NULL AND expires_at>?
+        AND (access_expires_at IS NULL OR access_expires_at>?)`,
+  ).bind(codeHash, now, now).first();
+  if (!share) return { ok: false, reason: "invalid" };
+
+  const owner = await machineOwner(env, share.machine_id);
+  if (!owner) return { ok: false, reason: "invalid" };
+  if (owner.account_id === account.id) return { ok: false, reason: "self" };
+
+  // Claim first with a conditional write. A concurrent redeemer then changes
+  // zero rows and cannot receive a grant.
+  const claim = await env.DB.prepare(
+    `UPDATE machine_share_codes
+        SET redeemed_at=?, redeemed_by_id=?, redeemed_by_login=?
+      WHERE code_hash=? AND redeemed_at IS NULL AND expires_at>?
+        AND (access_expires_at IS NULL OR access_expires_at>?)`,
+  ).bind(now, account.id, account.login, codeHash, now, now).run();
+  if (changed(claim) !== 1) return { ok: false, reason: "invalid" };
 
   await env.DB.prepare(
     `INSERT INTO machine_grants
@@ -197,11 +259,21 @@ export async function grantMachine(env, machineId, ownerId, granteeLogin, expire
        created_at=excluded.created_at,
        expires_at=excluded.expires_at,
        revoked_at=NULL`,
-  ).bind(machineId, gh.id, gh.login, owner.account_id, owner.account_login, now, expiresAt).run();
+  ).bind(
+    share.machine_id, account.id, account.login, owner.account_id, owner.account_login,
+    now, share.access_expires_at ?? null,
+  ).run();
 
   return {
     ok: true,
-    grant: { grantee_id: gh.id, grantee_login: gh.login, created_at: now, expires_at: expiresAt },
+    grant: {
+      machine_id: share.machine_id,
+      owner_login: owner.account_login,
+      grantee_id: account.id,
+      grantee_login: account.login,
+      created_at: now,
+      expires_at: share.access_expires_at ?? null,
+    },
   };
 }
 

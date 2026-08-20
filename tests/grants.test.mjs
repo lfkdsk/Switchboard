@@ -1,15 +1,13 @@
-import test, { afterEach } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  createShareCode,
   deleteMachine,
-  grantMachine,
   listGrants,
   machineAccess,
+  redeemShareCode,
   revokeGrant,
 } from "../src/registry.js";
-
-const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
 
 function sqlKey(sql) {
   return sql.replace(/\s+/g, " ").trim();
@@ -46,6 +44,12 @@ class Statement {
       const machine = this.db.machines.get(this.args[0]);
       return machine ? { account_id: machine.account_id, last_seen: machine.last_seen } : null;
     }
+    if (this.sql.startsWith("SELECT machine_id, access_expires_at FROM machine_share_codes")) {
+      const share = this.db.shareCodes.get(this.args[0]);
+      if (!share || share.redeemed_at != null || share.expires_at <= this.args[1]) return null;
+      if (share.access_expires_at != null && share.access_expires_at <= this.args[2]) return null;
+      return { machine_id: share.machine_id, access_expires_at: share.access_expires_at };
+    }
     throw new Error("Unhandled first(): " + this.sql);
   }
 
@@ -63,29 +67,64 @@ class Statement {
   }
 
   async run() {
+    if (this.sql.startsWith("INSERT INTO machine_share_codes")) {
+      const [code_hash, machine_id, created_by_id, created_by_login, created_at, expires_at, access_expires_at] = this.args;
+      this.db.shareCodes.set(code_hash, {
+        code_hash, machine_id, created_by_id, created_by_login, created_at,
+        expires_at, access_expires_at, redeemed_at: null,
+        redeemed_by_id: null, redeemed_by_login: null,
+      });
+      return { meta: { changes: 1 } };
+    }
+    if (this.sql.startsWith("UPDATE machine_share_codes SET redeemed_at")) {
+      const [redeemed_at, redeemed_by_id, redeemed_by_login, codeHash, now, accessNow] = this.args;
+      const share = this.db.shareCodes.get(codeHash);
+      if (!share || share.redeemed_at != null || share.expires_at <= now
+        || (share.access_expires_at != null && share.access_expires_at <= accessNow)) {
+        return { meta: { changes: 0 } };
+      }
+      Object.assign(share, { redeemed_at, redeemed_by_id, redeemed_by_login });
+      return { meta: { changes: 1 } };
+    }
+    if (this.sql.startsWith("DELETE FROM machine_share_codes WHERE machine_id")) {
+      const machineId = this.args[0];
+      for (const [key, share] of this.db.shareCodes) {
+        if (share.machine_id === machineId) this.db.shareCodes.delete(key);
+      }
+      return { meta: { changes: 1 } };
+    }
+    if (this.sql.startsWith("DELETE FROM machine_share_codes WHERE expires_at")) {
+      const [now, redeemedBefore] = this.args;
+      for (const [key, share] of this.db.shareCodes) {
+        if (share.expires_at <= now || (share.redeemed_at != null && share.redeemed_at <= redeemedBefore)) {
+          this.db.shareCodes.delete(key);
+        }
+      }
+      return { meta: { changes: 0 } };
+    }
     if (this.sql.startsWith("INSERT INTO machine_grants")) {
       const [machine_id, grantee_id, grantee_login, granted_by_id, granted_by_login, created_at, expires_at] = this.args;
       this.db.grants.set(`${machine_id}:${grantee_id}`, {
         machine_id, grantee_id, grantee_login, granted_by_id, granted_by_login,
         created_at, expires_at, revoked_at: null,
       });
-      return { success: true };
+      return { meta: { changes: 1 } };
     }
     if (this.sql.startsWith("UPDATE machine_grants SET revoked_at")) {
       const [revoked_at, machineId, granteeId] = this.args;
       this.db.grants.get(`${machineId}:${granteeId}`).revoked_at = revoked_at;
-      return { success: true };
+      return { meta: { changes: 1 } };
     }
     if (this.sql.startsWith("DELETE FROM machine_grants")) {
       const machineId = this.args[0];
       for (const [key, grant] of this.db.grants) {
         if (grant.machine_id === machineId) this.db.grants.delete(key);
       }
-      return { success: true };
+      return { meta: { changes: 1 } };
     }
     if (this.sql.startsWith("DELETE FROM machines")) {
       this.db.machines.delete(this.args[0]);
-      return { success: true };
+      return { meta: { changes: 1 } };
     }
     throw new Error("Unhandled run(): " + this.sql);
   }
@@ -95,10 +134,11 @@ class FakeDB {
   constructor() {
     this.machines = new Map();
     this.grants = new Map();
+    this.shareCodes = new Map();
   }
   prepare(sql) { return new Statement(this, sql); }
   async batch(statements) {
-    for (const statement of statements) await statement.run();
+    return Promise.all(statements.map((statement) => statement.run()));
   }
 }
 
@@ -114,17 +154,16 @@ function envWithMachine(overrides = {}) {
   return { DB };
 }
 
-test("grant uses GitHub's stable id and authorizes owner and grantee", async () => {
+test("a one-time code binds access to the signed-in recipient", async () => {
   const env = envWithMachine();
-  globalThis.fetch = async (url) => {
-    assert.equal(url, "https://api.github.com/users/Bob");
-    return new Response(JSON.stringify({ id: 202, login: "bob" }), {
-      headers: { "content-type": "application/json" },
-    });
-  };
+  const expiresAt = Date.now() + 86400000;
+  const created = await createShareCode(env, "machine-1", "owner-1", expiresAt);
+  assert.equal(created.ok, true);
+  assert.match(created.share.code, /^[0-9A-HJKMNP-TV-Z]{4}(?:-[0-9A-HJKMNP-TV-Z]{4}){4}$/);
+  assert.equal(created.share.access_expires_at, expiresAt);
+  assert.equal(JSON.stringify([...env.DB.shareCodes.values()]).includes(created.share.code.replaceAll("-", "")), false);
 
-  const expiresAt = Date.now() + 60_000;
-  const result = await grantMachine(env, "machine-1", "owner-1", "Bob", expiresAt);
+  const result = await redeemShareCode(env, created.share.code.toLowerCase(), { id: "202", login: "bob" });
   assert.equal(result.ok, true);
   assert.equal(result.grant.grantee_id, "202");
   assert.equal(result.grant.grantee_login, "bob");
@@ -137,6 +176,20 @@ test("grant uses GitHub's stable id and authorizes owner and grantee", async () 
   });
   assert.equal((await listGrants(env, "machine-1", "owner-1")).length, 1);
   assert.equal(await listGrants(env, "machine-1", "somebody-else"), null);
+  assert.deepEqual(await redeemShareCode(env, created.share.code, { id: "303", login: "eve" }), {
+    ok: false, reason: "invalid",
+  });
+});
+
+test("an owner cannot redeem their own code or create one for another owner's machine", async () => {
+  const env = envWithMachine();
+  assert.deepEqual(await createShareCode(env, "machine-1", "stranger"), { ok: false, reason: "not-found" });
+  const created = await createShareCode(env, "machine-1", "owner-1");
+  assert.equal(created.ok, true);
+  assert.deepEqual(await redeemShareCode(env, created.share.code, { id: "owner-1", login: "owner" }), {
+    ok: false, reason: "self",
+  });
+  assert.equal((await redeemShareCode(env, created.share.code, { id: "guest-1", login: "guest" })).ok, true);
 });
 
 test("expired grants fail closed and revocation is owner-or-self only", async () => {
@@ -161,7 +214,9 @@ test("deleting an offline machine also deletes every grant", async () => {
   env.DB.grants.set("machine-1:grantee-1", {
     machine_id: "machine-1", grantee_id: "grantee-1", revoked_at: null,
   });
+  env.DB.shareCodes.set("code-hash", { machine_id: "machine-1", expires_at: Date.now() + 60000, redeemed_at: null });
   assert.deepEqual(await deleteMachine(env, "machine-1", "owner-1"), { ok: true });
   assert.equal(env.DB.machines.size, 0);
   assert.equal(env.DB.grants.size, 0);
+  assert.equal(env.DB.shareCodes.size, 0);
 });

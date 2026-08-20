@@ -20,7 +20,7 @@ import {
   cliStart, cliComplete, cliPoll,
   listMachines, listSharedWithMe, listReachableMachines, deleteMachine,
   verifyAgentToken, registerMachine, machineAccess,
-  grantMachine, revokeGrant, listGrants,
+  createShareCode, redeemShareCode, revokeGrant, listGrants,
 } from "./registry.js";
 
 export { Circuit };
@@ -96,17 +96,25 @@ export default {
       const grants = await listGrants(env, machineId, s.id);
       return grants ? json({ grants }) : json({ error: "not found" }, 404);
     }
-    if (p === "/api/machines/grant" && request.method === "POST") {
+    if (p === "/api/share-codes" && request.method === "POST") {
       const s = await getSession(request, env);
       if (!s) return json({ error: "not signed in" }, 401);
       const b = await safeJson(request);
-      if (!b || !b.machine_id || !b.login) return json({ error: "missing machine_id/login" }, 400);
-      const r = await grantMachine(env, b.machine_id, s.id, b.login, b.expires_at ?? null);
-      if (r.ok) return json({ ok: true, grant: r.grant });
-      if (r.reason === "unknown-login") return json({ error: "no such github user" }, 404);
-      if (r.reason === "self") return json({ error: "you already own this machine" }, 400);
+      if (!b || !b.machine_id) return json({ error: "missing machine_id" }, 400);
+      const r = await createShareCode(env, b.machine_id, s.id, b.expires_at ?? null);
+      if (r.ok) return json({ ok: true, share: r.share }, 200, { "cache-control": "no-store" });
       if (r.reason === "bad-expiry") return json({ error: "expires_at must be a future timestamp" }, 400);
       return json({ error: "not found" }, 404);
+    }
+    if (p === "/api/share-codes/redeem" && request.method === "POST") {
+      const s = await getSession(request, env);
+      if (!s) return json({ error: "not signed in" }, 401);
+      const b = await safeJson(request);
+      if (!b || !b.code) return json({ error: "missing code" }, 400);
+      const r = await redeemShareCode(env, b.code, { id: s.id, login: s.login });
+      if (r.ok) return json({ ok: true, grant: r.grant });
+      if (r.reason === "self") return json({ error: "you already own this machine" }, 400);
+      return json({ error: "invalid or expired code" }, 404);
     }
     if (p === "/api/machines/revoke" && request.method === "POST") {
       const s = await getSession(request, env);

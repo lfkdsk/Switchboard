@@ -76,9 +76,9 @@ quick remote help. No sign-in required; the token *is* the key (see
 - **📊 All your machines, one dashboard** — sign in with GitHub and every machine
   you've bound is listed with live status: online/offline, round-trip latency,
   CPU, memory, and last-seen.
-- **🤝 Share by GitHub identity** — give another GitHub user access to one
-  machine without handing over a bearer URL. Set an expiry or revoke it later;
-  their existing connections are closed immediately on revoke.
+- **🤝 Share by one-time code** — generate a ten-minute, single-use invitation
+  for one machine. The recipient redeems it while signed in, so access binds to
+  their GitHub identity; set an expiry or revoke it later.
 - **👀 See what each host is doing** — without opening a shell. Every machine
   shows the foreground process of each open shell, how long it's been quiet, and
   the busiest processes on the box. Opt in with `SWITCHBOARD_ACTIVITY=claude` and
@@ -120,12 +120,14 @@ Both modes give you the multi-tab terminal and file transfer; they differ only i
 
 ### Share a machine with another account
 
-Open **Share** on one of your dashboard machines, enter a GitHub login, and
-choose an expiry. The recipient sees the machine in their own dashboard and can
-open its terminal. A share is full access — terminal input, file transfer, and
-commands — but it does not transfer ownership or let the recipient re-share or
-delete the machine. **Revoke** closes that account's active connections as well
-as rejecting future ones.
+Open **Share access** on one of your dashboard machines, choose how long access
+should last, and generate a code. Send it to the recipient within ten minutes;
+they sign in, paste it under **Redeem a share code**, and the code becomes
+unusable immediately. The machine then appears in their dashboard. A share is
+full access — terminal input, file transfer, and commands — but it does not
+transfer ownership or let the recipient re-share or delete the machine.
+**Revoke** closes that account's active connections as well as rejecting future
+ones.
 
 Shared machines also appear in the recipient's `switchboard nodes`. Their CLI
 can use `exec` and `shell` only while the target daemon has peer access enabled;
@@ -350,6 +352,7 @@ whether it is safe to re-run:
 ```bash
 npx wrangler d1 execute switchboard_db --remote --file migrations/0002_add_peer.sql
 npx wrangler d1 execute switchboard_db --remote --file migrations/0004_add_grants.sql
+npx wrangler d1 execute switchboard_db --remote --file migrations/0005_add_share_codes.sql
 ```
 
 Wrangler prints your URL (e.g. `https://switchboard.<subdomain>.workers.dev`).
@@ -446,8 +449,9 @@ and never include command-line arguments (those routinely carry secrets).
 - **Account mode is gated by GitHub identity.** A bound machine can be opened by
   its signed-in owner or a GitHub account holding a live machine grant. Grants
   use numeric GitHub ids, may expire, cannot be delegated onward, and are
-  checked on every connection. Sessions are HMAC-signed cookies, and agent
-  tokens are stored **hashed** (SHA-256) in D1.
+  checked on every connection. One-time share codes expire after ten minutes,
+  are stored **hashed** (SHA-256), and bind to the redeeming account. Sessions
+  are HMAC-signed cookies, and agent tokens are also stored hashed in D1.
 - **The agent token is a full account credential**, and since peer mode it's a
   *client* one too: whoever holds `~/.switchboard/config.json` can `exec` on the
   account's owned or shared machines that allow peers. It was always
