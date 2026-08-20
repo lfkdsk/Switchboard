@@ -16,8 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -45,12 +45,26 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Validate Cloudflare credentials
+        run: |
+          node <<'NODE'
+          const token = process.env.CLOUDFLARE_API_TOKEN || "";
+          const account = process.env.CLOUDFLARE_ACCOUNT_ID || "";
+          if (!/^[\x21-\x7e]+$/.test(token)) {
+            console.error("::error::CLOUDFLARE_API_TOKEN is missing or contains non-ASCII characters; copy a fresh token into the production Environment secret.");
+            process.exit(1);
+          }
+          if (!/^[0-9a-f]{32}$/i.test(account)) {
+            console.error("::error::CLOUDFLARE_ACCOUNT_ID must be the 32-character hexadecimal account id.");
+            process.exit(1);
+          }
+          NODE
       - name: Apply D1 migrations
         run: npx wrangler d1 migrations apply switchboard_db --remote
       - name: Deploy Worker
