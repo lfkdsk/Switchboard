@@ -28,6 +28,23 @@ CREATE TABLE IF NOT EXISTS machines (
 );
 CREATE INDEX IF NOT EXISTS idx_machines_account ON machines(account_id);
 
+-- Delegated access. A machine still has exactly one owner; a live row here lets
+-- another GitHub account open its terminal and, when peer is enabled on the
+-- host, reach it through `switchboard exec` / `switchboard shell` as well.
+-- Numeric GitHub ids are the authority; logins are display-only snapshots.
+CREATE TABLE IF NOT EXISTS machine_grants (
+  machine_id       TEXT NOT NULL,
+  grantee_id       TEXT NOT NULL,
+  grantee_login    TEXT NOT NULL,
+  granted_by_id    TEXT NOT NULL,
+  granted_by_login TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  expires_at       INTEGER,            -- NULL = no automatic expiry
+  revoked_at       INTEGER,            -- NULL = live
+  PRIMARY KEY (machine_id, grantee_id)
+);
+CREATE INDEX IF NOT EXISTS idx_machine_grants_grantee ON machine_grants(grantee_id);
+
 -- Account-scoped agent tokens the CLI presents to register/connect a machine.
 -- Only the SHA-256 hash is stored; the plaintext lives in the CLI's config.
 CREATE TABLE IF NOT EXISTS agent_tokens (

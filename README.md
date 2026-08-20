@@ -76,6 +76,9 @@ quick remote help. No sign-in required; the token *is* the key (see
 - **📊 All your machines, one dashboard** — sign in with GitHub and every machine
   you've bound is listed with live status: online/offline, round-trip latency,
   CPU, memory, and last-seen.
+- **🤝 Share by GitHub identity** — give another GitHub user access to one
+  machine without handing over a bearer URL. Set an expiry or revoke it later;
+  their existing connections are closed immediately on revoke.
 - **👀 See what each host is doing** — without opening a shell. Every machine
   shows the foreground process of each open shell, how long it's been quiet, and
   the busiest processes on the box. Opt in with `SWITCHBOARD_ACTIVITY=claude` and
@@ -107,13 +110,27 @@ quick remote help. No sign-in required; the token *is* the key (see
 |                          | **Account** — `switchboard login`     | **Token** — `switchboard`              |
 | ------------------------ | ------------------------------------- | -------------------------------------- |
 | Sign-in                  | GitHub, once per machine              | none                                   |
-| Who can open the shell   | only you                              | anyone holding the token               |
+| Who can open the shell   | you + GitHub users you share with     | anyone holding the token               |
 | Appears in the dashboard | ✅ with live stats                     | —                                      |
 | Shell lifetime           | persists — reattach anytime           | persists across reloads (60s grace)    |
-| Best for                 | your own machines                     | sharing · pairing · one-offs           |
+| Best for                 | persistent, identity-based access     | pairing · one-offs                     |
 
 Both modes give you the multi-tab terminal and file transfer; they differ only in
 *who* can connect and how long shells stick around.
+
+### Share a machine with another account
+
+Open **Share** on one of your dashboard machines, enter a GitHub login, and
+choose an expiry. The recipient sees the machine in their own dashboard and can
+open its terminal. A share is full access — terminal input, file transfer, and
+commands — but it does not transfer ownership or let the recipient re-share or
+delete the machine. **Revoke** closes that account's active connections as well
+as rejecting future ones.
+
+Shared machines also appear in the recipient's `switchboard nodes`. Their CLI
+can use `exec` and `shell` only while the target daemon has peer access enabled;
+`SWITCHBOARD_PEER=0` continues to block machine-to-machine access without
+blocking a shared browser terminal.
 
 ### Keep it running — macOS menu-bar app
 
@@ -205,13 +222,13 @@ that wouldn't happen.
 
 ---
 
-## Your machines can reach each other
+## Machines can reach each other
 
 Sign in on two machines and each one can see and drive the other — no browser in
 the middle:
 
 ```bash
-switchboard nodes                      # every machine on your account, live
+switchboard nodes                      # owned + shared machines, live
 switchboard exec build-box npm test    # run something over there
 switchboard shell build-box            # a shell over there, in this terminal
 ```
@@ -219,9 +236,9 @@ switchboard shell build-box            # a shell over there, in this terminal
 `<node>` is a hostname, or any unambiguous prefix of one (or of the machine id).
 An ambiguous prefix is an error, never a guess.
 
-This is the same trust boundary the dashboard has always had — your account —
-reached with the credential the machine already holds, so there are no keys to
-distribute and nothing new to expose. Both ends still dial out, which means it
+The relay authorizes either ownership or an explicit, live machine grant using
+the credential the caller already holds, so there are no extra keys to
+distribute. Both ends still dial out, which means it
 works to a machine you *couldn't* ssh to: behind NAT, on hotel wifi, on a
 corporate network with no inbound anything.
 
@@ -264,9 +281,9 @@ ln -s "$PWD/.claude/skills/switchboard" ~/.claude/skills/switchboard
 
 ### Turning it off
 
-Peer access is **on by default** in account mode — these are your own machines,
-and anyone who could reach one this way could already have opened a shell on it
-from the dashboard. A host that should only ever be driven by hand opts out:
+Peer access is **on by default** in account mode. The relay still requires
+ownership or an explicit live grant before it lets a peer connect. A host that
+should only ever be driven through a browser opts out:
 
 ```bash
 SWITCHBOARD_PEER=0 switchboard         # or: switchboard --no-peer
@@ -327,11 +344,12 @@ npm run deploy
 
 Already deployed and pulling a newer version? `schema.sql` only creates tables it
 doesn't have, so columns added since your database was created live in
-`migrations/`. Apply the ones you're missing, oldest first — each file says what
-it's for, and re-running an applied one fails loudly rather than silently:
+`migrations/`. Apply the ones you're missing, oldest first; each file documents
+whether it is safe to re-run:
 
 ```bash
 npx wrangler d1 execute switchboard_db --remote --file migrations/0002_add_peer.sql
+npx wrangler d1 execute switchboard_db --remote --file migrations/0004_add_grants.sql
 ```
 
 Wrangler prints your URL (e.g. `https://switchboard.<subdomain>.workers.dev`).
@@ -376,13 +394,13 @@ switchboard logout           Remove the stored account credential.
 switchboard service install  Linux: run in the background via systemd, starting
                              at boot. Also: uninstall, status.
 
-switchboard nodes            List every machine on your account and what it's
-                             doing. (Alias: ls.)
+switchboard nodes            List every owned or shared machine you can reach.
+                             (Alias: ls.)
 switchboard exec <node> <cmd…>
-                             Run a command on one of your other machines; its
+                             Run a command on a reachable peer machine; its
                              stdout, stderr and exit code come back here.
-switchboard shell <node>     Open an interactive shell on one of your other
-                             machines. Ctrl-] detaches.
+switchboard shell <node>     Open an interactive shell on a reachable peer
+                             machine. Ctrl-] detaches.
 ```
 
 | Option | Description |
@@ -390,7 +408,7 @@ switchboard shell <node>     Open an interactive shell on one of your other
 | `-t, --token <token>` | Force anonymous mode with this token (min 24 chars). |
 | `-s, --server <url>`  | Relay origin. Default: `https://shell.lfkdsk.org`. |
 | `--shell <path>`      | Shell to spawn. Default: `$SHELL`, else `bash`/`powershell`. |
-| `--no-peer`           | Refuse `exec`/`shell` from your other machines. |
+| `--no-peer`           | Refuse `exec`/`shell` from peer machines. |
 | `--force`             | Start without asking, even if a daemon is already running here. |
 | `-v, --version`       | Print version and exit. |
 | `-h, --help`          | Show help and exit. |
@@ -406,7 +424,7 @@ in `~/.switchboard/config.json` (mode `0600`), and whoever is currently serving
 this machine in `~/.switchboard/daemons.json` (see
 [One daemon at a time](#one-daemon-at-a-time)).
 
-`SWITCHBOARD_PEER=0` makes this machine refuse `exec`/`shell` from your other
+`SWITCHBOARD_PEER=0` makes this machine refuse `exec`/`shell` from peer
 machines (see [above](#turning-it-off)). It's on by default in account mode, and
 `service install` pins your choice into the unit so a host you closed off doesn't
 come back open at boot.
@@ -425,17 +443,20 @@ and never include command-line arguments (those routinely carry secrets).
 - **The token is the only credential in token mode.** Anyone with it gets a shell
   on the host — treat it like a password. It's a fresh 256-bit random value per
   run, so guessing is infeasible.
-- **Account mode is gated by GitHub identity.** A machine bound with
-  `switchboard login` can only be opened by the signed-in owner; sessions are
-  HMAC-signed cookies, and agent tokens are stored **hashed** (SHA-256) in D1.
+- **Account mode is gated by GitHub identity.** A bound machine can be opened by
+  its signed-in owner or a GitHub account holding a live machine grant. Grants
+  use numeric GitHub ids, may expire, cannot be delegated onward, and are
+  checked on every connection. Sessions are HMAC-signed cookies, and agent
+  tokens are stored **hashed** (SHA-256) in D1.
 - **The agent token is a full account credential**, and since peer mode it's a
-  *client* one too: whoever holds `~/.switchboard/config.json` on one machine can
-  `exec` on the others that allow peers. It was always account-scoped — that file
-  could already register or take over any of your machines' circuits — but the
-  blast radius is bigger now, so it stays mode `0600`, and a host you don't want
-  driven remotely should run with `SWITCHBOARD_PEER=0`. `switchboard logout`
-  removes the credential; the relay checks ownership on every single connection,
-  so revoking is immediate.
+  *client* one too: whoever holds `~/.switchboard/config.json` can `exec` on the
+  account's owned or shared machines that allow peers. It was always
+  account-scoped — that file could already register or take over any owned
+  machine's circuit — but the blast radius is bigger now, so it stays mode
+  `0600`, and a host you don't want driven remotely should run with
+  `SWITCHBOARD_PEER=0`. `switchboard logout` removes the credential; ownership
+  and grants are checked on every connection, and revoking a grant invalidates
+  that account's existing connections too.
 - **The relay sees plaintext.** TLS terminates at the Worker, so the operator
   (you, when self-hosting) can see the stream. Switchboard is **not** end-to-end
   encrypted — self-hosting removes the third party, not the relay's visibility.
@@ -455,7 +476,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `src/index.js` | Worker entry + router (WebSocket, auth, CLI-login, dashboard API) |
 | `src/circuit.js` | The `Circuit` Durable Object — the per-token/per-machine relay |
 | `src/auth.js` | GitHub OAuth sessions (HMAC-signed cookies) |
-| `src/registry.js` | D1 bookkeeping: machines, agent tokens, CLI-login handshake |
+| `src/registry.js` | D1 bookkeeping: machines, sharing grants, agent tokens, CLI-login handshake |
 | `public/index.html` | The browser app — terminal, tabs, dashboard, file transfer |
 | `public/cli-login.html` | The `switchboard login` authorization page |
 | `public/fonts/` | Vendored Nerd Font symbol subsets (see [public/fonts/README.md](public/fonts/README.md)) |

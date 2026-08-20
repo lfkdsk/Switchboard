@@ -34,7 +34,7 @@
   body { background: var(--bg); color: var(--fg); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display: flex; flex-direction: column; }
   a { color: var(--accent); }
   header { display: flex; align-items: center; gap: 14px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-  header .brand { font-weight: 600; letter-spacing: .3px; cursor: pointer; }
+  header .brand { flex: none; font-weight: 600; letter-spacing: .3px; cursor: pointer; white-space: nowrap; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
   .dot.on { background: var(--ok); } .dot.off { background: var(--err); } .dot.wait { background: var(--warn); }
   .stats { display: flex; gap: 14px; color: var(--muted); flex-wrap: wrap; }
@@ -66,9 +66,28 @@
   .dash-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
   .dash-head h1 { font-size: 18px; margin: 0; }
   .machine { display: flex; flex-direction: column; gap: 9px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 10px; }
-  .machine .m-head { display: flex; align-items: center; gap: 12px; }
+  .machine .m-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .machine .m-info { min-width: 0; flex: 1 1 220px; }
+  .machine .m-head > .spacer { display: none; }
+  .machine .m-head > button.primary { margin-left: auto; }
+  .m-actions { position: relative; flex: none; }
+  .m-more { width: 34px; padding: 7px 8px; font-size: 18px; line-height: 1; }
+  .m-menu { position: absolute; z-index: 15; top: calc(100% + 6px); right: 0; min-width: 184px; padding: 5px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.4); }
+  .m-menu button { display: block; width: 100%; padding: 8px 10px; border: 0; text-align: left; background: transparent; }
+  .m-menu button:hover { background: #1b2230; }
+  .m-menu button.danger { border: 0; }
+  .m-menu button.danger:hover { background: rgba(248,81,73,.12); }
   .machine .name { font-weight: 600; }
   .machine .meta { color: var(--muted); font-size: 12px; }
+  .machine.shared { border-left: 3px solid var(--accent); }
+  .m-name { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; white-space: nowrap; }
+  .m-grants { display: flex; flex-direction: column; gap: 8px; margin-left: 20px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .grant-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+  .m-grants input, .m-grants select { padding: 5px 8px; font-size: 12px; }
+  .m-grants input { min-width: 150px; }
+  .m-grants select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font-family: inherit; }
+  .m-grants button { padding: 4px 10px; font-size: 12px; }
   /* activity: what the host is actually doing, without opening a shell */
   .m-act { display: flex; flex-direction: column; gap: 4px; font-size: 12px; padding-left: 20px; }
   .m-act:empty { display: none; }
@@ -144,7 +163,7 @@
   <div class="view" id="view-dashboard">
     <div class="dash-wrap">
       <div class="dash-head">
-        <h1>Your machines</h1>
+        <h1>Machines</h1>
         <span class="spacer"></span>
         <button id="refreshBtn">Refresh</button>
       </div>
@@ -187,6 +206,7 @@
     // ---- view router -------------------------------------------------------
     let session = null, dashTimer = null;
     function showView(name) {
+      if (name !== "dashboard") closeActionMenus();
       for (const v of document.querySelectorAll(".view")) v.classList.toggle("active", v.id === "view-" + name);
       const inTerm = name === "terminal";
       $("backBtn").hidden = !(inTerm && session);
@@ -260,6 +280,11 @@
       if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m";
       if (s < 86400) return Math.floor(s / 3600) + "h"; return Math.floor(s / 86400) + "d";
     }
+    function expiryLabel(ts) {
+      if (ts == null) return "no expiry";
+      const left = ts - Date.now();
+      return left > 0 ? "expires in " + fmtDur(left) : "expired";
+    }
 
     // ---- activity ("what is this host doing?") -----------------------------
     // Flatten the daemon's activity blob into uniform rows so one renderer can
@@ -312,7 +337,14 @@
       const list = $("machineList");
       if (!silent && !machineEls.size) list.innerHTML = '<div class="muted" style="padding:8px">Loading…</div>';
       let machines = [];
-      try { machines = (await (await api("/api/machines")).json()).machines || []; }
+      try {
+        const [mineResponse, sharedResponse] = await Promise.all([
+          api("/api/machines"), api("/api/machines/shared"),
+        ]);
+        if (!mineResponse.ok || !sharedResponse.ok) throw new Error("dashboard request failed");
+        const [mine, shared] = await Promise.all([mineResponse.json(), sharedResponse.json()]);
+        machines = (mine.machines || []).concat(shared.machines || []);
+      }
       catch { if (!silent) { list.innerHTML = '<div class="empty">Could not load machines.</div>'; machineEls.clear(); } return; }
       if (!machines.length) { list.innerHTML = '<div class="empty">No machines yet. Run <code>npx @switch-board/cli login</code> on a host to bind it.</div>'; machineEls.clear(); return; }
 
@@ -336,37 +368,89 @@
         if (!el) { // first sighting: build the row once, then reuse it
           el = document.createElement("div");
           el.className = "machine";
-          el.innerHTML = `<div class="m-head"><span class="dot"></span><div><div class="name"></div><div class="meta"></div></div><span class="spacer"></span><button class="primary">Open shell</button></div><div class="m-act"></div>`;
+          el.innerHTML = `<div class="m-head"><span class="dot"></span><div class="m-info"><div class="m-name"><span class="name"></span><span class="badge" hidden></span></div><div class="meta"></div></div><span class="spacer"></span><button class="primary open-shell">Open shell</button><div class="m-actions"><button class="m-more" type="button" aria-haspopup="menu" aria-expanded="false" title="Machine actions">⋯</button><div class="m-menu" role="menu" hidden></div></div></div><div class="m-act"></div><div class="m-grants" hidden></div>`;
           machineEls.set(m.machine_id, el);
         }
         // Update fields in place — no teardown, so no flicker.
         const head = el.querySelector(".m-head");
+        el.classList.toggle("shared", !!m.shared);
         el.querySelector(".dot").className = "dot " + (online ? "on" : "off");
         el.querySelector(".name").textContent = label;
         el.querySelector(".meta").textContent = meta;
-        el.querySelector(".primary").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        const badge = el.querySelector(".badge");
+        badge.hidden = !m.shared;
+        if (m.shared) badge.textContent = `shared by @${m.owner_login} · ${expiryLabel(m.expires_at)}`;
+        el.querySelector(".open-shell").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
         // An offline machine's last-known activity is stale by definition.
         syncActivity(el.querySelector(".m-act"), online ? activityRows(m.activity) : []);
-        // The Delete button only exists while the machine is offline.
-        let del = head.querySelector(".danger");
-        if (!online) {
-          if (!del) {
-            del = document.createElement("button");
-            del.className = "danger";
-            del.textContent = "Delete";
-            del.title = "Remove this offline machine from your dashboard";
-            head.appendChild(del);
-          }
-          del.onclick = () => deleteMachine(m.machine_id, label, el);
-        } else if (del) { del.remove(); }
+        syncActionMenu(m, online, label, el);
         // Place the row at its slot (only moves the node if the order actually changed).
         if (list.children[i] !== el) list.insertBefore(el, list.children[i] || null);
       });
     }
 
+    function menuBtn(menu, cls, want, text, title, extra) {
+      let btn = menu.querySelector("." + cls);
+      if (!want) { if (btn) btn.remove(); return null; }
+      if (!btn) {
+        btn = document.createElement("button");
+        btn.className = extra ? cls + " " + extra : cls;
+        btn.type = "button";
+        btn.setAttribute("role", "menuitem");
+        btn.textContent = text;
+        menu.appendChild(btn);
+      }
+      btn.title = title;
+      return btn;
+    }
+
+    function closeActionMenus(except) {
+      for (const actions of document.querySelectorAll(".m-actions")) {
+        if (actions === except) continue;
+        actions.querySelector(".m-menu").hidden = true;
+        actions.querySelector(".m-more").setAttribute("aria-expanded", "false");
+      }
+    }
+
+    function syncActionMenu(machine, online, label, el) {
+      const actions = el.querySelector(".m-actions");
+      const more = actions.querySelector(".m-more");
+      const menu = actions.querySelector(".m-menu");
+      more.setAttribute("aria-label", `Machine actions for ${label}`);
+      more.onclick = (event) => {
+        event.stopPropagation();
+        const opening = menu.hidden;
+        closeActionMenus(actions);
+        menu.hidden = !opening;
+        more.setAttribute("aria-expanded", String(opening));
+        if (opening) menu.querySelector("button:not(:disabled)")?.focus();
+      };
+      menu.onclick = (event) => event.stopPropagation();
+
+      const share = menuBtn(menu, "action-share", !machine.shared, "Share access…", "Share full terminal and command access with a GitHub user");
+      if (share) share.onclick = () => { closeActionMenus(); toggleGrants(machine.machine_id, el); };
+
+      const del = menuBtn(menu, "action-delete", !machine.shared, "Delete machine", online ? "Machine must be offline before it can be deleted" : "Remove this offline machine from your dashboard", "danger");
+      if (del) {
+        del.disabled = online;
+        del.onclick = () => { closeActionMenus(); deleteMachine(machine.machine_id, label, el); };
+      }
+
+      const leave = menuBtn(menu, "action-leave", !!machine.shared, "Leave machine", "Give up your access to this machine", "danger");
+      if (leave) leave.onclick = () => { closeActionMenus(); leaveShare(machine, label, el); };
+    }
+
+    document.addEventListener("click", () => closeActionMenus());
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      const trigger = document.querySelector('.m-more[aria-expanded="true"]');
+      closeActionMenus();
+      if (trigger) trigger.focus();
+    });
+
     async function deleteMachine(machineId, label, el) {
-      if (!confirm(`Delete offline machine "${label}"?\n\nThis removes it from your dashboard. You can re-add it by running the CLI on that host again.`)) return;
-      const btn = el.querySelector(".danger");
+      if (!confirm(`Delete offline machine "${label}"?\n\nThis removes it and all of its shares. You can re-add it by running the CLI on that host again.`)) return;
+      const btn = el.querySelector(".action-delete");
       btn.disabled = true;
       try {
         const r = await api("/api/machines/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ machine_id: machineId }) });
@@ -381,6 +465,138 @@
           btn.disabled = false;
         }
       } catch { toast("Couldn't delete machine — network error.", "err"); btn.disabled = false; }
+    }
+
+    // ---- sharing -----------------------------------------------------------
+    // Grant panels are refreshed only when opened or changed. The 3s machine
+    // poll reuses the row, so it cannot erase a login while the owner types it.
+    function toggleGrants(machineId, el) {
+      const box = el.querySelector(".m-grants");
+      box.hidden = !box.hidden;
+      if (!box.hidden) loadGrants(machineId, box);
+    }
+    async function loadGrants(machineId, box) {
+      box.textContent = "";
+      const status = document.createElement("div");
+      status.className = "muted";
+      status.textContent = "Loading shares…";
+      box.appendChild(status);
+      let grants;
+      try {
+        const response = await api("/api/machines/grants?machine_id=" + encodeURIComponent(machineId));
+        if (!response.ok) throw new Error("share request failed");
+        grants = (await response.json()).grants || [];
+      } catch { status.textContent = "Could not load shares."; return; }
+
+      box.textContent = "";
+      const warning = document.createElement("div");
+      warning.className = "muted";
+      warning.textContent = "A share grants full terminal, file-transfer, and command access.";
+      box.appendChild(warning);
+      if (!grants.length) {
+        const none = document.createElement("div");
+        none.className = "muted";
+        none.textContent = "Not shared with anyone.";
+        box.appendChild(none);
+      }
+      for (const grant of grants) {
+        const row = document.createElement("div");
+        row.className = "grant-row";
+        row.innerHTML = '<span class="who"></span><span class="muted when"></span><span class="spacer"></span><button class="danger">Revoke</button>';
+        row.querySelector(".who").textContent = "@" + grant.grantee_login;
+        row.querySelector(".when").textContent = `since ${fmtAgo(grant.created_at)} · ${expiryLabel(grant.expires_at)}`;
+        row.querySelector(".danger").onclick = () => revokeShare(machineId, grant, box, row);
+        box.appendChild(row);
+      }
+      box.appendChild(grantForm(machineId, box));
+    }
+
+    const GRANT_EXPIRY = [[0, "no expiry"], [1, "1 day"], [7, "7 days"], [30, "30 days"]];
+    function grantForm(machineId, box) {
+      const row = document.createElement("div");
+      row.className = "grant-row";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = "github login";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.style.flex = "1";
+      const expiry = document.createElement("select");
+      expiry.title = "How long this share lasts";
+      for (const [value, text] of GRANT_EXPIRY) {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = text;
+        expiry.appendChild(option);
+      }
+      const button = document.createElement("button");
+      button.className = "primary";
+      button.textContent = "Share";
+      const submit = async () => {
+        const login = input.value.trim().replace(/^@/, "");
+        if (!login) return;
+        button.disabled = true;
+        const days = Number(expiry.value);
+        try {
+          const response = await api("/api/machines/grant", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              machine_id: machineId,
+              login,
+              expires_at: days ? Date.now() + days * 86400000 : null,
+            }),
+          });
+          const body = await response.json().catch(() => ({}));
+          if (response.ok) {
+            toast(`Shared with @${body.grant ? body.grant.grantee_login : login}`, "ok");
+            loadGrants(machineId, box);
+            return;
+          }
+          toast(body.error === "no such github user" ? `No GitHub user “${login}”.` : "Couldn't share: " + (body.error || "failed"), "err");
+        } catch { toast("Couldn't share — network error.", "err"); }
+        button.disabled = false;
+      };
+      button.onclick = submit;
+      input.addEventListener("keydown", (event) => { if (event.key === "Enter") submit(); });
+      row.append(input, expiry, button);
+      return row;
+    }
+
+    async function revokeShare(machineId, grant, box, row) {
+      if (!confirm(`Revoke @${grant.grantee_login}'s access?\n\nTheir open terminals and commands will be disconnected immediately.`)) return;
+      const button = row.querySelector(".danger");
+      button.disabled = true;
+      try {
+        const response = await api("/api/machines/revoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ machine_id: machineId, grantee_id: grant.grantee_id }),
+        });
+        if (response.ok) {
+          toast(`Revoked @${grant.grantee_login}`, "ok");
+          loadGrants(machineId, box);
+        } else { toast("Couldn't revoke that share.", "err"); button.disabled = false; }
+      } catch { toast("Couldn't revoke — network error.", "err"); button.disabled = false; }
+    }
+
+    async function leaveShare(machine, label, el) {
+      if (!confirm(`Leave “${label}”?\n\nYou lose access until @${machine.owner_login} shares it with you again.`)) return;
+      const button = el.querySelector(".action-leave");
+      button.disabled = true;
+      try {
+        const response = await api("/api/machines/revoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ machine_id: machine.machine_id, grantee_id: session.id }),
+        });
+        if (response.ok) {
+          toast(`Left “${label}”`, "ok");
+          el.remove();
+          machineEls.delete(machine.machine_id);
+          renderDashboard(true);
+        } else { toast("Couldn't leave that machine.", "err"); button.disabled = false; }
+      } catch { toast("Couldn't leave — network error.", "err"); button.disabled = false; }
     }
 
     // ===================== TERMINAL (multi-shell) ===========================
@@ -549,7 +765,18 @@
         case "pong": if (m.t === lastPingT) $("rttVal").textContent = (Date.now() - m.t) + "ms"; break;
         case "stats": updateStats(m); break;
         case "exit": { const sh = shells.get(m.sid); if (sh) sh.term.write(`\r\n\x1b[33m[exited ${m.code}]\x1b[0m\r\n`); break; }
-        case "_relay": setConn(m.event === "daemon-online" ? "on" : "off", m.event === "daemon-online" ? "connected" : "host offline"); break;
+        case "_relay":
+          if (m.event === "access-revoked" || m.event === "access-expired") {
+            manualClose = true;
+            stopPing();
+            setConn("off", m.event === "access-expired" ? "access expired" : "access revoked");
+            toast(m.event === "access-expired" ? "This machine share expired." : "Access to this machine was revoked.", "err");
+            dropSocket(ws); ws = null;
+            setTimeout(() => { if (session) { closeTerminal(); goDashboard(); } }, 600);
+          } else {
+            setConn(m.event === "daemon-online" ? "on" : "off", m.event === "daemon-online" ? "connected" : "host offline");
+          }
+          break;
         case "dl-meta": { const d = downloads.get(m.id); if (d) d.name = m.name || "download"; break; }
         case "dl-chunk": { const d = downloads.get(m.id); if (d) d.parts.push(b64ToBytes(m.data)); break; }
         case "dl-end": dlEnd(m); break;

@@ -5,9 +5,9 @@
  *   - anonymous: /ws?role=…&token=<secret>      (token is the credential)
  *   - bound:     /ws?role=…&machine=<id>        (account-gated)
  *       daemon  → header x-switchboard-agent: <agent token>  (→ account)
- *       browser → sb_session cookie             (→ account; must own machine)
+ *       browser → sb_session cookie             (→ account; owner or grantee)
  *                 …or the same agent token, which is how one of your machines
- *                 dials another (peer mode; the target must have opted in).
+ *                 dials an owned/shared target (peer mode; target opts in).
  *
  * HTTP: GitHub-OAuth sessions (/auth/*), the CLI-login handshake (/cli/*),
  * the dashboard API (/api/*), the CLI's own node list (/api/nodes), and static
@@ -18,7 +18,9 @@ import { Circuit } from "./circuit.js";
 import { handleLogin, handleSession, handleLogout, getSession, json } from "./auth.js";
 import {
   cliStart, cliComplete, cliPoll,
-  listMachines, deleteMachine, verifyAgentToken, registerMachine, machineAccess,
+  listMachines, listSharedWithMe, listReachableMachines, deleteMachine,
+  verifyAgentToken, registerMachine, machineAccess,
+  grantMachine, revokeGrant, listGrants,
 } from "./registry.js";
 
 export { Circuit };
@@ -81,6 +83,47 @@ export default {
         ? json({ error: "machine is online" }, 409)
         : json({ error: "not found" }, 404);
     }
+    if (p === "/api/machines/shared") {
+      const s = await getSession(request, env);
+      if (!s) return json({ error: "not signed in" }, 401);
+      return json({ machines: await listSharedWithMe(env, s.id) });
+    }
+    if (p === "/api/machines/grants") {
+      const s = await getSession(request, env);
+      if (!s) return json({ error: "not signed in" }, 401);
+      const machineId = url.searchParams.get("machine_id");
+      if (!machineId) return json({ error: "missing machine_id" }, 400);
+      const grants = await listGrants(env, machineId, s.id);
+      return grants ? json({ grants }) : json({ error: "not found" }, 404);
+    }
+    if (p === "/api/machines/grant" && request.method === "POST") {
+      const s = await getSession(request, env);
+      if (!s) return json({ error: "not signed in" }, 401);
+      const b = await safeJson(request);
+      if (!b || !b.machine_id || !b.login) return json({ error: "missing machine_id/login" }, 400);
+      const r = await grantMachine(env, b.machine_id, s.id, b.login, b.expires_at ?? null);
+      if (r.ok) return json({ ok: true, grant: r.grant });
+      if (r.reason === "unknown-login") return json({ error: "no such github user" }, 404);
+      if (r.reason === "self") return json({ error: "you already own this machine" }, 400);
+      if (r.reason === "bad-expiry") return json({ error: "expires_at must be a future timestamp" }, 400);
+      return json({ error: "not found" }, 404);
+    }
+    if (p === "/api/machines/revoke" && request.method === "POST") {
+      const s = await getSession(request, env);
+      if (!s) return json({ error: "not signed in" }, 401);
+      const b = await safeJson(request);
+      if (!b || !b.machine_id || !b.grantee_id) {
+        return json({ error: "missing machine_id/grantee_id" }, 400);
+      }
+      const granteeId = String(b.grantee_id);
+      const r = await revokeGrant(env, b.machine_id, granteeId, s.id);
+      if (!r.ok) return json({ error: "not found" }, 404);
+      // The database is authoritative for every future connection. Also close
+      // this account's existing granted sockets so revoke means now, not after
+      // their current terminal happens to disconnect.
+      const disconnected = await disconnectGrantedAccount(env, b.machine_id, granteeId);
+      return json({ ok: true, disconnected });
+    }
 
     // ---- the CLI's view of the account ----
     // Same list as /api/machines, but authenticated with the agent token a
@@ -93,7 +136,7 @@ export default {
       if (!account) return json({ error: "invalid or missing agent token" }, 401);
       // `now` travels with the rows for the same reason: "last seen 3m ago" is
       // only true if it's measured against the clock that stamped last_seen.
-      return json({ login: account.login, now: Date.now(), nodes: await listMachines(env, account.id) });
+      return json({ login: account.login, now: Date.now(), nodes: await listReachableMachines(env, account.id) });
     }
 
     // ---- static assets (frontend) ----
@@ -104,6 +147,30 @@ export default {
 
 async function safeJson(request) {
   try { return await request.json(); } catch { return null; }
+}
+
+async function disconnectGrantedAccount(env, machineId, accountId) {
+  const stub = env.CIRCUIT.get(env.CIRCUIT.idFromName("m:" + machineId));
+  try {
+    const response = await stub.fetch(new Request("https://switchboard.internal/__revoke", {
+      method: "POST",
+      headers: { "x-switchboard-account": accountId },
+    }));
+    if (response.ok) return Number((await response.json()).closed) || 0;
+  } catch {
+    // D1 has already revoked the grant, so reconnects still fail closed. A DO
+    // delivery failure must not roll the durable decision back.
+  }
+  return 0;
+}
+
+function withBrowserAccess(request, accountId, access) {
+  const r = new Request(request);
+  r.headers.set("x-switchboard-account", accountId);
+  r.headers.set("x-switchboard-access", access.via);
+  if (access.expiresAt != null) r.headers.set("x-switchboard-expires", String(access.expiresAt));
+  else r.headers.delete("x-switchboard-expires");
+  return r;
 }
 
 async function routeWebSocket(request, env, url) {
@@ -129,24 +196,23 @@ async function routeWebSocket(request, env, url) {
       );
       if (!ok) return new Response("machine is owned by another account\n", { status: 403 });
     } else {
-      // A client is either a signed-in browser or one of the account's own
-      // machines dialling a sibling. Both must own the target; a machine must
-      // additionally find it willing to be dialled.
+      // A client is a signed-in browser or an account's agent token. Both may
+      // use owned machines and explicit live grants. Software connections still
+      // require the target daemon's peer opt-in; browser terminals do not.
       const peer = agentToken ? await verifyAgentToken(env, agentToken) : null;
       if (agentToken && !peer) return new Response("invalid agent token\n", { status: 401 });
       const s = peer || (await getSession(request, env));
       if (!s) return new Response("not signed in\n", { status: 401 });
-      const target = await machineAccess(env, machineId);
-      if (!target || target.accountId !== s.id) {
-        return new Response("not your machine\n", { status: 403 });
-      }
+      const target = await machineAccess(env, machineId, s.id);
+      if (!target) return new Response("you don't have access to this machine\n", { status: 403 });
       if (peer && !target.peer) {
         return new Response(
-          "that machine does not accept connections from your other machines\n" +
+          "that machine does not accept peer connections\n" +
             "(restart its daemon without SWITCHBOARD_PEER=0 to allow it)\n",
           { status: 403 },
         );
       }
+      request = withBrowserAccess(request, s.id, target);
     }
     return env.CIRCUIT.get(env.CIRCUIT.idFromName("m:" + machineId)).fetch(request);
   }

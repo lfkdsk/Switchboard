@@ -17,6 +17,24 @@ export class Circuit extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/__revoke" && request.method === "POST") {
+      const accountId = request.headers.get("x-switchboard-account");
+      if (!accountId) return new Response("missing account\n", { status: 400 });
+      let closed = 0;
+      for (const ws of this.ctx.getWebSockets("browser")) {
+        const a = ws.deserializeAttachment() || {};
+        if (a.accessVia !== "grant" || a.accountId !== accountId) continue;
+        // Persist the block before attempting the close handshake. Even if a
+        // client/runtime delays that handshake, no more frames pass either way.
+        a.blocked = "access-revoked";
+        ws.serializeAttachment(a);
+        this.safeSend(ws, JSON.stringify({ type: "_relay", event: a.blocked }));
+        try { ws.close(4003, "machine access revoked"); closed++; } catch {}
+      }
+      return new Response(JSON.stringify({ ok: true, closed }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
     const role = url.searchParams.get("role");
     const machineId = url.searchParams.get("machine") || null;
 
@@ -36,7 +54,15 @@ export class Circuit extends DurableObject {
 
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server, [role]);
-    server.serializeAttachment({ role, machineId });
+    const expiresRaw = request.headers.get("x-switchboard-expires");
+    const expiresAt = expiresRaw == null ? null : Number(expiresRaw);
+    server.serializeAttachment({
+      role,
+      machineId,
+      accountId: request.headers.get("x-switchboard-account") || null,
+      accessVia: request.headers.get("x-switchboard-access") || null,
+      expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
+    });
 
     if (role === "browser") {
       const daemonUp = this.ctx.getWebSockets("daemon").some((s) => s.readyState === WS_OPEN);
@@ -58,8 +84,11 @@ export class Circuit extends DurableObject {
       if (att.machineId && typeof message === "string" && message.length < 8000) {
         this.recordHeartbeat(att.machineId, message);
       }
-      for (const b of this.ctx.getWebSockets("browser")) this.safeSend(b, message);
+      for (const b of this.ctx.getWebSockets("browser")) {
+        if (!this.closeIfBlocked(b)) this.safeSend(b, message);
+      }
     } else {
+      if (this.closeIfBlocked(ws)) return;
       const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);
       if (daemon) this.safeSend(daemon, message);
     }
@@ -96,7 +125,22 @@ export class Circuit extends DurableObject {
   }
 
   broadcastToBrowsers(str) {
-    for (const b of this.ctx.getWebSockets("browser")) this.safeSend(b, str);
+    for (const b of this.ctx.getWebSockets("browser")) {
+      if (!this.closeIfBlocked(b)) this.safeSend(b, str);
+    }
+  }
+  closeIfBlocked(ws) {
+    const a = ws.deserializeAttachment() || {};
+    if (a.blocked) {
+      try { ws.close(4003, a.blocked === "access-expired" ? "machine access expired" : "machine access revoked"); } catch {}
+      return true;
+    }
+    if (a.accessVia !== "grant" || a.expiresAt == null || a.expiresAt > Date.now()) return false;
+    a.blocked = "access-expired";
+    ws.serializeAttachment(a);
+    this.safeSend(ws, JSON.stringify({ type: "_relay", event: a.blocked }));
+    try { ws.close(4003, "machine access expired"); } catch {}
+    return true;
   }
   safeSend(ws, data) { try { ws.send(data); } catch {} }
 }

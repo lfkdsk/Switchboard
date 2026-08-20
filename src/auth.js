@@ -94,6 +94,27 @@ export async function githubUser(token) {
   return { id: String(u.id), login: u.login };
 }
 
+// GitHub logins are case-insensitive display names; grants are keyed by the
+// numeric id returned here so a rename cannot transfer access to somebody else.
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+
+export async function githubUserByLogin(login) {
+  if (!login || !GITHUB_LOGIN.test(login)) return null;
+  let r;
+  try {
+    r = await fetch("https://api.github.com/users/" + encodeURIComponent(login), {
+      headers: {
+        "user-agent": "switchboard",
+        accept: "application/vnd.github+json",
+      },
+    });
+  } catch { return null; }
+  if (!r.ok) return null;
+  const u = await r.json();
+  if (!u || u.id == null || !u.login) return null;
+  return { id: String(u.id), login: u.login };
+}
+
 // GET /auth/login → bounce to GitHub authorize (via the lfkdsk-auth callback).
 export function handleLogin(url) {
   const state = url.searchParams.get("state") || "";

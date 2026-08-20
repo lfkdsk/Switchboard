@@ -1,8 +1,11 @@
 /**
- * D1-backed registry: machines, agent tokens, and the CLI-login handshake.
+ * D1-backed registry: machines, delegated access, agent tokens, and the
+ * CLI-login handshake.
  * The relay stays a transparent forwarder for terminal traffic; this module is
  * only the account/ownership bookkeeping around it.
  */
+
+import { githubUserByLogin } from "./auth.js";
 
 const enc = new TextEncoder();
 
@@ -71,26 +74,67 @@ export async function updateMachineStats(env, machineId, s) {
     machineId,
   ).run();
 }
-// Who owns this machine, and does it take peer connections? One row read answers
-// both questions the /ws gate asks, so it stays one round-trip to D1.
-export async function machineAccess(env, machineId) {
+// Owner or live grantee. A browser grant is full shell access; `peer` remains a
+// separate host-side opt-in that the Worker applies to agent-token clients.
+// Re-evaluated on every connection so a week-long session cookie never caches a
+// revoked grant.
+export async function machineAccess(env, machineId, accountId) {
   const row = await env.DB.prepare(
     "SELECT account_id, peer FROM machines WHERE machine_id=?",
   ).bind(machineId).first();
-  return row ? { accountId: row.account_id, peer: !!row.peer } : null;
+  if (!row) return null;
+  if (row.account_id === accountId) {
+    return { accountId: row.account_id, peer: !!row.peer, via: "owner", expiresAt: null };
+  }
+  const grant = await env.DB.prepare(
+    `SELECT expires_at FROM machine_grants
+      WHERE machine_id=? AND grantee_id=? AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ?)`,
+  ).bind(machineId, accountId, Date.now()).first();
+  return grant
+    ? { accountId: row.account_id, peer: !!row.peer, via: "grant", expiresAt: grant.expires_at ?? null }
+    : null;
 }
-export async function listMachines(env, accountId) {
-  const { results } = await env.DB.prepare(
-    // Stable order: created_at never changes, so rows keep a fixed position.
-    // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
-    "SELECT machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity, peer FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC",
-  ).bind(accountId).all();
-  // Hand the client a parsed object; a row written by an older daemon has none.
+
+const MACHINE_COLS = "machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity, peer";
+
+function withActivity(results) {
   return (results || []).map((r) => {
     let activity = null;
     if (r.activity) { try { activity = JSON.parse(r.activity); } catch {} }
     return { ...r, activity, peer: !!r.peer, online: isOnline(r.last_seen) };
   });
+}
+
+export async function listMachines(env, accountId) {
+  const { results } = await env.DB.prepare(
+    // Stable order: created_at never changes, so rows keep a fixed position.
+    // (Ordering by last_seen made rows re-shuffle on every heartbeat → jitter.)
+    `SELECT ${MACHINE_COLS} FROM machines WHERE account_id=? ORDER BY created_at ASC, machine_id ASC`,
+  ).bind(accountId).all();
+  return withActivity(results);
+}
+
+// Machines shared with an account, shaped like owned machines plus the owner
+// and expiry labels the dashboard/CLI need to explain why each row is visible.
+export async function listSharedWithMe(env, accountId) {
+  const cols = MACHINE_COLS.split(", ").map((c) => "m." + c).join(", ");
+  const { results } = await env.DB.prepare(
+    `SELECT ${cols}, m.account_login AS owner_login, g.expires_at
+       FROM machine_grants g JOIN machines m ON m.machine_id=g.machine_id
+      WHERE g.grantee_id=? AND g.revoked_at IS NULL
+        AND (g.expires_at IS NULL OR g.expires_at > ?)
+      ORDER BY m.created_at ASC, m.machine_id ASC`,
+  ).bind(accountId, Date.now()).all();
+  return withActivity(results).map((m) => ({ ...m, shared: true }));
+}
+
+export async function listReachableMachines(env, accountId) {
+  const [owned, shared] = await Promise.all([
+    listMachines(env, accountId),
+    listSharedWithMe(env, accountId),
+  ]);
+  return owned.concat(shared);
 }
 
 // A machine is "online" while its heartbeat stays fresh — the `online` column is
@@ -110,8 +154,82 @@ export async function deleteMachine(env, machineId, accountId) {
   ).bind(machineId).first();
   if (!row || row.account_id !== accountId) return { ok: false, reason: "not-found" };
   if (isOnline(row.last_seen)) return { ok: false, reason: "online" };
-  await env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId).run();
+  // A host keeps its machine id across reinstalls. Delete grants with the row so
+  // re-registering that id cannot revive access the owner believed was removed.
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM machine_grants WHERE machine_id=?").bind(machineId),
+    env.DB.prepare("DELETE FROM machines WHERE machine_id=?").bind(machineId),
+  ]);
   return { ok: true };
+}
+
+// ---- delegated machine access -------------------------------------------
+// A grant widens who may open the machine; ownership never moves. Only the
+// owner may grant/re-grant. The grantee may leave, but cannot share onward.
+
+async function machineOwner(env, machineId) {
+  const row = await env.DB.prepare(
+    "SELECT account_id, account_login FROM machines WHERE machine_id=?",
+  ).bind(machineId).first();
+  return row || null;
+}
+
+export async function grantMachine(env, machineId, ownerId, granteeLogin, expiresAt = null) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || owner.account_id !== ownerId) return { ok: false, reason: "not-found" };
+
+  const now = Date.now();
+  if (expiresAt != null && (!Number.isFinite(expiresAt) || expiresAt <= now)) {
+    return { ok: false, reason: "bad-expiry" };
+  }
+  const gh = await githubUserByLogin(String(granteeLogin || "").trim());
+  if (!gh) return { ok: false, reason: "unknown-login" };
+  if (gh.id === ownerId) return { ok: false, reason: "self" };
+
+  await env.DB.prepare(
+    `INSERT INTO machine_grants
+       (machine_id, grantee_id, grantee_login, granted_by_id, granted_by_login, created_at, expires_at, revoked_at)
+     VALUES (?,?,?,?,?,?,?,NULL)
+     ON CONFLICT (machine_id, grantee_id) DO UPDATE SET
+       grantee_login=excluded.grantee_login,
+       granted_by_id=excluded.granted_by_id,
+       granted_by_login=excluded.granted_by_login,
+       created_at=excluded.created_at,
+       expires_at=excluded.expires_at,
+       revoked_at=NULL`,
+  ).bind(machineId, gh.id, gh.login, owner.account_id, owner.account_login, now, expiresAt).run();
+
+  return {
+    ok: true,
+    grant: { grantee_id: gh.id, grantee_login: gh.login, created_at: now, expires_at: expiresAt },
+  };
+}
+
+export async function revokeGrant(env, machineId, granteeId, callerId) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || (owner.account_id !== callerId && granteeId !== callerId)) {
+    return { ok: false, reason: "not-found" };
+  }
+  const row = await env.DB.prepare(
+    "SELECT revoked_at FROM machine_grants WHERE machine_id=? AND grantee_id=?",
+  ).bind(machineId, granteeId).first();
+  if (!row || row.revoked_at != null) return { ok: false, reason: "not-found" };
+  await env.DB.prepare(
+    "UPDATE machine_grants SET revoked_at=? WHERE machine_id=? AND grantee_id=?",
+  ).bind(Date.now(), machineId, granteeId).run();
+  return { ok: true };
+}
+
+export async function listGrants(env, machineId, ownerId) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || owner.account_id !== ownerId) return null;
+  const { results } = await env.DB.prepare(
+    `SELECT grantee_id, grantee_login, created_at, expires_at
+       FROM machine_grants
+      WHERE machine_id=? AND revoked_at IS NULL
+      ORDER BY created_at ASC`,
+  ).bind(machineId).all();
+  return results || [];
 }
 
 // ---- CLI-login handshake (PKCE-like) -------------------------------------
