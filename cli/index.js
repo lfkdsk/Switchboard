@@ -871,7 +871,7 @@ function connect() {
 
   // Fatal server responses: 409 (another daemon on this circuit) and, in bound
   // mode, 401/403 (expired/invalid login). Retrying these would never succeed.
-  ws.on("unexpected-response", (_req, res) => {
+  ws.on("unexpected-response", (req, res) => {
     if (res.statusCode === 409) {
       console.error(
         "\nERROR: this " + (BOUND ? "machine" : "token") + " already has a daemon connected on the relay.\n" +
@@ -890,8 +890,17 @@ function connect() {
       for (const sid of sessions.keys()) killSession(sid);
       process.exit(1);
     }
-    log(`[relay] server responded ${res.statusCode}; will retry`);
+    // Everything else is transient (a 500 from the relay, a proxy hiccup) and
+    // should reconnect. That teardown is ours to do: ws only runs its own
+    // abortHandshake() when nothing is listening for `unexpected-response`
+    // (see ws/lib/websocket.js), and merely having this handler suppresses it.
+    // It also has to be destroy(err), not destroy() — with no error argument
+    // nothing reaches ws's request `error` handler, so no `close` is emitted,
+    // the socket sits in CONNECTING for ever, and the reconnect timer in the
+    // close handler below is never scheduled. The daemon stays up, logs a
+    // reassuring line, and is silently off the relay until someone restarts it.
     res.resume();
+    req.destroy(new Error(`relay responded ${res.statusCode} to the handshake`));
   });
 
   ws.on("message", (data, isBinary) => {
