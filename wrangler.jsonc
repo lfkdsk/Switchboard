@@ -23,7 +23,11 @@
     {
       "binding": "DB",
       "database_name": "switchboard_db",
-      "database_id": "1cd7072b-5e4b-49f5-88b8-1718f5d887d8"
+      "database_id": "1cd7072b-5e4b-49f5-88b8-1718f5d887d8",
+      // The production database predates Wrangler's migration ledger. The
+      // first file is a no-op baseline; every later schema change belongs here
+      // and is applied once by CI before the Worker is deployed.
+      "migrations_dir": "deploy-migrations"
     }
   ],
 

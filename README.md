@@ -331,6 +331,8 @@ which it's a clean reimplementation of.
 
 Want to own the stack? Deploy the relay to your own Cloudflare account:
 
+The Worker toolchain requires Node.js 22 or newer.
+
 ```bash
 git clone https://github.com/lfkdsk/Switchboard.git && cd Switchboard
 npm install
@@ -354,6 +356,19 @@ npx wrangler d1 execute switchboard_db --remote --file migrations/0002_add_peer.
 npx wrangler d1 execute switchboard_db --remote --file migrations/0004_add_grants.sql
 npx wrangler d1 execute switchboard_db --remote --file migrations/0005_add_share_codes.sql
 ```
+
+Those files are the historical/manual upgrade path for databases created before
+the current schema. Production CI uses Wrangler's migration ledger in
+`deploy-migrations/` instead. Its `0001_baseline.sql` is intentionally a no-op
+because the live database already has the schema above. Create every future
+production migration with:
+
+```bash
+npx wrangler d1 migrations create switchboard_db migration_name
+```
+
+Pull requests run the Worker tests. A push to `main` applies any new tracked D1
+migrations, deploys the Worker and static assets, then checks `/healthz`.
 
 Wrangler prints your URL (e.g. `https://switchboard.<subdomain>.workers.dev`).
 Point the daemon at it:
@@ -486,6 +501,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `public/fonts/` | Vendored Nerd Font symbol subsets (see [public/fonts/README.md](public/fonts/README.md)) |
 | `schema.sql` | D1 schema |
 | `migrations/` | Incremental D1 changes, for databases that predate a column |
+| `deploy-migrations/` | Wrangler-tracked production D1 migrations applied by CI |
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
 | `cli/` | `@switch-board/cli` — the host daemon |
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
