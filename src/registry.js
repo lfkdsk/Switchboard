@@ -39,17 +39,21 @@ export async function verifyAgentToken(env, token) {
 // `peer` is the host's own answer to "may my other machines run things here?",
 // re-stated on every connect — so flipping it is a daemon restart, not a support
 // ticket, and a machine that has gone away can't leave a stale `yes` behind.
-export async function registerMachine(env, machineId, account, name, peer) {
+export async function registerMachine(env, machineId, account, name, peer, platform = null, arch = null) {
   const existing = await env.DB.prepare("SELECT account_id FROM machines WHERE machine_id=?").bind(machineId).first();
   if (existing && existing.account_id !== account.id) return false;
   const now = Date.now();
   if (existing) {
-    await env.DB.prepare("UPDATE machines SET online=1, last_seen=?, name=?, peer=? WHERE machine_id=?")
-      .bind(now, name || "", peer ? 1 : 0, machineId).run();
+    await env.DB.prepare(
+      `UPDATE machines SET online=1, last_seen=?, name=?, peer=?,
+         platform=COALESCE(?, platform), arch=COALESCE(?, arch) WHERE machine_id=?`,
+    ).bind(now, name || "", peer ? 1 : 0, platform, arch, machineId).run();
   } else {
     await env.DB.prepare(
-      "INSERT INTO machines (machine_id, account_id, account_login, name, online, created_at, last_seen, peer) VALUES (?,?,?,?,1,?,?,?)",
-    ).bind(machineId, account.id, account.login, name || "", now, now, peer ? 1 : 0).run();
+      `INSERT INTO machines
+        (machine_id, account_id, account_login, name, online, created_at, last_seen, peer, platform, arch)
+       VALUES (?,?,?,?,1,?,?,?,?,?)`,
+    ).bind(machineId, account.id, account.login, name || "", now, now, peer ? 1 : 0, platform, arch).run();
   }
   return true;
 }
@@ -63,12 +67,13 @@ export async function setMachineOffline(env, machineId) {
 // dashboard shows accurate, self-healing status (online = last_seen is fresh).
 export async function updateMachineStats(env, machineId, s) {
   await env.DB.prepare(
-    "UPDATE machines SET online=1, last_seen=?, rtt=?, cpu=?, mem_used=?, mem_total=?, activity=? WHERE machine_id=?",
+    `UPDATE machines SET online=1, last_seen=?, rtt=?, cpu=?, mem_used=?, mem_total=?,
+       activity=?, platform=COALESCE(?, platform), arch=COALESCE(?, arch) WHERE machine_id=?`,
   ).bind(
     Date.now(), s.rtt ?? null, s.cpu ?? null, s.memUsed ?? null, s.memTotal ?? null,
     // Stored as an opaque JSON blob: it's display-only, ephemeral, and rides in
     // the UPDATE the heartbeat already performs, so it costs no extra write.
-    s.act ? JSON.stringify(s.act) : null,
+    s.act ? JSON.stringify(s.act) : null, s.platform ?? null, s.arch ?? null,
     machineId,
   ).run();
 }
@@ -94,7 +99,7 @@ export async function machineAccess(env, machineId, accountId) {
     : null;
 }
 
-const MACHINE_COLS = "machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, activity, peer";
+const MACHINE_COLS = "machine_id, name, online, created_at, last_seen, rtt, cpu, mem_used, mem_total, platform, arch, activity, peer";
 
 function withActivity(results) {
   return (results || []).map((r) => {

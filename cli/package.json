@@ -1,7 +1,7 @@
 {
   "name": "@switch-board/cli",
   "version": "1.2.1",
-  "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay (bound to your account, or via a one-off token), and reaches your other machines with exec/shell.",
+  "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay and reaches your other machines with exec, file copy, jobs, and interactive shells.",
   "license": "MIT",
   "bin": {
     "switchboard": "index.js"
@@ -14,6 +14,7 @@
     "index.js",
     "activity.js",
     "peer.js",
+    "lib/",
     "scripts/"
   ],
   "repository": {
