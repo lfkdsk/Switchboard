@@ -177,6 +177,9 @@ token you already hold, use `switchboard service install --token <token>`.
 > but **not Linux**, so installing compiles it from source. If `npm install`
 > fails, you're missing a toolchain:
 > `apt install -y python3 make g++` (or `dnf groupinstall "Development Tools"`).
+> On a read-only distro where you can't install one — SteamOS, Silverblue — see
+> [Running on a Steam Deck](docs/steam-deck.md), which also covers suspend,
+> waking the machine over Wi-Fi, and the `bash -lc` PATH trap.
 
 > **No systemd?** On Alpine/Devuan (OpenRC) or WSL without systemd, `service
 > install` will tell you so — run `switchboard` under your own supervisor
