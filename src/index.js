@@ -201,6 +201,8 @@ async function routeWebSocket(request, env, url) {
         env, machineId, account,
         url.searchParams.get("name") || "",
         url.searchParams.get("peer") === "1",
+        url.searchParams.get("platform") || null,
+        url.searchParams.get("arch") || null,
       );
       if (!ok) return new Response("machine is owned by another account\n", { status: 403 });
     } else {

@@ -34,6 +34,8 @@ const pty = require("node-pty");
 const fixPtyPerms = require("./scripts/fix-pty-perms");
 const activity = require("./activity");
 const peer = require("./peer");
+const { JobStore } = require("./lib/job-store");
+const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
 const pkg = require("./package.json");
 
 // ---- logging -------------------------------------------------------------
@@ -86,6 +88,13 @@ Reachable machines (signed in; the target must allow peers):
   switchboard exec <node> <cmd…>
                                Run a command over there; its stdout, stderr and
                                exit code come back here.
+  switchboard cp <source> <destination>
+                               Copy one file to or from a reachable machine.
+  switchboard jobs <node>      List detached jobs kept on that machine.
+  switchboard logs <node> <job> [--follow]
+                               Read a detached job's saved output.
+  switchboard wait <node> <job>
+                               Wait for a detached job and return its exit code.
   switchboard shell <node>     Open an interactive shell over there. Ctrl-] detaches.
 
   <node> is a hostname or any unambiguous prefix of it (or of the machine id).
@@ -100,9 +109,13 @@ Options:
   -v, --version         Print version and exit.
   -h, --help            Show this help and exit.
 
-  nodes: --json                Machine-readable output.
+  nodes/jobs: --json           Machine-readable output.
   exec:  --cwd <dir>           Working directory over there. Default: its home.
          --timeout <seconds>   Give up and kill the command after this long.
+         --login               Run through a login shell.
+         --shell <path>        Override the target shell for this command.
+         --detach              Start a durable job and print its id immediately.
+  logs:  --follow              Keep reading until the job finishes.
   shell: [sid] | --attach      Reattach: to that session, or to the newest one.
 
 Environment (overridden by the flags above):
@@ -154,8 +167,26 @@ function parseArgs(argv) {
 // stop at the first bare word after it: that word starts the remote command, and
 // everything from there belongs to the far end — so `exec box ls -la` keeps its
 // -la instead of losing it to this parser. A literal `--` ends our flags too.
-function parsePeerArgs(argv) {
+function parsePeerArgs(argv, command) {
   const opts = {};
+  if (command !== "exec") {
+    const positional = [];
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === "-h" || a === "--help") opts.help = true;
+      else if (a === "--follow" && command === "logs") opts.follow = true;
+      else if (a === "--json" && (command === "nodes" || command === "ls" || command === "jobs")) opts.json = true;
+      else if (a === "--attach" && command === "shell") opts.attach = true;
+      else if (a === "-s" || a === "--server") opts.server = argv[++i];
+      else if (a.startsWith("--server=")) opts.server = a.slice(a.indexOf("=") + 1);
+      else if (a === "--") { positional.push(...argv.slice(i + 1)); break; }
+      else if (a.startsWith("-")) { console.error(`Unknown option: ${a}`); process.exit(1); }
+      else positional.push(a);
+    }
+    opts.target = positional[0];
+    opts.rest = positional.slice(1);
+    return opts;
+  }
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i];
@@ -174,6 +205,10 @@ function parsePeerArgs(argv) {
       case "--json": opts.json = true; break;
       case "--cwd": opts.cwd = take(); break;
       case "--timeout": opts.timeout = Number(take()); break;
+      case "--login": opts.login = true; break;
+      case "--shell": opts.shell = take(); break;
+      case "--detach": opts.detach = true; break;
+      case "--follow": opts.follow = true; break;
       case "--attach": opts.attach = true; break;
       default:
         console.error(`Unknown option: ${a}\n`);
@@ -186,11 +221,11 @@ function parsePeerArgs(argv) {
 }
 
 const rawArgs = process.argv.slice(2);
-const PEER_SUBS = ["nodes", "ls", "exec", "shell"];
+const PEER_SUBS = ["nodes", "ls", "exec", "cp", "jobs", "logs", "wait", "shell"];
 const sub = ["login", "logout", "service", ...PEER_SUBS].includes(rawArgs[0]) ? rawArgs.shift() : null;
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
-const args = PEER_SUBS.includes(sub) ? parsePeerArgs(rawArgs) : parseArgs(rawArgs);
+const args = PEER_SUBS.includes(sub) ? parsePeerArgs(rawArgs, sub) : parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
 
@@ -258,7 +293,7 @@ function doLogout() {
 }
 
 // ---- peer commands -------------------------------------------------------
-// `nodes` / `exec` / `shell` don't expose anything: they spawn no PTY and
+// Peer subcommands don't expose anything: they spawn no PTY and
 // register nothing. They're this machine acting as a *client* of the relay,
 // using the same account credential the daemon does, to reach the machines the
 // dashboard would show you. The far end is the exec/session handling below.
@@ -287,6 +322,14 @@ function doPeer() {
   const run = (p) => p.catch((e) => { console.error("\n" + ((e && e.message) || e) + "\n"); process.exit(1); });
 
   if (sub === "nodes" || sub === "ls") return run(peer.cmdNodes(ctx, { json: !!args.json }));
+  if (sub === "cp") {
+    if (!args.target || args.rest.length !== 1) {
+      console.error("\nUsage: switchboard cp <node>:/remote/path ./local/path\n" +
+        "       switchboard cp ./local/path <node>:/remote/path\n");
+      process.exit(1);
+    }
+    return run(peer.cmdCopy(ctx, { source: args.target, destination: args.rest[0] }));
+  }
 
   if (!args.target) {
     console.error(`\nWhich machine? Usage: switchboard ${sub} <node>${sub === "exec" ? " <command…>" : ""}\n\n` +
@@ -298,6 +341,16 @@ function doPeer() {
     // sitting before the machine name would be ambiguous about which is which.
     return run(peer.cmdShell(ctx, { target: args.target, sid: args.rest[0] || null, attach: !!args.attach }));
   }
+  if (sub === "jobs") {
+    if (args.rest.length) die("Usage: switchboard jobs <node> [--json]");
+    return run(peer.cmdJobs(ctx, { target: args.target, json: !!args.json }));
+  }
+  if (sub === "logs" || sub === "wait") {
+    if (args.rest.length !== 1) die(`Usage: switchboard ${sub} <node> <job>${sub === "logs" ? " [--follow]" : ""}`);
+    return run(sub === "logs"
+      ? peer.cmdLogs(ctx, { target: args.target, job: args.rest[0], follow: !!args.follow })
+      : peer.cmdWait(ctx, { target: args.target, job: args.rest[0] }));
+  }
   // Joined the way ssh joins it, so quoting is resolved once — over there.
   const command = args.rest.join(" ").trim();
   if (!command) {
@@ -308,8 +361,13 @@ function doPeer() {
     console.error("\n--timeout takes a number of seconds.\n");
     process.exit(1);
   }
+  if (args.detach && args.timeout) {
+    console.error("\n--timeout cannot be combined with --detach; use `switchboard wait` to observe the job.\n");
+    process.exit(1);
+  }
   return run(peer.cmdExec(ctx, {
     target: args.target, command, cwd: args.cwd || null, timeout: args.timeout || 0,
+    login: !!args.login, shell: args.shell || null, detach: !!args.detach,
   }));
 }
 
@@ -716,7 +774,9 @@ function setupConnection() {
     if (!cfg.machineId) { cfg.machineId = MACHINE; saveConfig(cfg); }
     AGENT = cfg.agentToken;
     wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&machine=" + encodeURIComponent(MACHINE) +
-      "&name=" + encodeURIComponent(os.hostname()) + (PEER ? "&peer=1" : "");
+      "&name=" + encodeURIComponent(os.hostname()) +
+      "&platform=" + encodeURIComponent(process.platform) +
+      "&arch=" + encodeURIComponent(process.arch) + (PEER ? "&peer=1" : "");
     browseUrl = SERVER + "/";
   } else {
     // 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
@@ -863,6 +923,8 @@ const PONG_TIMEOUT_MS = 5 * STATS_INTERVAL_MS;
 const HANDSHAKE_TIMEOUT_MS = 15000;
 const activeDownloads = new Map(); // id -> fs.ReadStream
 const activeUploads = new Map(); // id -> { stream, finalPath }
+let jobStore = null;
+const PROTOCOL_FEATURES = ["cp-sha256-v1", "exec-options-v1", "jobs-v1"];
 
 function sendCtl(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -934,6 +996,9 @@ function connect() {
     let msg;
     try { msg = JSON.parse(text); } catch { return; }
     switch (msg.type) {
+      case "capabilities":
+        sendCtl({ type: "capabilities", id: msg.id, version: pkg.version, features: PROTOCOL_FEATURES });
+        break;
       case "open":
         openSession(msg.sid, msg.cols, msg.rows);
         sendStats();
@@ -952,9 +1017,13 @@ function connect() {
       case "ping": sendCtl({ type: "pong", t: msg.t }); break; // browser↔daemon RTT probe
       case "exec": startExec(msg); break;
       case "exec-stdin": execStdin(msg.id, msg.data); break;
-      case "exec-stdin-end": execStdinEnd(msg.id); break;
+      case "exec-stdin-end": execStdinEnd(msg.id, msg.sha256); break;
       case "exec-kill": killExec(msg.id, msg.signal); break;
-      case "dl-open": startDownload(msg.id, msg.path); break;
+      case "dl-open": startDownload(msg.id, msg.path, msg.base === "home"); break;
+      case "dl-cancel": cancelDownload(msg.id); break;
+      case "job-list": sendJobList(msg.id); break;
+      case "job-read": sendJobRead(msg); break;
+      case "job-get": sendJobStatus(msg); break;
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
       case "ul-end": endUpload(msg.id); break;
@@ -964,7 +1033,11 @@ function connect() {
         // Nobody is left on this circuit, so no running command still has a
         // caller: its output is going nowhere and nothing can stop it any more.
         // This is the SIGHUP an ssh session would have delivered.
-        if (!msg.online) for (const id of [...activeExecs.keys()]) killExec(id, "SIGTERM");
+        if (!msg.online) {
+          for (const [id, running] of activeExecs) {
+            if (!running.detached) killExec(id, "SIGTERM");
+          }
+        }
         break;
     }
   });
@@ -978,6 +1051,7 @@ function connect() {
       log("[relay] replaced by a newer daemon for this " + (BOUND ? "machine" : "token") + "; exiting.");
       emitStatus("fatal", { reason: "replaced", code });
       for (const sid of sessions.keys()) killSession(sid);
+      for (const id of activeExecs.keys()) killExec(id, "SIGTERM");
       process.exit(0);
     }
     // Sessions are kept across reconnects; their onData handlers check ws state.
@@ -985,10 +1059,11 @@ function connect() {
     activeDownloads.clear();
     for (const up of activeUploads.values()) up.stream.destroy();
     activeUploads.clear();
-    // Exec dies with the link it was invoked over: its caller is already gone,
-    // and a command whose output has nowhere to go would fill a pipe and hang.
-    // (Long jobs belong in a session, which does survive a reconnect.)
-    for (const id of [...activeExecs.keys()]) { killExec(id, "SIGTERM"); activeExecs.delete(id); }
+    // Attached exec dies with its caller; detached jobs keep writing to disk
+    // and remain queryable after the relay connection comes back.
+    for (const [id, running] of activeExecs) {
+      if (!running.detached) { running.abandoned = true; killExec(id, "SIGTERM"); }
+    }
     log(`[relay] disconnected, retrying in ${reconnectDelay}ms`);
     emitStatus("disconnected", { code, retryInMs: reconnectDelay });
     setTimeout(connect, reconnectDelay);
@@ -1084,7 +1159,7 @@ function endUpload(id) {
 }
 
 // Stream a host file to the browser as base64 chunks, with backpressure.
-function startDownload(id, rawPath) {
+function startDownload(id, rawPath, relativeToHome = false) {
   if (!rawPath) {
     sendCtl({ type: "dl-error", id, message: "no path given" });
     return;
@@ -1093,7 +1168,10 @@ function startDownload(id, rawPath) {
   if (filePath === "~" || filePath.startsWith("~/")) {
     filePath = path.join(os.homedir(), filePath.slice(1));
   }
-  filePath = path.resolve(filePath);
+  // cp explicitly asks for home-relative paths to match exec/upload semantics.
+  // An old web client omits the flag and keeps the download protocol's original
+  // daemon-cwd behaviour.
+  filePath = relativeToHome ? path.resolve(os.homedir(), filePath) : path.resolve(filePath);
 
   fs.stat(filePath, (err, st) => {
     if (err) {
@@ -1104,12 +1182,18 @@ function startDownload(id, rawPath) {
       sendCtl({ type: "dl-error", id, message: "path is a directory" });
       return;
     }
+    if (!st.isFile()) {
+      sendCtl({ type: "dl-error", id, message: "path is not a regular file" });
+      return;
+    }
     sendCtl({ type: "dl-meta", id, name: path.basename(filePath), size: st.size, mime: "application/octet-stream" });
 
+    const hash = crypto.createHash("sha256");
     const stream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
     activeDownloads.set(id, stream);
     stream.on("data", (chunk) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) { stream.destroy(); return; }
+      hash.update(chunk);
       stream.pause(); // resume once this chunk has flushed -> backpressure
       ws.send(JSON.stringify({ type: "dl-chunk", id, data: chunk.toString("base64") }), () => {
         if (ws && ws.readyState === WebSocket.OPEN) stream.resume();
@@ -1117,7 +1201,7 @@ function startDownload(id, rawPath) {
     });
     stream.on("end", () => {
       activeDownloads.delete(id);
-      sendCtl({ type: "dl-end", id });
+      sendCtl({ type: "dl-end", id, sha256: hash.digest("hex") });
       log(`[file] sent ${filePath} (${st.size} bytes)`);
     });
     stream.on("error", (e) => {
@@ -1125,6 +1209,11 @@ function startDownload(id, rawPath) {
       sendCtl({ type: "dl-error", id, message: e.message });
     });
   });
+}
+function cancelDownload(id) {
+  const stream = activeDownloads.get(id);
+  if (stream) stream.destroy();
+  activeDownloads.delete(id);
 }
 
 // ---- remote exec ---------------------------------------------------------
@@ -1136,18 +1225,10 @@ function startDownload(id, rawPath) {
 // The relay only lets a peer reach here when this daemon declared `peer=1` on
 // connect (SWITCHBOARD_PEER), so the gate is upstream; by the time a message
 // arrives it has already been checked against the account that owns this host.
-const activeExecs = new Map(); // id -> child process
+// The detached bit is needed when a caller disconnects: only attached commands
+// should receive the ssh-like hangup, while detached jobs keep writing to disk.
+const activeExecs = new Map();
 const MAX_EXECS = 8;
-
-// A *login* shell. The daemon's own environment is not the user's: started by
-// systemd or launchd it inherits a stub PATH, so `node`, `claude` or `cargo`
-// installed by a version manager would simply not exist. -l reads the profile,
-// which is what makes a command behave the way it does when you type it.
-function shellCommandArgs(cmd) {
-  return process.platform === "win32"
-    ? ["-NoLogo", "-NoProfile", "-Command", cmd]
-    : ["-lc", cmd];
-}
 
 function execFail(id, message) {
   sendCtl({ type: "exec-exit", id, code: 126, error: message });
@@ -1156,7 +1237,7 @@ function execFail(id, message) {
 function startExec(msg) {
   const id = msg.id;
   if (!id || activeExecs.has(id)) return;
-  const cmd = typeof msg.cmd === "string" ? msg.cmd.trim() : "";
+  let cmd = typeof msg.cmd === "string" ? msg.cmd.trim() : "";
   if (!cmd) return execFail(id, "empty command");
   // A peer is already trusted to run anything here; the cap is against a runaway
   // loop on the other end, not against its author.
@@ -1164,10 +1245,61 @@ function startExec(msg) {
 
   let cwd = msg.cwd ? String(msg.cwd) : os.homedir();
   if (cwd === "~" || cwd.startsWith("~/")) cwd = path.join(os.homedir(), cwd.slice(1));
+  let selectedShell = msg.shell ? String(msg.shell) : SHELL;
+  // An absent flag preserves the behaviour expected by older clients. New
+  // clients send false explicitly, so --login is an actual per-command choice.
+  const login = msg.login === undefined ? true : !!msg.login;
+  const detached = !!msg.detach;
+  let upload = null;
+  try {
+    if (msg.upload) {
+      let destination = String(msg.upload.path || "");
+      if (!destination) throw new Error("no upload destination given");
+      if (/[\\/]$/.test(destination)) throw new Error("target path is a directory; choose a file path");
+      if (destination === "~" || destination.startsWith("~/")) {
+        destination = path.join(os.homedir(), destination.slice(1));
+      }
+      destination = path.resolve(cwd, destination);
+      const parent = path.dirname(destination);
+      const parentStat = fs.statSync(parent);
+      if (!parentStat.isDirectory()) throw new Error(`target parent is not a directory: ${parent}`);
+      try {
+        if (fs.statSync(destination).isDirectory()) throw new Error(`target is a directory: ${destination}`);
+      } catch (e) {
+        if (e.code !== "ENOENT") throw e;
+      }
+      const tempPath = path.join(parent, `.${path.basename(destination)}.switchboard-${id}.part`);
+      const fd = fs.openSync(tempPath, "wx", 0o600);
+      fs.closeSync(fd);
+      upload = { destination, tempPath, expected: null };
+      if (process.platform === "win32") {
+        selectedShell = "powershell.exe";
+        const encodedPath = Buffer.from(tempPath, "utf16le").toString("base64");
+        cmd = `$p=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedPath}'));` +
+          "$i=[Console]::OpenStandardInput();$o=[IO.File]::OpenWrite($p);" +
+          "try{$i.CopyTo($o)}finally{$o.Dispose()}";
+      } else {
+        selectedShell = "/bin/sh";
+        cmd = `cat > ${shellQuote(tempPath)}`;
+      }
+    }
+  } catch (e) {
+    return execFail(id, e.code === "ENOENT" ? `target directory does not exist: ${path.dirname(String(msg.upload?.path || ""))}` : e.message);
+  }
+
+  let job = null;
+  if (detached) {
+    try {
+      job = jobStore.create({ id, command: cmd, cwd, shell: selectedShell, login });
+    } catch (e) {
+      if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
+      return execFail(id, e.message);
+    }
+  }
 
   let child;
   try {
-    child = spawn(SHELL, shellCommandArgs(cmd), {
+    child = spawn(selectedShell, shellCommandArgs(cmd, login), {
       cwd,
       env: process.env,
       // Its own process group, so a Ctrl-C on the far end can take down the
@@ -1176,15 +1308,40 @@ function startExec(msg) {
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (e) {
+    if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
+    if (job) void jobStore.finish(id, { status: "failed", error: e.message });
     return execFail(id, e.message);
   }
-  activeExecs.set(id, child);
+  activeExecs.set(id, { child, detached, upload });
   log(`[exec ${id.slice(0, 8)}] ${cmd}`);
+  if (detached) sendCtl({ type: "exec-job", id, job: id });
+  else if (upload) sendCtl({ type: "exec-ready", id });
+  if (detached) {
+    jobStore.writer(id)?.on("error", (e) => {
+      const running = activeExecs.get(id);
+      if (!running) return;
+      running.outputError = e;
+      killExec(id, "SIGTERM");
+    });
+  }
 
   // Same backpressure shape as a download: pause until the frame has flushed,
   // so a command that floods stdout can't outrun the socket.
   const pump = (stream, type) => {
     stream.on("data", (chunk) => {
+      if (detached) {
+        try {
+          if (!jobStore.append(id, chunk)) {
+            stream.pause();
+            jobStore.writer(id)?.once("drain", () => stream.resume());
+          }
+        } catch (e) {
+          const running = activeExecs.get(id);
+          if (running) running.outputError = e;
+          killExec(id, "SIGTERM");
+        }
+        return;
+      }
       if (!ws || ws.readyState !== WebSocket.OPEN) { killExec(id); return; }
       stream.pause();
       ws.send(JSON.stringify({ type, id, data: chunk.toString("base64") }), () => {
@@ -1198,29 +1355,81 @@ function startExec(msg) {
   // Without stdin the caller is not going to send any, and a command that reads
   // it (`cat`, `read`) would hang forever waiting on a pipe nobody will close.
   child.stdin.on("error", () => {}); // the child may exit before we finish writing
-  if (!msg.stdin) child.stdin.end();
+  if (detached || !msg.stdin) child.stdin.end();
 
   child.on("error", (e) => {
     if (!activeExecs.delete(id)) return;
-    execFail(id, e.code === "ENOENT" ? `no such directory: ${cwd}` : e.message);
+    if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
+    const message = e.code === "ENOENT" ? `shell or working directory not found (${selectedShell}, ${cwd})` : e.message;
+    if (detached) void jobStore.finish(id, { status: "failed", error: message });
+    else execFail(id, message);
   });
-  child.on("close", (code, signal) => {
-    if (!activeExecs.delete(id)) return;
-    sendCtl({ type: "exec-exit", id, code: code == null ? null : code, signal: signal || null });
+  child.on("close", async (code, signal) => {
+    const running = activeExecs.get(id);
+    if (!running || !activeExecs.delete(id)) return;
+    let error = null;
+    let sha256 = null;
+    if (upload) {
+      try {
+        if (running.uploadProtocolError) {
+          try { fs.unlinkSync(upload.tempPath); } catch {}
+          error = running.uploadProtocolError.message;
+          code = 1;
+        } else if (code !== 0 || signal) {
+          try { fs.unlinkSync(upload.tempPath); } catch {}
+          error = "upload failed; partial target was removed";
+        } else {
+          sha256 = await verifyUploadedFile(upload.tempPath, upload.expected);
+          if (process.platform === "win32") {
+            try { fs.unlinkSync(upload.destination); } catch (e) { if (e.code !== "ENOENT") throw e; }
+          }
+          fs.renameSync(upload.tempPath, upload.destination);
+        }
+      } catch (e) {
+        try { fs.unlinkSync(upload.tempPath); } catch {}
+        error = e.message;
+        code = 1;
+      }
+    }
+    if (detached) {
+      const outputError = running.outputError;
+      await jobStore.finish(id, {
+        status: outputError ? "failed" : "exited", exitCode: code, signal: signal || null,
+        error: outputError ? `could not save job output: ${outputError.message}` : error,
+      });
+    } else if (!running.abandoned) {
+      sendCtl({ type: "exec-exit", id, code: code == null ? null : code, signal: signal || null, error, sha256 });
+    }
     log(`[exec ${id.slice(0, 8)}] exited (${signal || code})`);
   });
 }
 
 function execStdin(id, b64) {
-  const child = activeExecs.get(id);
-  if (child && child.stdin.writable) child.stdin.write(Buffer.from(String(b64 || ""), "base64"));
+  const running = activeExecs.get(id);
+  const child = running?.child;
+  if (child && child.stdin.writable) {
+    child.stdin.write(Buffer.from(String(b64 || ""), "base64"), () => {
+      if (running.upload) sendCtl({ type: "exec-stdin-ready", id });
+    });
+  }
 }
-function execStdinEnd(id) {
-  const child = activeExecs.get(id);
-  if (child && child.stdin.writable) child.stdin.end();
+function execStdinEnd(id, sha256) {
+  const running = activeExecs.get(id);
+  const child = running?.child;
+  if (!child || !child.stdin.writable) return;
+  if (running.upload) {
+    const expected = String(sha256 || "");
+    if (!/^[a-f0-9]{64}$/.test(expected)) {
+      running.uploadProtocolError = new Error("client did not provide a valid upload checksum");
+      killExec(id, "SIGTERM");
+      return;
+    }
+    running.upload.expected = expected;
+  }
+  child.stdin.end();
 }
 function killExec(id, signal) {
-  const child = activeExecs.get(id);
+  const child = activeExecs.get(id)?.child;
   if (!child) return;
   const sig = signal === "SIGKILL" ? "SIGKILL" : signal === "SIGTERM" ? "SIGTERM" : "SIGINT";
   try {
@@ -1229,6 +1438,30 @@ function killExec(id, signal) {
     if (process.platform === "win32") child.kill(sig);
     else process.kill(-child.pid, sig);
   } catch { try { child.kill(sig); } catch {} }
+}
+
+function sendJobList(id) {
+  if (!id) return;
+  sendCtl({ type: "job-list", id, jobs: jobStore.list() });
+}
+function sendJobRead(msg) {
+  if (!msg.id || !msg.job) return;
+  try {
+    const chunk = jobStore.read(String(msg.job), msg.offset, 64 * 1024);
+    sendCtl({
+      type: "job-chunk", id: msg.id, job: msg.job, data: chunk.data.toString("base64"),
+      offset: chunk.offset, size: chunk.size, record: jobStore.get(String(msg.job)),
+    });
+  } catch (e) {
+    sendCtl({ type: "job-error", id: msg.id, job: msg.job, message: e.message });
+  }
+}
+function sendJobStatus(msg) {
+  if (!msg.id || !msg.job) return;
+  const record = jobStore.get(String(msg.job));
+  sendCtl(record
+    ? { type: "job-status", id: msg.id, job: msg.job, record }
+    : { type: "job-error", id: msg.id, job: msg.job, message: "no such job" });
 }
 
 // ---- host metrics --------------------------------------------------------
@@ -1308,6 +1541,10 @@ function sendStats() {
   // Claude Code sessions. cpu alone can't answer this: an agent blocked on an
   // API call looks exactly like an idle machine.
   const act = activity.snapshot(sessions, cwdCache);
+  // Activity is already persisted as an opaque blob by old relays, which lets
+  // new CLIs discover OS/arch without a schema migration or relay deployment.
+  act.platform = process.platform;
+  act.arch = process.arch;
   try {
     ws.send(JSON.stringify({
       type: "stats",
@@ -1318,6 +1555,7 @@ function sendStats() {
       ip: primaryIp(),
       host: os.hostname(),
       platform: process.platform,
+      arch: process.arch,
       rtt: lastRtt, // relay-edge round-trip from the previous tick (ms)
       act,
     }));
@@ -1356,6 +1594,11 @@ function sendStats() {
   claimRunRecord();
   process.on("exit", releaseRunRecord);
   refreshMemAvailable();
+  // Different local daemons may legally serve different circuits at once. Keep
+  // their job ledgers apart so one startup cannot mark the other's jobs unknown.
+  const jobScope = BOUND ? MACHINE : circuitId(false, TOKEN);
+  jobStore = new JobStore({ dir: path.join(CONFIG_DIR, "jobs", jobScope) }).init();
+  setInterval(() => jobStore.cleanup(), 60 * 60 * 1000);
   setInterval(sendStats, STATS_INTERVAL_MS);
   setInterval(refreshCwds, 10000);
   log(`connecting to ${SERVER} …`);
@@ -1368,6 +1611,7 @@ function sendStats() {
     log(`shutting down (${sig}).`);
     emitStatus("stopping", { signal: sig });
     for (const sid of sessions.keys()) killSession(sid);
+    for (const id of activeExecs.keys()) killExec(id, "SIGTERM");
     process.exit(0);
   };
   process.on("SIGINT", shutdown("SIGINT"));

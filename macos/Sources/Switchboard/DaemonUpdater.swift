@@ -197,6 +197,16 @@ final class DaemonUpdater: ObservableObject {
                 try? fm.createSymbolicLink(at: link, withDestinationURL: target)
             }
         }
+        // npm's bin entry is a symlink to this file. Repair older staged
+        // updates here as well as new ones so one bad mode cannot strand users.
+        do {
+            try fm.setAttributes([.posixPermissions: 0o755],
+                                 ofItemAtPath: dir.appendingPathComponent("index.js").path)
+        } catch {
+            try? fm.removeItem(at: marker)
+            log("rejected update \(version): could not make index.js executable")
+            return nil
+        }
         return (version, dir)
     }
 
@@ -293,6 +303,10 @@ final class DaemonUpdater: ObservableObject {
         let dest = updates.appendingPathComponent(meta.version)
         try? fm.removeItem(at: dest)
         try fm.moveItem(at: extracted, to: dest)
+        // The package tarball's mode is not reliable after extraction and the
+        // installed `switchboard` bin is a symlink to this entry point.
+        try fm.setAttributes([.posixPermissions: 0o755],
+                             ofItemAtPath: dest.appendingPathComponent("index.js").path)
 
         // Marker last, atomically (write-temp + rename): a crash mid-stage
         // leaves the previous version live.

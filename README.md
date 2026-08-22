@@ -230,9 +230,10 @@ Sign in on two machines and each one can see and drive the other — no browser 
 the middle:
 
 ```bash
-switchboard nodes                      # owned + shared machines, live
-switchboard exec build-box npm test    # run something over there
-switchboard shell build-box            # a shell over there, in this terminal
+switchboard nodes                         # owned + shared machines, OS/arch, live status
+switchboard exec build-box npm test       # run something over there
+switchboard cp ./app.tgz build-box:/tmp/app.tgz  # copy one file in either direction
+switchboard shell build-box               # a shell over there, in this terminal
 ```
 
 `<node>` is a hostname, or any unambiguous prefix of one (or of the machine id).
@@ -256,15 +257,45 @@ switchboard nodes --json               # machine-readable, for the agent to read
 
 stdout and stderr come back unmixed, the exit code is the remote one, piped stdin
 is forwarded, and Ctrl-C reaches the remote *process group* — so it composes with
-everything else a shell does, including `&&`, pipes and `$?`. The command runs
-under a login shell over there, so `PATH` is the one you'd get in a terminal, not
-the stub a launchd/systemd daemon inherits. Arguments are joined the way `ssh`
-joins them and parsed by the far shell, so quote anything your local shell
-shouldn't touch:
+everything else a shell does, including `&&`, pipes and `$?`. Arguments are joined
+the way `ssh` joins them and parsed by the far shell, so quote anything your local
+shell shouldn't touch. Use `--login` when a daemon launched by systemd/launchd
+needs the PATH from your shell profile, or `--shell` when zsh's unmatched-glob
+behaviour is wrong for one command:
 
 ```bash
 switchboard exec build-box 'cd ~/app && git pull && npm test'   # one remote shell
 switchboard exec build-box --cwd ~/app --timeout 600 npm test   # same, spelled out
+switchboard exec build-box --login which xcodebuild
+switchboard exec build-box --shell /bin/bash 'rm -f dir/*.png && echo done'
+```
+
+For work that must survive the calling machine disconnecting, detach it. The job
+record and combined stdout/stderr live on the target machine, under its
+per-daemon `~/.switchboard/jobs/` subdirectory, rather than on the caller:
+
+```bash
+JOB=$(switchboard exec build-box --detach 'xcodebuild ...')
+switchboard jobs build-box
+switchboard logs build-box "$JOB" --follow
+switchboard wait build-box "$JOB"       # exits with xcodebuild's exit code
+```
+
+Each job keeps at most 64 MiB of output and records how many later bytes were
+omitted. Finished and unknown jobs are kept for 24 hours, with at most 100 job
+records per target daemon. If the daemon restarts, a job that had been running is
+reported as `unknown`; completed records remain queryable.
+
+`cp` currently transfers one regular file. Downloads reuse the dashboard's
+streaming download protocol; uploads stream the local file to a target-side
+stdin sink (`cat` on POSIX) through exec. Both directions verify SHA-256 before replacing the
+destination, and failed staged files are removed. Paths with spaces or shell
+metacharacters are safe. Directories are rejected explicitly rather than copied
+partially. Relative remote paths are resolved from the target user's home:
+
+```bash
+switchboard cp build-box:~/artifacts/app.zip ./app.zip
+switchboard cp ./config.json build-box:'~/app/config.json'
 ```
 
 `shell` is the browser terminal in your terminal, on the same sessions: **Ctrl-]**
@@ -355,6 +386,7 @@ whether it is safe to re-run:
 npx wrangler d1 execute switchboard_db --remote --file migrations/0002_add_peer.sql
 npx wrangler d1 execute switchboard_db --remote --file migrations/0004_add_grants.sql
 npx wrangler d1 execute switchboard_db --remote --file migrations/0005_add_share_codes.sql
+npx wrangler d1 execute switchboard_db --remote --file migrations/0006_add_platform_arch.sql
 ```
 
 Those files are the historical/manual upgrade path for databases created before
@@ -417,6 +449,13 @@ switchboard nodes            List every owned or shared machine you can reach.
 switchboard exec <node> <cmd…>
                              Run a command on a reachable peer machine; its
                              stdout, stderr and exit code come back here.
+switchboard cp <source> <destination>
+                             Copy one file to or from a reachable peer.
+switchboard jobs <node>      List detached jobs retained on the target.
+switchboard logs <node> <job> [--follow]
+                             Read or follow a detached job's output.
+switchboard wait <node> <job>
+                             Wait for completion and return the job's exit code.
 switchboard shell <node>     Open an interactive shell on a reachable peer
                              machine. Ctrl-] detaches.
 ```
@@ -431,8 +470,13 @@ switchboard shell <node>     Open an interactive shell on a reachable peer
 | `-v, --version`       | Print version and exit. |
 | `-h, --help`          | Show help and exit. |
 | `nodes --json`        | Machine-readable node list. |
+| `jobs --json`         | Machine-readable retained job list. |
 | `exec --cwd <dir>`    | Working directory on the far machine. Default: its home. |
 | `exec --timeout <s>`  | Kill the remote command after this many seconds. |
+| `exec --login` | Run this command through the target's login shell (`-lc`). |
+| `exec --shell <path>` | Override the target shell for this command. |
+| `exec --detach` | Start a target-side durable job and print its id. |
+| `logs --follow` | Keep reading output until the job reaches a terminal state. |
 | `shell [sid]`, `shell --attach` | Reattach to that session, or to the newest one. |
 
 Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
@@ -505,7 +549,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `wrangler.jsonc` | Cloudflare config (DO binding, D1, routes, static assets) |
 | `cli/` | `@switch-board/cli` — the host daemon |
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
-| `cli/peer.js` | The other machines: `nodes`, `exec`, `shell` (client side) |
+| `cli/peer.js` | The other machines: `nodes`, `exec`, `cp`, jobs, and `shell` (client side) |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
 | `site/` | The GitHub Pages project page — intro + downloads (see [site/README.md](site/README.md)) |
 | `.claude/skills/switchboard/` | Claude Code skill: driving the CLI (`nodes`, `exec`, `shell`, `login`, `service`) |

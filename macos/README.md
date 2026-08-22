@@ -45,6 +45,8 @@ staged version is newer than the bundled one, the supervisor runs its
 `index.js` — still on the **bundled** Node and the **bundled** `node_modules`
 (via a `node_modules` symlink into the staged dir, `NODE_PATH` as fallback), so
 native code (node-pty) never changes outside a signed release.
+The updater also reasserts `index.js` mode `0755` before activating it, because
+the installed `switchboard` executable may be a symlink to that file.
 
 Guardrails:
 

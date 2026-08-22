@@ -3,7 +3,8 @@ name: switchboard
 description: >-
   Drive the Switchboard CLI (@switch-board/cli) to work on the user's *other*
   machines: `switchboard nodes` lists them, `switchboard exec <node> <cmd>` runs
-  something over there with real stdout and a real exit code, `switchboard shell
+  something over there with real stdout and a real exit code, `switchboard cp`
+  transfers a file, detached jobs survive caller disconnects, `switchboard shell
   <node>` opens an interactive one, and `switchboard login` / `service` expose a
   machine. Use this whenever a task belongs on a different machine than the one
   you're on — "run the tests on my build box", "what is my desktop doing?", "is
@@ -25,7 +26,7 @@ Two credentials, and they behave differently:
 - **Account** (`switchboard login`) — the machine is bound to the user's GitHub
   account, shows up in their dashboard, and can be shared through a ten-minute,
   single-use code redeemed by another GitHub account. Owned and shared machines
-  both appear in `nodes`; `exec` / `shell`
+  both appear in `nodes`; peer commands
   additionally require the target's peer opt-in.
 - **Token** (`switchboard`, no login) — a one-off share. Anyone holding the token
   gets a shell there. No dashboard, no peer access. Good for pairing; not a
@@ -50,7 +51,7 @@ what exists, what's online, and what each box is busy with.
 
 `--json` gives the same list machine-readably (`id`, `name`, `shared`, `owner`,
 `expiresAt`, `online`, `peer`,
-`lastSeenMsAgo`, `rtt`, `cpu`, `memUsed`, `memTotal`, `activity`) — use it when
+`lastSeenMsAgo`, `rtt`, `cpu`, `memUsed`, `memTotal`, `platform`, `arch`, `activity`) — use it when
 you need to branch on the answer rather than show it to someone.
 
 **`exec` is the workhorse.** It's a plain command: stdout on stdout, stderr on
@@ -61,14 +62,17 @@ works across machines.
 switchboard exec build-box npm test
 switchboard exec build --cwd '~/src/api' -- cargo build --release
 switchboard exec mini --timeout 120 ./deploy.sh
+switchboard exec mini --login which xcodebuild
+switchboard exec mini --shell /bin/bash 'rm -f dir/*.png && echo done'
 switchboard exec build-box 'cd ~/app && git pull && npm test'   # one remote shell
 echo "$patch" | switchboard exec build-box 'git apply -'        # piped stdin is forwarded
 ```
 
 Everything after the machine name belongs to the far end, quoting included, so
 `exec box ls -la` keeps its `-la` instead of losing it to the local parser. The
-command runs in a **login** shell (`$SHELL -lc`), which is what makes tools
-installed by a version manager — node, cargo, claude — exist over there.
+Commands are non-login by default. Add `--login` (`$SHELL -lc`) when tools
+installed by a version manager — node, cargo, xcodebuild — are missing, and use
+`--shell /bin/bash` to override zsh for a command whose unmatched glob should not abort.
 
 Quote anything your local shell shouldn't touch, `--cwd` included: an unquoted
 `~/app` is expanded here, to *your* home, before the far end ever sees it.
@@ -93,7 +97,7 @@ for when there wasn't a remote one to pass on:
 
 | Code | Meaning |
 | --- | --- |
-| 124 | `--timeout` expired; SIGTERM went to the remote process group |
+| 124 | `--timeout` expired; SIGTERM then SIGKILL went to the remote process group |
 | 126 | never started — no such directory, an empty command, or the host's 8 exec slots were full |
 | 130 | you pressed Ctrl-C twice and gave up locally |
 | 255 | the host went offline, or the link dropped mid-command |
@@ -105,11 +109,15 @@ want to reason about; a PTY echoes your own keystrokes back and paints escape
 sequences through the transcript. Reach for `shell` only when something needs a
 terminal to work at all.
 
-One caveat that decides the choice for long jobs: **an `exec` dies with the link
+One caveat that decides the choice for long jobs: **an attached `exec` dies with the link
 it was invoked over.** If the connection drops, the far end kills the command —
 deliberately, since its output has nowhere left to go. A ten-minute build is fine;
-an hour-long training run should live in a `shell` session (those survive
-reconnects and detaching) or under `nohup`/tmux over there.
+an hour-long build should use `exec --detach`. Query it with `jobs`, stream its
+bounded target-side log with `logs --follow`, and collect its status with `wait`.
+
+`switchboard cp local node:remote` uploads one file and `switchboard cp
+node:remote local` downloads one. Both directions verify SHA-256; directories are
+rejected explicitly.
 
 Also worth knowing: at most 8 `exec`s run concurrently on one host, and Ctrl-C
 reaches the remote process group, so a pipeline dies the way it would locally.

@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS machines (
   cpu           REAL,               -- last reported cpu fraction 0..1
   mem_used      INTEGER,
   mem_total     INTEGER,
+  platform      TEXT,               -- retained so an offline node still shows its OS
+  arch          TEXT,               -- retained so callers can choose compatible artifacts
   -- What the machine is doing, as an opaque JSON blob (shells / top / agents).
   -- Display-only and always ephemeral: cleared the moment the daemon goes away.
   -- See migrations/ for applying this to a database created before it existed.
