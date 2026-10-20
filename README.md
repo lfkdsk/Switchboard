@@ -146,6 +146,19 @@ or build it yourself from [`macos/`](macos/README.md):
 cd macos && scripts/make-app.sh && open build/Switchboard.app
 ```
 
+### Keep it running — Windows tray app
+
+The same thing for Windows: a **notification-area app** with live status, a
+Settings window, and a "start when I sign in" entry, supervising the same daemon
+with its own bundled Node. Grab `Switchboard-<version>-x64-setup.exe` (per-user,
+no admin) or the portable `.zip` from the
+[Releases](https://github.com/lfkdsk/Switchboard/releases) page, or build it from
+[`windows/`](windows/README.md):
+
+```powershell
+cd windows; scripts\make-app.ps1; build\Switchboard\Switchboard.exe
+```
+
 ### Keep it running — Linux background service
 
 On Linux the daemon runs as a **systemd user service**, so it starts at boot and
@@ -192,7 +205,7 @@ Circuits are last-writer-wins: whoever dials in last gets the line, and the
 daemon that was serving this machine is dropped — taking the shells open in it
 along. That's the right answer for a restart and the wrong one for a forgotten
 terminal, so when you start one by hand and something is already up — the
-menu-bar app, the systemd service, another window — the CLI says what it found
+menu-bar app, the tray app, the systemd service, another window — the CLI says what it found
 and asks first:
 
 ```
@@ -554,6 +567,7 @@ and never include command-line arguments (those routinely carry secrets).
 | `cli/activity.js` | Host activity: shell processes, top-by-cpu, Claude Code sessions |
 | `cli/peer.js` | The other machines: `nodes`, `exec`, `cp`, jobs, and `shell` (client side) |
 | `macos/` | Native menu-bar app that supervises the daemon (see [macos/README.md](macos/README.md)) |
+| `windows/` | Windows tray app that supervises the daemon (see [windows/README.md](windows/README.md)) |
 | `site/` | The GitHub Pages project page — intro + downloads (see [site/README.md](site/README.md)) |
 | `.claude/skills/switchboard/` | Claude Code skill: driving the CLI (`nodes`, `exec`, `shell`, `login`, `service`) |
 

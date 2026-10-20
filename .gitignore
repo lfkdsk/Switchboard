@@ -10,3 +10,8 @@ macos/build/
 
 # Landing page staging output (site/preview.sh, .github/workflows/pages.yml)
 _site/
+
+# Windows tray app (dotnet build output + assembled app/installer)
+windows/bin/
+windows/obj/
+windows/build/
