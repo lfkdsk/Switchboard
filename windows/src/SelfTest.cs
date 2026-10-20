@@ -102,9 +102,14 @@ namespace Switchboard
             return i < 0 ? url : url.Substring(0, i + 6) + "…";
         }
 
+        // Console.Error would encode with the OEM code page and turn →/… into '?';
+        // write UTF-8 to the raw handle instead.
+        static readonly Lazy<System.IO.TextWriter> Stderr = new Lazy<System.IO.TextWriter>(() =>
+            new System.IO.StreamWriter(Console.OpenStandardError(), new System.Text.UTF8Encoding(false)) { AutoFlush = true });
+
         public static void Log(string s)
         {
-            try { Console.Error.WriteLine("[selftest] " + s); } catch (Exception) { }
+            try { Stderr.Value.WriteLine("[selftest] " + s); } catch (Exception) { }
             Paths.AppendLog("selftest.log", s);
         }
     }

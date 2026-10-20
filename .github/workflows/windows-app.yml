@@ -76,6 +76,7 @@ jobs:
           $psi = [Diagnostics.ProcessStartInfo]::new("$PWD\windows\build\Switchboard\Switchboard.exe", '--selftest')
           $psi.UseShellExecute = $false
           $psi.RedirectStandardError = $true
+          $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
           $p = [Diagnostics.Process]::Start($psi)
           $err = $p.StandardError.ReadToEnd()
           $p.WaitForExit()
@@ -94,6 +95,7 @@ jobs:
           $psi = [Diagnostics.ProcessStartInfo]::new("$PWD\windows\build\Switchboard\Switchboard.exe", '--selftest')
           $psi.UseShellExecute = $false
           $psi.RedirectStandardError = $true
+          $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
           $p = [Diagnostics.Process]::Start($psi)
           $err = $p.StandardError.ReadToEnd()
           $p.WaitForExit()
