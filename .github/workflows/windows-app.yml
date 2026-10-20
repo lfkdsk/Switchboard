@@ -102,6 +102,28 @@ jobs:
           $err
           if ($p.ExitCode -ne 0) { throw "selftest exited $($p.ExitCode)" }
 
+      # Gating: drive this desktop the way another machine would. The real
+      # Switchboard.exe auto-starts its daemon against a stand-in relay, which
+      # then sends plain `exec` frames to open a window, click into it, type,
+      # screenshot it and click its button — and finally the app is killed to
+      # prove the daemon goes down with it. See scripts/remote-control-test.js.
+      - name: Remote-control test (open window, click, type, screenshot)
+        run: |
+          & windows\build\Switchboard\runtime\node.exe windows\scripts\remote-control-test.js `
+            windows\build\Switchboard\Switchboard.exe windows\build\remote-control.png
+          $code = $LASTEXITCODE
+          Write-Host '--- daemon.log ---'
+          Get-Content "$env:LOCALAPPDATA\Switchboard\Logs\daemon.log" -Tail 25 -ErrorAction SilentlyContinue
+          if ($code) { throw "remote-control test failed ($code)" }
+
+      - name: Upload remote-control screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-control-screenshot
+          path: windows/build/remote-control.png
+          if-no-files-found: ignore
+
       - name: Package installer and portable zip
         run: |
           $v = '${{ steps.ver.outputs.version }}'

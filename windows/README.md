@@ -139,6 +139,12 @@ builds on every push/PR on `windows-latest`:
   proves the shipped node-pty can open a ConPTY (`scripts/check-pty.js`);
 - runs `--selftest` offline (**gating** — state machine + graceful stop) and
   against the public relay (non-gating);
+- runs `scripts/remote-control-test.js` (**gating**): the real `Switchboard.exe`
+  auto-starts its daemon against a stand-in relay on localhost, which then sends
+  the same `exec` frames `switchboard exec` would — open a window on the
+  desktop, click into it, type, screenshot it (uploaded as the
+  `remote-control-screenshot` artifact), click its button and read back what it
+  got — and finally kills the app to prove the daemon goes down with it;
 - builds the Inno Setup installer and the portable zip, then installs and
   uninstalls silently to check what lands and what's cleaned up;
 - uploads both as the `Switchboard-windows-x64` artifact.
@@ -166,5 +172,6 @@ draft/prerelease rules (`-rc` tags stay drafts).
 | `scripts/make-app.ps1` | build + assemble `build\Switchboard\` |
 | `scripts/fetch-runtime.ps1` | stage the embedded Node runtime |
 | `scripts/check-pty.js` | CI check that the bundled node-pty opens a ConPTY |
+| `scripts/remote-control-test.js` | CI end-to-end: drive the desktop over `exec` (window, click, type, screenshot) |
 | `scripts/make-icon.sh` | regenerate the `.ico` (needs `rsvg-convert` + ImageMagick) |
 | `installer/Switchboard.iss` | per-user Inno Setup installer |
