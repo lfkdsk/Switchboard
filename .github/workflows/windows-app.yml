@@ -1,0 +1,192 @@
+name: Windows app
+
+# Build the Switchboard tray app, package it as a per-user installer plus a
+# portable zip, upload both as artifacts, and attach them to a GitHub Release on
+# tag pushes (the same v* tags the macOS workflow releases from).
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create/update the Release on tag pushes
+
+concurrency:
+  group: windows-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: Build & package (x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          dotnet --version
+          [Environment]::OSVersion.VersionString
+          $env:PROCESSOR_ARCHITECTURE
+
+      # Plain semver for tags (v1.2.3 -> 1.2.3); a stable 0.1.0 otherwise, like
+      # the macOS build.
+      - name: Resolve version
+        id: ver
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            "version=$($env:GITHUB_REF_NAME.Substring(1))" >> $env:GITHUB_OUTPUT
+          } else {
+            "version=0.1.0" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Build app (embeds Node x64 + cli deps)
+        run: windows/scripts/make-app.ps1 -Version '${{ steps.ver.outputs.version }}'
+
+      - name: Verify bundle
+        run: |
+          $app = 'windows\build\Switchboard'
+          foreach ($f in 'Switchboard.exe', 'Switchboard.exe.config', 'runtime\node.exe',
+                         'runtime\cli\index.js', 'runtime\cli\package.json') {
+            if (-not (Test-Path "$app\$f")) { throw "missing $f" }
+          }
+          (Get-Item "$app\Switchboard.exe").VersionInfo | Format-List ProductVersion, FileVersion
+          & "$app\runtime\node.exe" --version
+          # The bundled cli loads with its bundled deps (ws, node-pty)…
+          & "$app\runtime\node.exe" "$app\runtime\cli\index.js" --version
+          if ($LASTEXITCODE) { throw "bundled cli did not start" }
+          # …and node-pty can actually open a ConPTY with the shipped Node.
+          & "$app\runtime\node.exe" windows\scripts\check-pty.js "$app\runtime\cli"
+          if ($LASTEXITCODE) { throw "bundled node-pty could not open a pty" }
+
+      # Gating, and offline: nothing listens on port 9, so the daemon sits in its
+      # reconnect loop. What this proves is the Windows-only part of the
+      # supervisor — status file → state machine, and Stop closing the daemon's
+      # stdin so it shuts down by itself instead of being killed.
+      - name: Self-test (supervisor + graceful stop)
+        env:
+          SWITCHBOARD_SERVER: http://127.0.0.1:9
+          SELFTEST_EXPECT: connecting
+          SELFTEST_SECONDS: '6'
+        run: |
+          $psi = [Diagnostics.ProcessStartInfo]::new("$PWD\windows\build\Switchboard\Switchboard.exe", '--selftest')
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardError = $true
+          $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+          $p = [Diagnostics.Process]::Start($psi)
+          $err = $p.StandardError.ReadToEnd()
+          $p.WaitForExit()
+          $err
+          Write-Host '--- daemon.log ---'
+          Get-Content "$env:LOCALAPPDATA\Switchboard\Logs\daemon.log" -Tail 20 -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "selftest exited $($p.ExitCode)" }
+
+      # Best-effort smoke test against the public relay. Non-gating: a relay
+      # hiccup must not block packaging a release.
+      - name: Self-test against the public relay
+        continue-on-error: true
+        env:
+          SELFTEST_SECONDS: '12'
+        run: |
+          $psi = [Diagnostics.ProcessStartInfo]::new("$PWD\windows\build\Switchboard\Switchboard.exe", '--selftest')
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardError = $true
+          $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+          $p = [Diagnostics.Process]::Start($psi)
+          $err = $p.StandardError.ReadToEnd()
+          $p.WaitForExit()
+          $err
+          if ($p.ExitCode -ne 0) { throw "selftest exited $($p.ExitCode)" }
+
+      # Gating: drive this desktop the way another machine would. The real
+      # Switchboard.exe auto-starts its daemon against a stand-in relay, which
+      # then sends plain `exec` frames to open a window, click into it, type,
+      # screenshot it and click its button — and finally the app is killed to
+      # prove the daemon goes down with it. See scripts/remote-control-test.js.
+      - name: Remote-control test (open window, click, type, screenshot)
+        run: |
+          & windows\build\Switchboard\runtime\node.exe windows\scripts\remote-control-test.js `
+            windows\build\Switchboard\Switchboard.exe windows\build\remote-control.png
+          $code = $LASTEXITCODE
+          Write-Host '--- daemon.log ---'
+          Get-Content "$env:LOCALAPPDATA\Switchboard\Logs\daemon.log" -Tail 25 -ErrorAction SilentlyContinue
+          if ($code) { throw "remote-control test failed ($code)" }
+
+      - name: Upload remote-control screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-control-screenshot
+          path: windows/build/remote-control.png
+          if-no-files-found: ignore
+
+      - name: Package installer and portable zip
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE) { throw "could not install Inno Setup" }
+          }
+          & $iscc /Qp "/DAppVersion=$v" windows\installer\Switchboard.iss
+          if ($LASTEXITCODE) { throw "iscc failed" }
+          Compress-Archive -Path windows\build\Switchboard -DestinationPath "windows\build\Switchboard-$v-x64.zip"
+          "SETUP=windows/build/Switchboard-$v-x64-setup.exe" >> $env:GITHUB_ENV
+          "ZIP=windows/build/Switchboard-$v-x64.zip" >> $env:GITHUB_ENV
+
+      # Install silently as the runner user, check what landed, then uninstall
+      # and check it all went — including the sign-in Run entry.
+      - name: Installer round trip
+        run: |
+          $dir = "$env:LOCALAPPDATA\Programs\Switchboard"
+          $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          Start-Process $env:SETUP -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          foreach ($f in 'Switchboard.exe', 'runtime\node.exe', 'runtime\cli\index.js', 'unins000.exe') {
+            if (-not (Test-Path "$dir\$f")) { throw "installer did not place $f" }
+          }
+          $entry = (Get-ItemProperty $run -Name Switchboard -ErrorAction SilentlyContinue).Switchboard
+          if ($entry -notlike "*Switchboard.exe*--autostart") { throw "unexpected Run entry: '$entry'" }
+
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          # The uninstaller re-launches itself from %TEMP%; wait for it to finish.
+          for ($i = 0; $i -lt 60 -and (Test-Path "$dir\Switchboard.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$dir\Switchboard.exe") { throw "uninstall left Switchboard.exe behind" }
+          if (Get-ItemProperty $run -Name Switchboard -ErrorAction SilentlyContinue) { throw "uninstall left the Run entry" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Switchboard-windows-x64
+          path: |
+            ${{ env.SETUP }}
+            ${{ env.ZIP }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: app
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: List
+        run: find dist -type f
+      # Same tag and the same draft/prerelease rules as macos-app.yml, so both
+      # workflows land their assets on one Release whichever finishes first.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.exe
+            dist/**/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: ${{ contains(github.ref_name, '-rc') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}

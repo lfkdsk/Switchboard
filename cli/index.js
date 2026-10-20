@@ -55,6 +55,8 @@ const logErr = (...a) => console.error(`[${ts()}]`, ...a);
 //   SWITCHBOARD_STATUS_FILE=<path>  append NDJSON to a file (Foundation-friendly)
 //   SWITCHBOARD_JSON_STATUS=1       write NDJSON to fd 3 (inherited pipe)
 // The file sink wins if both are set. Human logs on stdout/stderr are untouched.
+// A supervisor that can't signal us (Windows) also sets
+// SWITCHBOARD_STOP_ON_STDIN_EOF=1 and closes our stdin to stop us; see the end.
 const STATUS_FILE = process.env.SWITCHBOARD_STATUS_FILE || null;
 const STATUS_FD = process.env.SWITCHBOARD_JSON_STATUS ? 3 : null;
 const STATUS_ON = !!(STATUS_FILE || STATUS_FD);
@@ -565,7 +567,8 @@ const LAUNCHER = (process.env.INVOCATION_ID || process.env.JOURNAL_STREAM) ? "se
 function launcherLabel(kind) {
   switch (kind) {
     case "service": return "the systemd user service";
-    case "app": return process.platform === "darwin" ? "the menu-bar app" : "a supervisor";
+    case "app": return process.platform === "darwin" ? "the menu-bar app"
+      : process.platform === "win32" ? "the tray app" : "a supervisor";
     default: return "a terminal";
   }
 }
@@ -1616,4 +1619,14 @@ function sendStats() {
   };
   process.on("SIGINT", shutdown("SIGINT"));
   process.on("SIGTERM", shutdown("SIGTERM"));
+  // Windows has no signal a supervisor can send a windowless child: there,
+  // child.kill() is TerminateProcess and Ctrl-C needs a shared console. So the
+  // tray app holds our stdin open and closes it to ask us to stop — which also
+  // takes us down with it if the app itself dies. Opt-in, because an
+  // interactive run must not exit on Ctrl-Z/Ctrl-D.
+  if (process.env.SWITCHBOARD_STOP_ON_STDIN_EOF === "1") {
+    process.stdin.on("end", shutdown("stdin closed"));
+    process.stdin.on("error", shutdown("stdin closed"));
+    process.stdin.resume();
+  }
 })();

@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The Windows tray app. .NET Framework 4.8 rather than modern .NET on purpose:
+    it ships with every supported Windows 10/11, so the exe needs no runtime of
+    its own and stays a few hundred KB next to the embedded Node.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Switchboard</AssemblyName>
+    <RootNamespace>Switchboard</RootNamespace>
+    <ApplicationIcon>Resources\Switchboard.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+
+    <!-- make-app.ps1 passes the tag (1.2.3 or 1.2.3-rc1); the SDK strips the
+         prerelease label for the numeric assembly/file versions. -->
+    <Version>0.1.0</Version>
+    <Product>Switchboard</Product>
+    <Company>Switchboard</Company>
+    <Description>Switchboard tray app</Description>
+    <Copyright>MIT</Copyright>
+    <!-- The menu prints InformationalVersion; keep it free of the +commit suffix. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\Switchboard.ico" LogicalName="Switchboard.ico" />
+  </ItemGroup>
+
+</Project>
