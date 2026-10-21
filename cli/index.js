@@ -38,6 +38,9 @@ const { JobStore } = require("./lib/job-store");
 const {
   SessionLogStore, recordingEnabled, sessionLogListResponse, sessionLogReadResponse,
 } = require("./lib/session-log");
+const {
+  SessionScreen, buildSessionReplay, parseSessionGrace,
+} = require("./lib/session-replay");
 const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
 const pkg = require("./package.json");
 
@@ -144,6 +147,8 @@ Environment (overridden by the flags above):
   SWITCHBOARD_FORCE=1           Same as --force.
   SWITCHBOARD_RECORD=0          Do not save shell session output. Recording is on
                                 by default with bounded local retention.
+  SWITCHBOARD_SESSION_GRACE=24h Keep detached shells for this long. A bare value
+                                is seconds; 0 keeps them until explicit close.
 
 Notes:
   Logged in → this machine shows up in your dashboard; you may share it there.
@@ -831,8 +836,8 @@ function setupConnection() {
 // reuses its sid and resumes, a new window gets a fresh sid and its own shell.
 // Sessions outlive relay reconnects so a flaky link or tab reload doesn't lose
 // work.
-const sessions = new Map(); // sid -> { pty, log, graceTimer, exitPromise }
-const SESSION_GRACE_MS = 60000;
+const sessions = new Map(); // sid -> { pty, log, screen, offset, replayQueue, graceTimer, exitPromise }
+const SESSION_GRACE_MS = parseSessionGrace(process.env.SWITCHBOARD_SESSION_GRACE);
 const RECORD_SESSIONS = recordingEnabled();
 
 // Binary frame format shared with the relay/browser:
@@ -841,9 +846,9 @@ function encodeFrame(sid, payloadBuf) {
   const sidBuf = Buffer.from(sid, "utf8");
   return Buffer.concat([Buffer.from([sidBuf.length]), sidBuf, payloadBuf]);
 }
-function sendSessionData(sid, str) {
+function sendSessionData(sid, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(encodeFrame(sid, Buffer.from(str, "utf8")), { binary: true });
+    ws.send(encodeFrame(sid, Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8")), { binary: true });
   }
 }
 
@@ -854,8 +859,8 @@ function openSession(sid, cols, rows) {
     if (cols > 0 && rows > 0) {
       try { s.pty.resize(cols, rows); } catch {}
       s.log?.resize(cols, rows);
+      s.screen.resize(cols, rows);
     }
-    s.pty.write("\f"); // Ctrl-L: redraw so a reattached window sees a prompt
     return s;
   }
   const p = pty.spawn(SHELL, [], {
@@ -870,27 +875,36 @@ function openSession(sid, cols, rows) {
   catch (e) { logErr(`[session ${sid}] recording unavailable: ${e.message}`); }
   let settleExit;
   const exitPromise = new Promise((resolve) => { settleExit = resolve; });
+  const screen = new SessionScreen(cols, rows);
   s = {
-    pty: p, log: sessionRecorder, logPaused: false, graceTimer: null,
+    pty: p, log: sessionRecorder, screen,
+    offset: sessionRecorder?.stat().off || 0,
+    logPaused: false, replayPaused: false, replayQueue: Promise.resolve(), graceTimer: null,
     startedAt: Date.now(), lastOutputAt: Date.now(), exitPromise, settleExit,
   };
   sessions.set(sid, s);
   p.onData((d) => {
+    const output = Buffer.from(d, "utf8");
     s.lastOutputAt = Date.now();
-    if (s.log && !s.log.append(d) && !s.logPaused) {
+    s.offset += output.length;
+    s.screen.write(output);
+    if (s.log && !s.log.append(output) && !s.logPaused) {
       s.logPaused = true;
       try { p.pause(); } catch {}
       void s.log.drain().finally(() => {
         s.logPaused = false;
-        try { p.resume(); } catch {}
+        if (!s.replayPaused) { try { p.resume(); } catch {} }
       });
     }
-    sendSessionData(sid, d);
+    sendSessionData(sid, output);
   });
   p.onExit(({ exitCode }) => {
     sessions.delete(sid);
     const closed = s.log?.close({ exitCode }) || Promise.resolve();
-    void closed.finally(s.settleExit);
+    void Promise.allSettled([closed, s.replayQueue]).finally(() => {
+      s.screen.dispose();
+      s.settleExit();
+    });
     sendCtl({ type: "exit", sid, code: exitCode });
     broadcastSessions();
     log(`[session ${sid}] shell exited (${exitCode})`);
@@ -898,6 +912,39 @@ function openSession(sid, cols, rows) {
   broadcastSessions();
   log(`[session ${sid}] shell started (pid ${p.pid})`);
   return s;
+}
+
+function replaySession(sid, s, msg) {
+  s.replayQueue = s.replayQueue.then(async () => {
+    if (!sessions.has(sid)) return;
+    s.replayPaused = true;
+    try { s.pty.pause(); } catch {}
+    try {
+      const replay = await buildSessionReplay({
+        log: s.log,
+        screen: s.screen,
+        since: msg.since,
+        currentOffset: s.offset,
+        forceSnapshot: !!msg.snapshot,
+      });
+      // Replay is broadcast by the relay. Delta metadata lets already-current
+      // clients ignore bytes intended for a reconnecting peer; snapshots reset
+      // every attached view so all of them remain identical.
+      if (replay.mode === "snapshot") {
+        sendCtl({ type: "reset", sid, offset: replay.to });
+      }
+      sendCtl({
+        type: "session-replay", sid, mode: replay.mode,
+        from: replay.from, to: replay.to, bytes: replay.payload.length,
+      });
+      if (replay.payload.length) sendSessionData(sid, replay.payload);
+    } catch (error) {
+      logErr(`[session ${sid}] replay failed: ${error.message}`);
+    } finally {
+      s.replayPaused = false;
+      if (!s.logPaused) { try { s.pty.resume(); } catch {} }
+    }
+  });
 }
 
 // Report the live session list so a browser can show/attach tabs (tmux-style):
@@ -928,10 +975,18 @@ function scheduleSessionCleanup(sid) {
   const s = sessions.get(sid);
   if (!s) return;
   if (s.graceTimer) clearTimeout(s.graceTimer);
+  if (SESSION_GRACE_MS === 0) { s.graceTimer = null; return; }
   s.graceTimer = setTimeout(() => {
     log(`[session ${sid}] no reconnect within grace window, closing`);
     killSession(sid);
   }, SESSION_GRACE_MS);
+  s.graceTimer.unref?.();
+}
+function cancelSessionCleanup(sid) {
+  const s = sessions.get(sid);
+  if (!s?.graceTimer) return;
+  clearTimeout(s.graceTimer);
+  s.graceTimer = null;
 }
 
 let stopping = false;
@@ -1001,7 +1056,7 @@ const activeDownloads = new Map(); // id -> fs.ReadStream
 const activeUploads = new Map(); // id -> { stream, finalPath }
 let jobStore = null;
 let sessionLog = null;
-const PROTOCOL_FEATURES = ["cp-sha256-v1", "exec-options-v1", "jobs-v1", "history-v1"];
+const PROTOCOL_FEATURES = ["cp-sha256-v1", "exec-options-v1", "jobs-v1", "history-v1", "session-replay-v1"];
 
 function sendCtl(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -1076,22 +1131,26 @@ function connect() {
       case "capabilities":
         sendCtl({ type: "capabilities", id: msg.id, version: pkg.version, features: PROTOCOL_FEATURES });
         break;
-      case "open":
-        openSession(msg.sid, msg.cols, msg.rows);
+      case "open": {
+        const session = openSession(msg.sid, msg.cols, msg.rows);
+        replaySession(msg.sid, session, msg);
         sendStats();
         break;
+      }
       case "resize": {
         if (!(msg.cols > 0 && msg.rows > 0)) break;
         const s = sessions.get(msg.sid);
         if (s) {
           try { s.pty.resize(msg.cols, msg.rows); } catch {}
           s.log?.resize(msg.cols, msg.rows);
+          s.screen.resize(msg.cols, msg.rows);
         }
         break;
       }
-      // tmux-style: closing a browser window does NOT end the shell when bound
-      // to an account; only an explicit `close` (or the shell exiting) does.
-      case "client-gone": if (!BOUND) scheduleSessionCleanup(msg.sid); break;
+      // Kept for old browser clients. Cleanup is driven by peer-status below,
+      // because one of several attached tabs closing must not age out a shell
+      // that another tab is still using.
+      case "client-gone": break;
       case "list-sessions": broadcastSessions(); break;
       case "close": killSession(msg.sid); broadcastSessions(); break;
       case "ping": sendCtl({ type: "pong", t: msg.t }); break; // browser↔daemon RTT probe
@@ -1112,6 +1171,10 @@ function connect() {
       case "peer-status":
         log("[relay] browser " + (msg.online ? "connected" : "disconnected"));
         emitStatus("peer", { online: !!msg.online });
+        for (const sid of sessions.keys()) {
+          if (msg.online) cancelSessionCleanup(sid);
+          else scheduleSessionCleanup(sid);
+        }
         // Nobody is left on this circuit, so no running command still has a
         // caller: its output is going nowhere and nothing can stop it any more.
         // This is the SIGHUP an ssh session would have delivered.

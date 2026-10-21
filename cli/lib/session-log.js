@@ -182,6 +182,14 @@ class SessionLogStore {
     while (state?.backpressure.size) await Promise.all([...state.backpressure]);
   }
 
+  async flush(sid) {
+    const state = this.active.get(sid);
+    if (!state || state.closing) return;
+    await Promise.all([...state.pending]);
+    if (!state.writer || state.writer.destroyed || state.writer.closed) return;
+    await new Promise((resolve) => state.writer.write(Buffer.alloc(0), resolve));
+  }
+
   close(sid, result = {}) {
     const state = this.active.get(sid);
     if (!state) return Promise.resolve(this.stat(sid));
@@ -571,6 +579,7 @@ class SessionLogHandle {
   append(value) { return this.store.append(this.sid, value); }
   resize(cols, rows) { return this.store.resize(this.sid, cols, rows); }
   drain() { return this.store.drain(this.sid); }
+  flush() { return this.store.flush(this.sid); }
   close(result) { return this.store.close(this.sid, result); }
   read(options) { return this.store.read(this.sid, options); }
   tail(bytes) { return this.store.tail(this.sid, bytes); }

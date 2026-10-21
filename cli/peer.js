@@ -842,6 +842,8 @@ async function cmdShell(ctx, opts) {
   const name = node.name || node.machine_id.slice(0, 8);
   let sid = opts.sid || null;
   let raw = false;
+  let offset = null;
+  let replay = null;
 
   const send = (obj) => { if (ws.readyState === WS_OPEN) ws.send(JSON.stringify(obj)); };
   const size = () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 });
@@ -860,7 +862,10 @@ async function cmdShell(ctx, opts) {
 
   const startSession = () => {
     if (!sid) sid = crypto.randomUUID();
-    send({ type: "open", sid, ...size() });
+    // A new CLI process has no in-memory terminal model, even when its outer
+    // terminal still contains old text. Ask the daemon for an authoritative
+    // snapshot; subsequent bytes advance the same raw PTY offset as the web UI.
+    send({ type: "open", sid, ...size(), snapshot: true });
     if (process.stdin.isTTY) { process.stdin.setRawMode(true); raw = true; }
     process.stdin.resume();
     process.stdin.on("data", (chunk) => {
@@ -886,7 +891,23 @@ async function cmdShell(ctx, opts) {
     if (isBinary) {
       const sidLen = data[0];
       if (data.toString("utf8", 1, 1 + sidLen) !== sid) return; // another window's shell
-      process.stdout.write(data.subarray(1 + sidLen));
+      const payload = data.subarray(1 + sidLen);
+      let cursor = 0;
+      if (replay?.remaining) {
+        const count = Math.min(replay.remaining, payload.length);
+        if (replay.apply && count) process.stdout.write(payload.subarray(0, count));
+        if (replay.mode === "delta" && replay.apply) offset = (offset || 0) + count;
+        replay.remaining -= count;
+        cursor = count;
+        if (!replay.remaining) {
+          if (replay.apply || offset === replay.to) offset = replay.to;
+          replay = null;
+        }
+      }
+      if (cursor < payload.length) {
+        process.stdout.write(payload.subarray(cursor));
+        offset = (offset || 0) + payload.length - cursor;
+      }
       return;
     }
     const text = data.toString("utf8");
@@ -894,6 +915,24 @@ async function cmdShell(ctx, opts) {
     let m;
     try { m = JSON.parse(text); } catch { return; }
     switch (m.type) {
+      case "reset":
+        if (m.sid === sid) process.stdout.write("\x1bc");
+        break;
+      case "session-replay":
+        if (m.sid !== sid || !Number.isSafeInteger(m.from) || !Number.isSafeInteger(m.to) ||
+            !Number.isSafeInteger(m.bytes) || m.bytes < 0) break;
+        replay = {
+          mode: m.mode,
+          from: m.from,
+          to: m.to,
+          remaining: m.bytes,
+          apply: m.mode === "snapshot" || offset === m.from,
+        };
+        if (!replay.remaining) {
+          if (replay.apply || offset === replay.to) offset = replay.to;
+          replay = null;
+        }
+        break;
       case "sessions":
         if (sid) break; // already attached; this is just the host keeping us posted
         if ((m.list || []).length) {
