@@ -59,6 +59,86 @@ test("session output rolls segments and reads continuously across their boundari
   fs.rmSync(dir, { recursive: true });
 });
 
+test("compressed segments use independently readable blocks", async () => {
+  const { dir, store } = tempStore({
+    segmentSize: 32,
+    compressionBlockSize: 4,
+  });
+  const log = store.open("session-blocks");
+  log.append("abcdefghijkl");
+  await log.close();
+
+  const sessionDir = path.join(dir, "session-blocks");
+  const meta = JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8"));
+  const segment = meta.segments[0];
+  assert.deepEqual(
+    segment.compressionBlocks.map(({ offset, bytes, storedOffset, storedBytes }) => ({
+      offset, bytes, storedOffset, storedBytes,
+    })),
+    [
+      { offset: 0, bytes: 4, storedOffset: 0, storedBytes: segment.compressionBlocks[0].storedBytes },
+      {
+        offset: 4,
+        bytes: 4,
+        storedOffset: segment.compressionBlocks[0].storedBytes,
+        storedBytes: segment.compressionBlocks[1].storedBytes,
+      },
+      {
+        offset: 8,
+        bytes: 4,
+        storedOffset: segment.compressionBlocks[0].storedBytes + segment.compressionBlocks[1].storedBytes,
+        storedBytes: segment.compressionBlocks[2].storedBytes,
+      },
+    ],
+  );
+
+  const file = path.join(sessionDir, `seg-0.log.${segment.compression}`);
+  const encoded = fs.readFileSync(file);
+  encoded[0] ^= 0xff;
+  fs.writeFileSync(file, encoded);
+  assert.equal(store.read("session-blocks", { from: 4, len: 4 }).data.toString(), "efgh");
+  assert.throws(() => store.read("session-blocks", { from: 0, len: 4 }));
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("legacy whole-segment compression is decompressed once for sequential reads", async () => {
+  const { dir, store } = tempStore({ segmentSize: 32 });
+  const log = store.open("session-legacy");
+  log.append("abcdefghijkl");
+  await log.close();
+
+  const sessionDir = path.join(dir, "session-legacy");
+  const metaPath = path.join(sessionDir, "meta.json");
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  const compression = meta.segments[0].compression;
+  const file = path.join(sessionDir, `seg-0.log.${compression}`);
+  const raw = Buffer.from("abcdefghijkl");
+  const encoded = compression === "zst"
+    ? zlib.zstdCompressSync(raw)
+    : zlib.gzipSync(raw);
+  fs.writeFileSync(file, encoded);
+  delete meta.segments[0].compressionBlocks;
+  meta.segments[0].storedBytes = encoded.length;
+  fs.writeFileSync(metaPath, JSON.stringify(meta));
+
+  const reloaded = new SessionLogStore({ dir, segmentSize: 32 }).init();
+  const originalRead = fs.readFileSync;
+  let compressedReads = 0;
+  fs.readFileSync = function countedRead(target, ...args) {
+    if (target === file) compressedReads += 1;
+    return originalRead.call(this, target, ...args);
+  };
+  try {
+    assert.equal(reloaded.read("session-legacy", { from: 0, len: 4 }).data.toString(), "abcd");
+    assert.equal(reloaded.read("session-legacy", { from: 4, len: 4 }).data.toString(), "efgh");
+    assert.equal(reloaded.read("session-legacy", { from: 8, len: 4 }).data.toString(), "ijkl");
+    assert.equal(compressedReads, 1);
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("close flushes a burst of queued writes before the record becomes closed", async () => {
   const { dir, store } = tempStore({ segmentSize: 31 });
   const log = store.open("session-burst");

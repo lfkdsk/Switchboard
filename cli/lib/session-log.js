@@ -15,6 +15,8 @@ const DEFAULT_MAX_SESSION_BYTES = 1024 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_READ_LENGTH = 64 * 1024;
+const DEFAULT_COMPRESSION_BLOCK_SIZE = 512 * 1024;
+const LEGACY_CACHE_ENTRIES = 4;
 
 class SessionLogStore {
   constructor(options) {
@@ -29,8 +31,13 @@ class SessionLogStore {
     this.maxSessionBytes = nonNegativeInt(options.maxSessionBytes, DEFAULT_MAX_SESSION_BYTES);
     this.maxTotalBytes = nonNegativeInt(options.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES);
     this.retentionMs = nonNegativeInt(options.retentionMs, DEFAULT_RETENTION_MS);
+    this.compressionBlockSize = positiveInt(
+      options.compressionBlockSize,
+      DEFAULT_COMPRESSION_BLOCK_SIZE,
+    );
     this.now = options.now || Date.now;
     this.records = new Map();
+    this.legacyCompressionCache = new Map();
     this.active = new Map();
     this.pruneScheduled = false;
   }
@@ -274,8 +281,11 @@ class SessionLogStore {
       let buffer;
       let bytesRead = 0;
       if (segment.compression) {
-        const raw = decompressSegment(segment.file, segment.compression);
-        buffer = raw.subarray(cursor - segment.start, cursor - segment.start + take);
+        buffer = this._readCompressedSegment(
+          segment,
+          cursor - segment.start,
+          take,
+        );
         bytesRead = buffer.length;
       } else {
         const fd = fs.openSync(segment.file, "r");
@@ -433,13 +443,67 @@ class SessionLogStore {
     try { input = fs.readFileSync(source); } catch (error) { if (error.code === "ENOENT") return; throw error; }
     const target = source + COMPRESS.ext;
     const temporary = target + `.tmp-${process.pid}`;
-    fs.writeFileSync(temporary, COMPRESS.encode(input), { mode: 0o600 });
+    const parts = [];
+    const blocks = [];
+    let storedOffset = 0;
+    for (let offset = 0; offset < input.length; offset += this.compressionBlockSize) {
+      const raw = input.subarray(offset, offset + this.compressionBlockSize);
+      const compressed = COMPRESS.encode(raw);
+      parts.push(compressed);
+      blocks.push({
+        offset,
+        bytes: raw.length,
+        storedOffset,
+        storedBytes: compressed.length,
+      });
+      storedOffset += compressed.length;
+    }
+    fs.writeFileSync(temporary, Buffer.concat(parts), { mode: 0o600 });
     fs.renameSync(temporary, target);
     fs.unlinkSync(source);
     segment.bytes = input.length;
     segment.compression = COMPRESS.ext.slice(1);
-    segment.storedBytes = fs.statSync(target).size;
+    segment.compressionBlocks = blocks;
+    segment.storedBytes = storedOffset;
     this._persist(record);
+  }
+
+  _readCompressedSegment(segment, offset, length) {
+    if (!segment.compressionBlocks?.length) {
+      const key = `${segment.file}:${segment.storedBytes || 0}`;
+      let raw = this.legacyCompressionCache.get(key);
+      if (raw) {
+        this.legacyCompressionCache.delete(key);
+        this.legacyCompressionCache.set(key, raw);
+      } else {
+        raw = decompressSegment(segment.file, segment.compression);
+        this.legacyCompressionCache.set(key, raw);
+        while (this.legacyCompressionCache.size > LEGACY_CACHE_ENTRIES) {
+          this.legacyCompressionCache.delete(this.legacyCompressionCache.keys().next().value);
+        }
+      }
+      return raw.subarray(offset, offset + length);
+    }
+
+    const end = offset + length;
+    const parts = [];
+    const fd = fs.openSync(segment.file, "r");
+    try {
+      for (const block of segment.compressionBlocks) {
+        const blockEnd = block.offset + block.bytes;
+        if (blockEnd <= offset || block.offset >= end) continue;
+        const encoded = Buffer.allocUnsafe(block.storedBytes);
+        const read = fs.readSync(fd, encoded, 0, block.storedBytes, block.storedOffset);
+        if (read !== block.storedBytes) throw new Error("truncated compressed session block");
+        const raw = decompressBuffer(encoded, segment.compression);
+        const from = Math.max(offset, block.offset) - block.offset;
+        const to = Math.min(end, blockEnd) - block.offset;
+        parts.push(raw.subarray(from, to));
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return parts.length === 1 ? parts[0] : Buffer.concat(parts);
   }
 
   _writeIndex(state, extra = null) {
@@ -665,7 +729,16 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
       bytes = st.size;
     }
     const segment = {
-      seg: file.seg, start, bytes, ...(compression ? { compression, storedBytes: st.size } : {}),
+      seg: file.seg,
+      start,
+      bytes,
+      ...(compression ? {
+        compression,
+        storedBytes: st.size,
+        ...(Array.isArray(prior?.compressionBlocks)
+          ? { compressionBlocks: prior.compressionBlocks }
+          : {}),
+      } : {}),
       createdAt: prior?.createdAt || st.birthtimeMs || st.mtimeMs,
       updatedAt: Math.max(Number(prior?.updatedAt) || 0, st.mtimeMs),
     };
@@ -704,7 +777,10 @@ function segmentFile(sessionDir, segment) {
 }
 
 function decompressSegment(file, compression) {
-  const input = fs.readFileSync(file);
+  return decompressBuffer(fs.readFileSync(file), compression);
+}
+
+function decompressBuffer(input, compression) {
   if (compression === "zst" && zlib.zstdDecompressSync) return zlib.zstdDecompressSync(input);
   if (compression === "gz") return zlib.gunzipSync(input);
   throw new Error(`unsupported session segment compression: ${compression}`);
