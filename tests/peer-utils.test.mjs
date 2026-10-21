@@ -12,6 +12,7 @@ import utils from "../cli/lib/peer-utils.js";
 const {
   finalizeDownload, parseCopyOperands, remoteOperand, shellCommandArgs, shellQuote, verifyUploadedFile,
 } = utils;
+const { lastLines, parseTailSpec, stripAnsi } = peer;
 
 test("cp operands distinguish node paths from local Windows and POSIX paths", () => {
   assert.deepEqual(remoteOperand("build:/tmp/a:b"), { node: "build", path: "/tmp/a:b" });
@@ -79,6 +80,7 @@ class FakeSocket extends EventEmitter {
   static uploadPath = null;
   static uploadCommand = null;
   static downloadBase = null;
+  static historyContent = Buffer.from("\x1b[31mred\x1b[0m\nblue\n");
   static features = ["cp-sha256-v1"];
   static ignoreCapabilities = false;
   constructor() {
@@ -122,6 +124,25 @@ class FakeSocket extends EventEmitter {
       this.reply({
         type: "job-list", id: m.id,
         jobs: [{ id: "job-remote", status: "exited", exitCode: 3, createdAt: 123, command: "build" }],
+      });
+    }
+    if (m.type === "sess-list" && FakeSocket.mode === "history") {
+      this.reply({
+        type: "sess-list", id: m.id, recording: true,
+        sessions: [{
+          sid: "session-remote", status: "closed", active: false, startedAt: 123,
+          from: 0, off: FakeSocket.historyContent.length, bytes: FakeSocket.historyContent.length,
+        }],
+      });
+    }
+    if (m.type === "sess-read" && FakeSocket.mode === "history") {
+      const from = Math.max(0, Math.min(Number(m.from) || 0, FakeSocket.historyContent.length));
+      const chunk = FakeSocket.historyContent.subarray(from, from + Math.min(Number(m.len) || 65536, 65536));
+      const next = from + chunk.length;
+      this.reply({
+        type: "sess-chunk", id: m.id, sid: m.sid, data: chunk.toString("base64"),
+        off: from, next, eof: next >= FakeSocket.historyContent.length,
+        stat: { active: false, from: 0, off: FakeSocket.historyContent.length },
       });
     }
   }
@@ -242,4 +263,52 @@ test("jobs queries use a fake transport and return target-side records", async (
   assert.deepEqual(JSON.parse(lines.join("\n")), [
     { id: "job-remote", status: "exited", exitCode: 3, createdAt: 123, command: "build" },
   ]);
+});
+
+test("history reads a line tail and strips terminal escape sequences", async () => {
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const original = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", tail: "1l", text: true,
+      raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = original;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "blue\n");
+});
+
+test("history text mode strips an ANSI sequence split across protocol chunks", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.concat([Buffer.alloc(65535, 0x78), Buffer.from("\x1b[31mred\x1b[0m\n")]);
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true,
+      raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "x".repeat(65535) + "red\n");
+});
+
+test("history helpers parse byte and line tails without a dependency", () => {
+  assert.deepEqual(parseTailSpec("64KiB"), { unit: "bytes", value: 65536 });
+  assert.deepEqual(parseTailSpec("200 lines"), { unit: "lines", value: 200 });
+  assert.equal(stripAnsi("\x1b[32mok\x1b[0m"), "ok");
+  assert.equal(lastLines(Buffer.from("one\ntwo\nthree\n"), 2).toString(), "two\nthree\n");
 });

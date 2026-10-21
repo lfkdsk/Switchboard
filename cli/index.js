@@ -35,6 +35,7 @@ const fixPtyPerms = require("./scripts/fix-pty-perms");
 const activity = require("./activity");
 const peer = require("./peer");
 const { JobStore } = require("./lib/job-store");
+const { SessionLogStore, recordingEnabled } = require("./lib/session-log");
 const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
 const pkg = require("./package.json");
 
@@ -95,6 +96,8 @@ Reachable machines (signed in; the target must allow peers):
   switchboard jobs <node>      List detached jobs kept on that machine.
   switchboard logs <node> <job> [--follow]
                                Read a detached job's saved output.
+  switchboard history <node> [sid]
+                               List saved shell sessions, or read one transcript.
   switchboard wait <node> <job>
                                Wait for a detached job and return its exit code.
   switchboard shell <node>     Open an interactive shell over there. Ctrl-] detaches.
@@ -118,6 +121,12 @@ Options:
          --shell <path>        Override the target shell for this command.
          --detach              Start a durable job and print its id immediately.
   logs:  --follow              Keep reading until the job finishes.
+  history: --from <off>        Start at this byte offset.
+           --tail <N|Nl>       Read the last N bytes, or N lines with an l suffix.
+           --text              Strip terminal escape sequences.
+           --raw               Write recorded PTY bytes (the default).
+           --follow            Poll for new output while the session is live.
+           --json              Machine-readable list/chunks.
   shell: [sid] | --attach      Reattach: to that session, or to the newest one.
 
 Environment (overridden by the flags above):
@@ -131,6 +140,8 @@ Environment (overridden by the flags above):
                                 terminals still work for you and anyone you have
                                 explicitly shared this machine with.
   SWITCHBOARD_FORCE=1           Same as --force.
+  SWITCHBOARD_RECORD=0          Do not save shell session output. Recording is on
+                                by default with bounded local retention.
 
 Notes:
   Logged in → this machine shows up in your dashboard; you may share it there.
@@ -176,8 +187,16 @@ function parsePeerArgs(argv, command) {
     for (let i = 0; i < argv.length; i++) {
       const a = argv[i];
       if (a === "-h" || a === "--help") opts.help = true;
-      else if (a === "--follow" && command === "logs") opts.follow = true;
-      else if (a === "--json" && (command === "nodes" || command === "ls" || command === "jobs")) opts.json = true;
+      else if (a === "--follow" && (command === "logs" || command === "history")) opts.follow = true;
+      else if (a === "--json" && ["nodes", "ls", "jobs", "history"].includes(command)) opts.json = true;
+      else if (a === "--text" && command === "history") opts.text = true;
+      else if (a === "--raw" && command === "history") opts.raw = true;
+      else if ((a === "--from" || a.startsWith("--from=")) && command === "history") {
+        opts.from = (a.includes("=") ? a.slice(a.indexOf("=") + 1) : argv[++i]) ?? "";
+      }
+      else if ((a === "--tail" || a.startsWith("--tail=")) && command === "history") {
+        opts.tail = (a.includes("=") ? a.slice(a.indexOf("=") + 1) : argv[++i]) ?? "";
+      }
       else if (a === "--attach" && command === "shell") opts.attach = true;
       else if (a === "-s" || a === "--server") opts.server = argv[++i];
       else if (a.startsWith("--server=")) opts.server = a.slice(a.indexOf("=") + 1);
@@ -223,7 +242,7 @@ function parsePeerArgs(argv, command) {
 }
 
 const rawArgs = process.argv.slice(2);
-const PEER_SUBS = ["nodes", "ls", "exec", "cp", "jobs", "logs", "wait", "shell"];
+const PEER_SUBS = ["nodes", "ls", "exec", "cp", "jobs", "logs", "history", "wait", "shell"];
 const sub = ["login", "logout", "service", ...PEER_SUBS].includes(rawArgs[0]) ? rawArgs.shift() : null;
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
@@ -347,6 +366,13 @@ function doPeer() {
     if (args.rest.length) die("Usage: switchboard jobs <node> [--json]");
     return run(peer.cmdJobs(ctx, { target: args.target, json: !!args.json }));
   }
+  if (sub === "history") {
+    if (args.rest.length > 1) die("Usage: switchboard history <node> [sid] [options]");
+    return run(peer.cmdHistory(ctx, {
+      target: args.target, sid: args.rest[0] || null, from: args.from, tail: args.tail,
+      text: !!args.text, raw: !!args.raw, follow: !!args.follow, json: !!args.json,
+    }));
+  }
   if (sub === "logs" || sub === "wait") {
     if (args.rest.length !== 1) die(`Usage: switchboard ${sub} <node> <job>${sub === "logs" ? " [--follow]" : ""}`);
     return run(sub === "logs"
@@ -428,6 +454,7 @@ function unitBody() {
   // Same reasoning for peer access: the unit is the machine's standing answer,
   // so a host you deliberately closed off must not come back open at boot.
   if (!PEER) env.push(`Environment="SWITCHBOARD_PEER=0"`);
+  if (!RECORD_SESSIONS) env.push(`Environment="SWITCHBOARD_RECORD=0"`);
   return `[Unit]
 Description=Switchboard — a shell on this machine, in your browser
 Documentation=https://github.com/lfkdsk/Switchboard
@@ -802,8 +829,9 @@ function setupConnection() {
 // reuses its sid and resumes, a new window gets a fresh sid and its own shell.
 // Sessions outlive relay reconnects so a flaky link or tab reload doesn't lose
 // work.
-const sessions = new Map(); // sid -> { pty, graceTimer }
+const sessions = new Map(); // sid -> { pty, log, graceTimer, exitPromise }
 const SESSION_GRACE_MS = 60000;
+const RECORD_SESSIONS = recordingEnabled();
 
 // Binary frame format shared with the relay/browser:
 //   [1 byte sid length][sid utf8 bytes][payload bytes]
@@ -821,7 +849,10 @@ function openSession(sid, cols, rows) {
   let s = sessions.get(sid);
   if (s) {
     if (s.graceTimer) { clearTimeout(s.graceTimer); s.graceTimer = null; }
-    if (cols > 0 && rows > 0) { try { s.pty.resize(cols, rows); } catch {} }
+    if (cols > 0 && rows > 0) {
+      try { s.pty.resize(cols, rows); } catch {}
+      s.log?.resize(cols, rows);
+    }
     s.pty.write("\f"); // Ctrl-L: redraw so a reattached window sees a prompt
     return s;
   }
@@ -832,11 +863,32 @@ function openSession(sid, cols, rows) {
     cwd: process.env.HOME || process.cwd(),
     env: process.env,
   });
-  s = { pty: p, graceTimer: null, startedAt: Date.now(), lastOutputAt: Date.now() };
+  let sessionRecorder = null;
+  try { sessionRecorder = sessionLog?.open(sid, { cols, rows }) || null; }
+  catch (e) { logErr(`[session ${sid}] recording unavailable: ${e.message}`); }
+  let settleExit;
+  const exitPromise = new Promise((resolve) => { settleExit = resolve; });
+  s = {
+    pty: p, log: sessionRecorder, logPaused: false, graceTimer: null,
+    startedAt: Date.now(), lastOutputAt: Date.now(), exitPromise, settleExit,
+  };
   sessions.set(sid, s);
-  p.onData((d) => { s.lastOutputAt = Date.now(); sendSessionData(sid, d); });
+  p.onData((d) => {
+    s.lastOutputAt = Date.now();
+    if (s.log && !s.log.append(d) && !s.logPaused) {
+      s.logPaused = true;
+      try { p.pause(); } catch {}
+      void s.log.drain().finally(() => {
+        s.logPaused = false;
+        try { p.resume(); } catch {}
+      });
+    }
+    sendSessionData(sid, d);
+  });
   p.onExit(({ exitCode }) => {
     sessions.delete(sid);
+    const closed = s.log?.close({ exitCode }) || Promise.resolve();
+    void closed.finally(s.settleExit);
     sendCtl({ type: "exit", sid, code: exitCode });
     broadcastSessions();
     log(`[session ${sid}] shell exited (${exitCode})`);
@@ -858,10 +910,15 @@ async function broadcastSessions() {
 
 function killSession(sid) {
   const s = sessions.get(sid);
-  if (!s) return;
+  if (!s) return null;
   if (s.graceTimer) clearTimeout(s.graceTimer);
   sessions.delete(sid);
-  try { s.pty.kill(); } catch {}
+  try { s.pty.kill(); }
+  catch (e) {
+    const closed = s.log?.close({ status: "interrupted", error: e.message }) || Promise.resolve();
+    void closed.finally(s.settleExit);
+  }
+  return s.exitPromise;
 }
 
 // A window's socket dropped: keep its shell briefly so a reload can reattach.
@@ -873,6 +930,20 @@ function scheduleSessionCleanup(sid) {
     log(`[session ${sid}] no reconnect within grace window, closing`);
     killSession(sid);
   }, SESSION_GRACE_MS);
+}
+
+let stopping = false;
+async function stopDaemon(code) {
+  if (stopping) return;
+  stopping = true;
+  const exits = [...sessions.keys()].map(killSession).filter(Boolean);
+  for (const id of activeExecs.keys()) killExec(id, "SIGTERM");
+  if (exits.length) {
+    await Promise.race([Promise.allSettled(exits), sleep(500)]);
+  }
+  try { await sessionLog?.closeAll({ status: "interrupted", error: "daemon stopped" }); }
+  catch (e) { logErr("could not flush session logs: " + e.message); }
+  process.exit(code);
 }
 
 // ---- banner --------------------------------------------------------------
@@ -927,7 +998,8 @@ const HANDSHAKE_TIMEOUT_MS = 15000;
 const activeDownloads = new Map(); // id -> fs.ReadStream
 const activeUploads = new Map(); // id -> { stream, finalPath }
 let jobStore = null;
-const PROTOCOL_FEATURES = ["cp-sha256-v1", "exec-options-v1", "jobs-v1"];
+let sessionLog = null;
+const PROTOCOL_FEATURES = ["cp-sha256-v1", "exec-options-v1", "jobs-v1", "history-v1"];
 
 function sendCtl(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -956,8 +1028,8 @@ function connect() {
           "       Stop the other one" + (BOUND ? "." : ", or choose a different --token.")
       );
       emitStatus("fatal", { reason: "conflict", code: res.statusCode });
-      for (const sid of sessions.keys()) killSession(sid);
-      process.exit(1);
+      void stopDaemon(1);
+      return;
     }
     if (res.statusCode === 401 || res.statusCode === 403) {
       console.error(
@@ -965,8 +1037,8 @@ function connect() {
           "Your login may have expired — run `switchboard login` again."
       );
       emitStatus("fatal", { reason: "auth", code: res.statusCode });
-      for (const sid of sessions.keys()) killSession(sid);
-      process.exit(1);
+      void stopDaemon(1);
+      return;
     }
     // Everything else is transient (a 500 from the relay, a proxy hiccup) and
     // should reconnect. That teardown is ours to do: ws only runs its own
@@ -1009,7 +1081,10 @@ function connect() {
       case "resize": {
         if (!(msg.cols > 0 && msg.rows > 0)) break;
         const s = sessions.get(msg.sid);
-        if (s) try { s.pty.resize(msg.cols, msg.rows); } catch {}
+        if (s) {
+          try { s.pty.resize(msg.cols, msg.rows); } catch {}
+          s.log?.resize(msg.cols, msg.rows);
+        }
         break;
       }
       // tmux-style: closing a browser window does NOT end the shell when bound
@@ -1027,6 +1102,8 @@ function connect() {
       case "job-list": sendJobList(msg.id); break;
       case "job-read": sendJobRead(msg); break;
       case "job-get": sendJobStatus(msg); break;
+      case "sess-list": sendSessionLogList(msg.id); break;
+      case "sess-read": sendSessionLogRead(msg); break;
       case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
       case "ul-chunk": uploadChunk(msg.id, msg.data); break;
       case "ul-end": endUpload(msg.id); break;
@@ -1053,10 +1130,10 @@ function connect() {
     if (code === 4001) {
       log("[relay] replaced by a newer daemon for this " + (BOUND ? "machine" : "token") + "; exiting.");
       emitStatus("fatal", { reason: "replaced", code });
-      for (const sid of sessions.keys()) killSession(sid);
-      for (const id of activeExecs.keys()) killExec(id, "SIGTERM");
-      process.exit(0);
+      void stopDaemon(0);
+      return;
     }
+    if (stopping) return;
     // Sessions are kept across reconnects; their onData handlers check ws state.
     for (const stream of activeDownloads.values()) stream.destroy();
     activeDownloads.clear();
@@ -1467,6 +1544,42 @@ function sendJobStatus(msg) {
     : { type: "job-error", id: msg.id, job: msg.job, message: "no such job" });
 }
 
+function sendSessionLogList(id) {
+  if (!id) return;
+  sendCtl({
+    type: "sess-list",
+    id,
+    recording: !!sessionLog,
+    sessions: sessionLog ? sessionLog.list() : [],
+  });
+}
+function sendSessionLogRead(msg) {
+  if (!msg.id || !msg.sid) return;
+  if (!sessionLog) {
+    sendCtl({ type: "sess-error", id: msg.id, sid: msg.sid, message: "session recording is disabled" });
+    return;
+  }
+  try {
+    const requested = Number(msg.len);
+    const len = Number.isSafeInteger(requested) && requested >= 0
+      ? Math.min(64 * 1024, requested)
+      : 64 * 1024;
+    const chunk = sessionLog.read(String(msg.sid), { from: msg.from, len });
+    sendCtl({
+      type: "sess-chunk",
+      id: msg.id,
+      sid: msg.sid,
+      data: chunk.data.toString("base64"),
+      off: chunk.off,
+      next: chunk.next,
+      eof: chunk.eof,
+      stat: sessionLog.stat(String(msg.sid)),
+    });
+  } catch (e) {
+    sendCtl({ type: "sess-error", id: msg.id, sid: msg.sid, message: e.message });
+  }
+}
+
 // ---- host metrics --------------------------------------------------------
 let prevCpu = cpuSample();
 function cpuSample() {
@@ -1599,9 +1712,19 @@ function sendStats() {
   refreshMemAvailable();
   // Different local daemons may legally serve different circuits at once. Keep
   // their job ledgers apart so one startup cannot mark the other's jobs unknown.
-  const jobScope = BOUND ? MACHINE : circuitId(false, TOKEN);
-  jobStore = new JobStore({ dir: path.join(CONFIG_DIR, "jobs", jobScope) }).init();
+  const storageScope = BOUND ? MACHINE : circuitId(false, TOKEN);
+  jobStore = new JobStore({ dir: path.join(CONFIG_DIR, "jobs", storageScope) }).init();
+  if (RECORD_SESSIONS) {
+    try {
+      sessionLog = new SessionLogStore({
+        dir: path.join(CONFIG_DIR, "sessions"), scope: storageScope,
+      }).init();
+    } catch (e) {
+      logErr("session recording unavailable: " + e.message);
+    }
+  }
   setInterval(() => jobStore.cleanup(), 60 * 60 * 1000);
+  if (sessionLog) setInterval(() => sessionLog.prune(), 60 * 60 * 1000);
   setInterval(sendStats, STATS_INTERVAL_MS);
   setInterval(refreshCwds, 10000);
   log(`connecting to ${SERVER} …`);
@@ -1613,9 +1736,7 @@ function sendStats() {
   const shutdown = (sig) => () => {
     log(`shutting down (${sig}).`);
     emitStatus("stopping", { signal: sig });
-    for (const sid of sessions.keys()) killSession(sid);
-    for (const id of activeExecs.keys()) killExec(id, "SIGTERM");
-    process.exit(0);
+    void stopDaemon(0);
   };
   process.on("SIGINT", shutdown("SIGINT"));
   process.on("SIGTERM", shutdown("SIGTERM"));

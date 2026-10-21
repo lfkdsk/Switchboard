@@ -20,6 +20,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { StringDecoder } = require("string_decoder");
 const { finalizeDownload, parseCopyOperands, removeFile } = require("./lib/peer-utils");
 
 const CAPABILITY_TIMEOUT_MS = 2000;
@@ -544,6 +545,234 @@ async function cmdLogs(ctx, opts) {
   }
 }
 
+// ---- persistent shell history --------------------------------------------
+async function cmdHistory(ctx, opts) {
+  validateHistoryOptions(opts);
+  const { node } = await pickNode(ctx, opts.target);
+  const ws = await capableSocket(ctx, node, ["history-v1"], "session history");
+  try {
+    const response = await socketRequest(ws, (id) => ({ type: "sess-list", id }), ["sess-list", "sess-error"]);
+    if (response.type === "sess-error") throw new Error(response.message);
+    const list = response.sessions || [];
+    if (!opts.sid) {
+      printSessionList(list, !!opts.json, response.recording !== false);
+      return;
+    }
+    if (response.recording === false) {
+      throw new Error("Session recording is disabled on the target (SWITCHBOARD_RECORD=0).");
+    }
+    const session = pickSession(list, opts.sid);
+    const sid = session.sid;
+    const tail = opts.tail == null ? null : parseTailSpec(opts.tail);
+    const writer = historyWriter(opts, sid);
+    let offset;
+
+    if (tail?.unit === "lines") {
+      const initial = await readLastLines(ws, sid, session, tail.value);
+      if (initial.data.length || opts.json) await writer.write(initial.data, {
+        off: initial.off, next: session.off, eof: true, stat: session,
+      });
+      offset = Number(session.off) || 0;
+      if (!opts.follow) {
+        await writer.end();
+        return;
+      }
+    } else {
+      offset = opts.from != null
+        ? parseHistoryOffset(opts.from)
+        : tail
+          ? Math.max(Number(session.from) || 0, (Number(session.off) || 0) - tail.value)
+          : Number(session.from) || 0;
+    }
+
+    while (true) {
+      const m = await readSessionChunk(ws, sid, offset);
+      const chunk = Buffer.from(m.data || "", "base64");
+      if (chunk.length || opts.json) await writer.write(chunk, m);
+      const next = Number(m.next);
+      if (Number.isSafeInteger(next) && next >= 0) offset = next;
+      else offset += chunk.length;
+      if (!m.eof) {
+        if (!chunk.length) await delay(20);
+        continue;
+      }
+      if (!opts.follow || !m.stat?.active) break;
+      await delay(500);
+    }
+    await writer.end();
+  } finally {
+    hangUp(ws);
+  }
+}
+
+function validateHistoryOptions(opts) {
+  if (!opts.sid && (opts.from != null || opts.tail != null || opts.text || opts.raw || opts.follow)) {
+    throw new Error("History read options need a session id: switchboard history <node> <sid> [options]");
+  }
+  if (opts.from != null && opts.tail != null) throw new Error("--from and --tail cannot be used together");
+  if (opts.text && opts.raw) throw new Error("--text and --raw cannot be used together");
+  if (opts.json && (opts.text || opts.raw)) throw new Error("--json cannot be combined with --text or --raw");
+  if (opts.from != null) parseHistoryOffset(opts.from);
+  if (opts.tail != null) parseTailSpec(opts.tail);
+}
+
+function printSessionList(list, json, recording) {
+  if (json) {
+    console.log(JSON.stringify(list, null, 2));
+    return;
+  }
+  if (!recording) {
+    console.log("Session recording is disabled on this target (SWITCHBOARD_RECORD=0).");
+    return;
+  }
+  if (!list.length) {
+    console.log("No recorded sessions.");
+    return;
+  }
+  const width = Math.max(8, ...list.map((session) => session.sid.length));
+  for (const session of list) {
+    const status = session.active ? "running" : session.status || "closed";
+    const when = new Date(session.startedAt || session.createdAt).toISOString();
+    const retained = session.from ? ` · starts at ${session.from}` : "";
+    console.log(
+      `${session.sid.padEnd(width)}  ${status.padEnd(11)}  ${when}  ${formatBytes(session.bytes || 0)}${retained}`
+    );
+  }
+}
+
+function pickSession(list, selector) {
+  const exact = list.find((session) => session.sid === selector);
+  if (exact) return exact;
+  const matches = list.filter((session) => session.sid.startsWith(selector));
+  if (!matches.length) throw new Error(`No recorded session matches “${selector}”.`);
+  if (matches.length > 1) {
+    throw new Error(`“${selector}” matches ${matches.length} recorded sessions; use a longer id.`);
+  }
+  return matches[0];
+}
+
+function readSessionChunk(ws, sid, from, len = 64 * 1024) {
+  return socketRequest(ws, (id) => ({ type: "sess-read", id, sid, from, len }),
+    ["sess-chunk", "sess-error"]).then((message) => {
+    if (message.type === "sess-error") throw new Error(message.message);
+    return message;
+  });
+}
+
+async function readLastLines(ws, sid, stat, count) {
+  if (!count) return { data: Buffer.alloc(0), off: Number(stat.off) || 0 };
+  const first = Number(stat.from) || 0;
+  let cursor = Number(stat.off) || 0;
+  const parts = [];
+  let newlines = 0;
+  let terminalNewline = false;
+  while (cursor > first) {
+    const from = Math.max(first, cursor - 64 * 1024);
+    const m = await readSessionChunk(ws, sid, from, cursor - from);
+    const chunk = Buffer.from(m.data || "", "base64");
+    if (!chunk.length && !m.eof) {
+      await delay(20);
+      continue;
+    }
+    if (!parts.length && chunk.length) terminalNewline = chunk[chunk.length - 1] === 0x0a;
+    for (const byte of chunk) if (byte === 0x0a) newlines++;
+    if (chunk.length) parts.unshift(chunk);
+    const actual = Number(m.off);
+    cursor = Number.isSafeInteger(actual) && actual >= first ? actual : from;
+    if (!chunk.length || newlines >= count + (terminalNewline ? 1 : 0)) break;
+  }
+  const data = lastLines(Buffer.concat(parts), count);
+  const loaded = parts.reduce((sum, part) => sum + part.length, 0);
+  return { data, off: cursor + loaded - data.length };
+}
+
+function lastLines(buffer, count) {
+  if (!count || !buffer.length) return Buffer.alloc(0);
+  let index = buffer.length - 1;
+  if (buffer[index] === 0x0a) index--;
+  let seen = 0;
+  for (; index >= 0; index--) {
+    if (buffer[index] === 0x0a && ++seen === count) return buffer.subarray(index + 1);
+  }
+  return buffer;
+}
+
+function parseHistoryOffset(value) {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  if (!/^\d+$/.test(String(value || ""))) throw new Error("--from takes a non-negative byte offset");
+  const offset = Number(value);
+  if (!Number.isSafeInteger(offset)) throw new Error("--from byte offset is too large");
+  return offset;
+}
+
+function parseTailSpec(value) {
+  const input = String(value || "").trim();
+  const lines = /^(\d+)\s*(?:l|line|lines)$/i.exec(input);
+  if (lines) return { unit: "lines", value: safeCount(lines[1], "--tail line count") };
+  const bytes = /^(\d+(?:\.\d+)?)\s*(b|k|kb|kib|m|mb|mib|g|gb|gib)?$/i.exec(input);
+  if (!bytes) throw new Error("--tail takes bytes (for example 64KiB) or lines (for example 200l)");
+  const powers = { b: 1, k: 1024, kb: 1024, kib: 1024, m: 1024 ** 2, mb: 1024 ** 2, mib: 1024 ** 2,
+    g: 1024 ** 3, gb: 1024 ** 3, gib: 1024 ** 3 };
+  const count = Math.floor(Number(bytes[1]) * (powers[(bytes[2] || "b").toLowerCase()] || 1));
+  if (!Number.isSafeInteger(count)) throw new Error("--tail byte count is too large");
+  return { unit: "bytes", value: count };
+}
+
+function safeCount(value, label) {
+  const count = Number(value);
+  if (!Number.isSafeInteger(count)) throw new Error(`${label} is too large`);
+  return count;
+}
+
+function historyWriter(opts, sid) {
+  const decoder = opts.text ? new StringDecoder("utf8") : null;
+  const ansi = decoder ? ansiStream() : null;
+  return {
+    async write(chunk, meta) {
+      if (opts.json) {
+        console.log(JSON.stringify({
+          sid,
+          data: chunk.toString("base64"),
+          off: meta.off,
+          next: meta.next,
+          eof: !!meta.eof,
+          active: !!meta.stat?.active,
+        }));
+      } else if (decoder) {
+        const text = ansi.write(decoder.write(chunk));
+        if (text) await writeOutput(process.stdout, text);
+      } else if (chunk.length) {
+        await writeOutput(process.stdout, chunk);
+      }
+    },
+    async end() {
+      if (!decoder) return;
+      const text = ansi.end(decoder.end());
+      if (text) await writeOutput(process.stdout, text);
+    },
+  };
+}
+
+const ANSI_PATTERN = "\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\)|[@-_])";
+function stripAnsi(value) {
+  return value.replace(new RegExp(ANSI_PATTERN, "g"), "");
+}
+function ansiStream() {
+  let carry = "";
+  const complete = new RegExp("^" + ANSI_PATTERN);
+  const take = (value, final) => {
+    let input = carry + value;
+    carry = "";
+    const lastEscape = input.lastIndexOf("\x1b");
+    if (lastEscape >= 0 && !complete.test(input.slice(lastEscape))) {
+      if (!final) carry = input.slice(lastEscape);
+      input = input.slice(0, lastEscape);
+    }
+    return stripAnsi(input);
+  };
+  return { write: (value) => take(value, false), end: (value) => take(value, true) };
+}
+
 async function cmdWait(ctx, opts) {
   const { node } = await pickNode(ctx, opts.target);
   const ws = await capableSocket(ctx, node, ["jobs-v1"], "job waiting");
@@ -811,4 +1040,7 @@ function ago(t, skew = 0) {
   return Math.round(s / 86400) + "d ago";
 }
 
-module.exports = { cmdCopy, cmdExec, cmdJobs, cmdLogs, cmdNodes, cmdShell, cmdWait };
+module.exports = {
+  cmdCopy, cmdExec, cmdHistory, cmdJobs, cmdLogs, cmdNodes, cmdShell, cmdWait,
+  lastLines, parseTailSpec, stripAnsi,
+};
