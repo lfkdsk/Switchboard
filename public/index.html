@@ -895,9 +895,30 @@
         .replace(/\x1b[@-_]/g, "")
         .replace(/\r(?!\n)/g, "\n");
     }
-    function foldHistoryAlt(input) {
-      return input.replace(/\x1b\[\?(?:47|1047|1049)h[\s\S]*?\x1b\[\?(?:47|1047|1049)l/g,
-        "\n[alternate screen]\n");
+    function historyDuration(ms) {
+      const seconds = Math.max(0, Math.round(ms / 1000));
+      const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
+      return [h && `${h}h`, (m || h) && `${m}m`, `${s}s`].filter(Boolean).join("");
+    }
+    function foldHistoryAlt(bytes, from, intervals) {
+      if (!intervals?.length) return bytes;
+      const end = from + bytes.length, parts = [];
+      let cursor = from;
+      for (const interval of [...intervals].sort((a, b) => a.start - b.start)) {
+        if (!(interval.end > from && interval.start < end)) continue;
+        const visibleEnd = Math.max(cursor, Math.min(end, interval.start));
+        if (visibleEnd > cursor) parts.push(bytes.slice(cursor - from, visibleEnd - from));
+        cursor = Math.max(cursor, Math.min(end, interval.end));
+        if (interval.end <= end && interval.end > from) {
+          const label = interval.application || "fullscreen";
+          parts.push(new TextEncoder().encode(`\n[${label} ${historyDuration(interval.endedAt - interval.startedAt)}]\n`));
+        }
+      }
+      if (cursor < end) parts.push(bytes.slice(cursor - from));
+      const size = parts.reduce((sum, part) => sum + part.length, 0), output = new Uint8Array(size);
+      let offset = 0;
+      for (const part of parts) { output.set(part, offset); offset += part.length; }
+      return output;
     }
     async function openHistory() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return toast("Not connected", "err");
@@ -926,7 +947,8 @@
             from: cursor, len: Math.min(64 * 1024, end - cursor) });
           if (result.type === "sess-error") throw new Error(result.message || "History read failed");
           const bytes = b64ToBytes(result.data || "");
-          const text = historyView.decoder.decode(bytes, { stream: true });
+          const folded = foldHistoryAlt(bytes, Number(result.off) || cursor, result.alternateScreens);
+          const text = historyView.decoder.decode(folded, { stream: true });
           historyView.pending += text;
           const parts = historyView.pending.split("\n");
           historyView.pending = parts.pop(); historyView.lines.push(...parts);
@@ -935,7 +957,7 @@
           cursor = next;
         }
         historyView.pending += historyView.decoder.decode();
-        const clean = stripHistoryAnsi(foldHistoryAlt(historyView.lines.join("\n") + "\n" + historyView.pending));
+        const clean = stripHistoryAnsi(historyView.lines.join("\n") + "\n" + historyView.pending);
         historyView.lines = clean.split("\n"); historyView.from = from;
         updateHistorySearch(); renderHistoryRows();
       } catch (error) { $("historyStatus").textContent = error.message; }

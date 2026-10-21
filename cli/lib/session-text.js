@@ -85,9 +85,35 @@ function renderHistoryText(value, state = createTextState(), options = {}) {
   return output;
 }
 
+function foldIndexedAlternateScreens(value, from, intervals = [], options = {}) {
+  const input = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  if (options.includeAlt || !intervals.length) return input;
+  const end = from + input.length;
+  const parts = [];
+  let cursor = from;
+  for (const interval of [...intervals].sort((a, b) => a.start - b.start)) {
+    if (!(interval.end > from && interval.start < end)) continue;
+    const visibleEnd = Math.max(cursor, Math.min(end, interval.start));
+    if (visibleEnd > cursor) parts.push(input.subarray(cursor - from, visibleEnd - from));
+    cursor = Math.max(cursor, Math.min(end, interval.end));
+    if (interval.end <= end && interval.end > from) {
+      const duration = formatDuration(interval.endedAt - interval.startedAt);
+      parts.push(Buffer.from(`\n[${interval.application || "fullscreen"} ${duration}]\n`));
+    }
+  }
+  if (cursor < end) parts.push(input.subarray(cursor - from));
+  return Buffer.concat(parts);
+}
+
 function filterGrep(text, pattern, options = {}) {
   const expression = pattern instanceof RegExp ? pattern : new RegExp(String(pattern), options.ignoreCase ? "i" : "");
   return text.split("\n").filter((line) => expression.test(line)).join("\n");
 }
 
-module.exports = { createTextState, filterGrep, formatDuration, renderHistoryText };
+module.exports = {
+  createTextState,
+  filterGrep,
+  foldIndexedAlternateScreens,
+  formatDuration,
+  renderHistoryText,
+};

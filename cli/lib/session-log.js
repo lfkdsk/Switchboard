@@ -27,6 +27,59 @@ const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_READ_LENGTH = 64 * 1024;
 const DEFAULT_COMPRESSION_BLOCK_SIZE = 512 * 1024;
 const LEGACY_CACHE_ENTRIES = 4;
+const ALT_SCREEN_RE = /\x1b\[\?(?:47|1047|1049)([hl])/g;
+
+function alternateApplication(line) {
+  const match = String(line).match(/(?:^|[\s$#;|&])(vim?|nvim|nano|less|more|man|top|htop|ssh|tmux)(?=\s|$)/i);
+  return match ? match[1].toLowerCase() : "fullscreen";
+}
+
+function rememberOutputLine(tracker, text) {
+  const clean = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r(?!\n)/g, "\n");
+  const parts = clean.split("\n");
+  tracker.line += parts[0];
+  for (let index = 1; index < parts.length; index++) {
+    if (tracker.line.trim()) tracker.lastLine = tracker.line;
+    tracker.line = parts[index];
+  }
+}
+
+function scanAlternateScreens(state, chunk, startOffset, now, emit) {
+  const prefix = state.altScan.pending;
+  const input = prefix + chunk.toString("latin1");
+  const baseOffset = startOffset - Buffer.byteLength(prefix, "latin1");
+  state.altScan.pending = "";
+  let cursor = 0;
+  ALT_SCREEN_RE.lastIndex = 0;
+  for (let match; (match = ALT_SCREEN_RE.exec(input));) {
+    if (!state.altScan.active) rememberOutputLine(state.altScan, input.slice(cursor, match.index));
+    const offset = baseOffset + match.index;
+    if (match[1] === "h" && !state.altScan.active) {
+      state.altScan.active = {
+        start: offset,
+        startedAt: now,
+        application: alternateApplication(state.altScan.line || state.altScan.lastLine),
+      };
+      emit({ type: "alternate-screen-enter", off: offset, ...state.altScan.active });
+    } else if (match[1] === "l" && state.altScan.active) {
+      const interval = {
+        type: "alternate-screen-exit",
+        off: offset + match[0].length,
+        ...state.altScan.active,
+        end: offset + match[0].length,
+        endedAt: now,
+      };
+      emit(interval);
+      state.altScan.active = null;
+    }
+    cursor = match.index + match[0].length;
+  }
+  const rest = input.slice(cursor);
+  const incomplete = rest.match(/\x1b(?:\[(?:\?(?:\d*)?)?)?$/);
+  const safe = incomplete ? rest.slice(0, incomplete.index) : rest;
+  if (!state.altScan.active) rememberOutputLine(state.altScan, safe);
+  if (incomplete) state.altScan.pending = incomplete[0];
+}
 
 class SessionLogStore {
   constructor(options) {
@@ -139,6 +192,7 @@ class SessionLogStore {
       closePromise: null,
       lastIndexOff: record.nextOffset,
       lastIndexAt: now,
+      altScan: { pending: "", active: null, line: "", lastLine: "" },
       indexTimer: null,
       handle: null,
     };
@@ -160,6 +214,11 @@ class SessionLogStore {
     if (!state || state.closing || state.failed) return true;
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     if (!chunk.length) return true;
+    const appendOffset = state.record.nextOffset;
+    const appendTime = this.now();
+    scanAlternateScreens(state, chunk, appendOffset, appendTime, (event) => {
+      this._writeIndex(state, event);
+    });
     let position = 0;
     let writable = true;
     while (position < chunk.length) {
@@ -318,16 +377,40 @@ class SessionLogStore {
     const data = parts.length === 1 ? parts[0] : Buffer.concat(parts);
     const next = off + data.length;
     const stat = this._publicStat(record, segments);
+    const alternateScreens = this._alternateScreens(record, off, next);
     return {
       data,
       off,
       next,
+      alternateScreens,
       eof: next >= (activeState && !activeState.failed ? logicalEnd : readableEnd),
       from: first,
       size: logicalEnd,
       active: this.active.has(sid),
       stat,
     };
+  }
+
+  _alternateScreens(record, from, to) {
+    const file = path.join(record._dir || this.sessionDir(record.sid), "index.jsonl");
+    let lines;
+    try { lines = fs.readFileSync(file, "utf8").split("\n"); } catch { return []; }
+    const intervals = [];
+    for (const line of lines) {
+      if (!line) continue;
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.type !== "alternate-screen-exit") continue;
+      if (!(entry.end > from && entry.start < to)) continue;
+      intervals.push({
+        start: entry.start,
+        end: entry.end,
+        startedAt: entry.startedAt,
+        endedAt: entry.endedAt,
+        application: entry.application || "fullscreen",
+      });
+    }
+    return intervals;
   }
 
   tail(sid, bytes) {
@@ -889,6 +972,7 @@ function sessionLogReadResponse(store, msg) {
       off: chunk.off,
       next: chunk.next,
       eof: chunk.eof,
+      alternateScreens: chunk.alternateScreens,
       stat: chunk.stat,
     };
   } catch (error) {

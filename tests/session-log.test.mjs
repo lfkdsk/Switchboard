@@ -59,6 +59,61 @@ test("session output rolls segments and reads continuously across their boundari
   fs.rmSync(dir, { recursive: true });
 });
 
+test("alternate-screen intervals are indexed with offsets, timestamps, and application", async () => {
+  let now = 1_000;
+  const { dir, store } = tempStore({ now: () => now });
+  const log = store.open("session-alternate");
+  log.append("$ vim file.txt\n\x1b[?104");
+  now = 193_000;
+  log.append("9hfullscreen bytes");
+  now = 385_000;
+  log.append("\x1b[?1049ldone\n");
+  await log.close();
+
+  const sessionDir = path.join(dir, "session-alternate");
+  const entries = fs.readFileSync(path.join(sessionDir, "index.jsonl"), "utf8")
+    .trim().split("\n").map(JSON.parse);
+  const enter = entries.find((entry) => entry.type === "alternate-screen-enter");
+  const exit = entries.find((entry) => entry.type === "alternate-screen-exit");
+  assert.deepEqual(
+    { start: enter.start, startedAt: enter.startedAt, application: enter.application },
+    { start: 15, startedAt: 193_000, application: "vim" },
+  );
+  assert.deepEqual(
+    {
+      start: exit.start,
+      end: exit.end,
+      startedAt: exit.startedAt,
+      endedAt: exit.endedAt,
+      application: exit.application,
+    },
+    { start: 15, end: 47, startedAt: 193_000, endedAt: 385_000, application: "vim" },
+  );
+  const chunk = store.read("session-alternate", { from: 10, len: 50 });
+  assert.deepEqual(chunk.alternateScreens, [{
+    start: 15,
+    end: 47,
+    startedAt: 193_000,
+    endedAt: 385_000,
+    application: "vim",
+  }]);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("alternate-screen indexing falls back to fullscreen", async () => {
+  let now = 10;
+  const { dir, store } = tempStore({ now: () => now });
+  const log = store.open("session-fullscreen");
+  log.append("prompt\n\x1b[?47hnoise");
+  now = 1_010;
+  log.append("\x1b[?47l");
+  await log.close();
+  const chunk = store.read("session-fullscreen", { from: 0, len: 100 });
+  assert.equal(chunk.alternateScreens[0].application, "fullscreen");
+  assert.equal(chunk.alternateScreens[0].endedAt - chunk.alternateScreens[0].startedAt, 1_000);
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("zstd compression is opt-in and requires runtime support", async () => {
   const runtime = {
     gzipSync: zlib.gzipSync,

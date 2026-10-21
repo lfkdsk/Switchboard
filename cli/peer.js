@@ -21,7 +21,11 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { StringDecoder } = require("string_decoder");
-const { createTextState, renderHistoryText } = require("./lib/session-text");
+const {
+  createTextState,
+  foldIndexedAlternateScreens,
+  renderHistoryText,
+} = require("./lib/session-text");
 const { finalizeDownload, parseCopyOperands, removeFile } = require("./lib/peer-utils");
 
 const CAPABILITY_TIMEOUT_MS = 2000;
@@ -752,7 +756,13 @@ function historyWriter(opts, sid) {
           active: !!meta.stat?.active,
         }));
       } else if (decoder) {
-        const text = selectLines(renderHistoryText(decoder.write(chunk), textState, { includeAlt: opts.includeAlt }));
+        const indexed = foldIndexedAlternateScreens(
+          chunk,
+          Number(meta.off) || 0,
+          meta.alternateScreens,
+          { includeAlt: opts.includeAlt },
+        );
+        const text = selectLines(renderHistoryText(decoder.write(indexed), textState, { includeAlt: opts.includeAlt }));
         if (text) await writeOutput(process.stdout, text);
       } else if (chunk.length) {
         await writeOutput(process.stdout, chunk);

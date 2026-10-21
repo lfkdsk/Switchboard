@@ -2,7 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import text from "../cli/lib/session-text.js";
 
-const { createTextState, formatDuration, renderHistoryText } = text;
+const {
+  createTextState,
+  foldIndexedAlternateScreens,
+  formatDuration,
+  renderHistoryText,
+} = text;
 
 test("history text strips ANSI across chunks", () => {
   const state = createTextState();
@@ -45,6 +50,28 @@ test("history text supports split alternate-screen controls", () => {
   assert.equal(renderHistoryText("x\x1b[?104", state, { now: 1_000 }), "x");
   assert.equal(renderHistoryText("9hhidden\x1b[?1049l", state, { now: 2_000 }),
     "[alternate screen 0s]\n");
+});
+
+test("indexed alternate screens use recorded offsets and duration", () => {
+  const input = Buffer.from("before<fullscreen bytes>after");
+  const start = Buffer.byteLength("before");
+  const end = Buffer.byteLength("before<fullscreen bytes>");
+  const folded = foldIndexedAlternateScreens(input, 100, [{
+    start: 100 + start,
+    end: 100 + end,
+    startedAt: 1_000,
+    endedAt: 193_000,
+    application: "vim",
+  }]);
+  assert.equal(folded.toString(), "before\n[vim 3m12s]\nafter");
+  assert.equal(foldIndexedAlternateScreens(input, 100, [], {}).toString(), input.toString());
+  assert.equal(foldIndexedAlternateScreens(input, 100, [{
+    start: 100 + start,
+    end: 100 + end,
+    startedAt: 1_000,
+    endedAt: 193_000,
+    application: "vim",
+  }], { includeAlt: true }).toString(), input.toString());
 });
 
 test("history duration formatting is compact", () => {
