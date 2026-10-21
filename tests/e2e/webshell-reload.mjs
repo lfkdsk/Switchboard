@@ -290,6 +290,29 @@ try {
   );
   assert.equal(reloadInteractive.match(/RELOAD_PID=(\d+)/)?.[1], pid);
 
+  const secondPage = await context.newPage();
+  await instrument(secondPage);
+  await secondPage.goto(`${origin}/?token=${encodeURIComponent(token)}`);
+  await waitForConnection(secondPage);
+  await waitForTerminal(secondPage, (text) => text.includes("12000") && text.includes("20000"), "scrollback in second live tab");
+  await sendCommand(secondPage, "echo MULTITAB_PID=$$; echo MULTITAB_SHARED_OK");
+  const [firstTabText, secondTabText] = await Promise.all([
+    waitForTerminal(page, (text) => text.includes("MULTITAB_SHARED_OK"), "shared output in first tab"),
+    waitForTerminal(secondPage, (text) => text.includes("MULTITAB_SHARED_OK"), "shared output in second tab"),
+  ]);
+  assert.equal(firstTabText.match(/MULTITAB_PID=(\d+)/)?.[1], pid);
+  assert.equal(secondTabText.match(/MULTITAB_PID=(\d+)/)?.[1], pid);
+  assert.equal(firstTabText.split("\n").filter((line) => line.trim() === "MULTITAB_SHARED_OK").length, 1);
+  assert.equal(secondTabText.split("\n").filter((line) => line.trim() === "MULTITAB_SHARED_OK").length, 1);
+  await secondPage.close();
+  await sendCommand(page, "echo MULTITAB_CLOSE_PID=$$; echo MULTITAB_CLOSE_OK");
+  const afterSecondTabClose = await waitForTerminal(
+    page,
+    (text) => text.includes("MULTITAB_CLOSE_OK") && /MULTITAB_CLOSE_PID=\d+/.test(text),
+    "first tab after closing second tab",
+  );
+  assert.equal(afterSecondTabClose.match(/MULTITAB_CLOSE_PID=(\d+)/)?.[1], pid);
+
   await terminate(daemon);
   await page.waitForFunction(
     () => /disconnected|offline/.test(document.querySelector("#connText")?.textContent || ""),

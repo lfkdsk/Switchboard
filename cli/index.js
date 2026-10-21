@@ -28,6 +28,7 @@ const os = require("os");
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
+const { StringDecoder } = require("string_decoder");
 const { exec, spawn, spawnSync } = require("child_process");
 const WebSocket = require("ws");
 const pty = require("node-pty");
@@ -875,6 +876,11 @@ function resizeSession(s, cols, rows) {
   s.screen?.resize(cols, rows);
 }
 
+function writeSessionInput(s, input) {
+  const text = s.inputDecoder.write(Buffer.isBuffer(input) ? input : Buffer.from(input));
+  if (text) s.pty.write(text);
+}
+
 function openInProcessSession(sid, cols, rows) {
   let s = sessions.get(sid);
   if (s) {
@@ -896,7 +902,7 @@ function openInProcessSession(sid, cols, rows) {
   const exitPromise = new Promise((resolve) => { settleExit = resolve; });
   const screen = new SessionScreen(cols, rows);
   s = {
-    pty: p, log: sessionRecorder, screen,
+    pty: p, log: sessionRecorder, screen, inputDecoder: new StringDecoder("utf8"),
     offset: sessionRecorder?.stat().off || 0,
     logPaused: false, replayPaused: false, replayQueue: Promise.resolve(), graceTimer: null,
     startedAt: Date.now(), lastOutputAt: Date.now(), exitPromise, settleExit,
@@ -942,7 +948,7 @@ function adoptHolder(client, recovered = false) {
   let settleExit;
   const exitPromise = new Promise((resolve) => { settleExit = resolve; });
   const s = {
-    pty: client, holder: true, log: null, screen: null,
+    pty: client, holder: true, log: null, screen: null, inputDecoder: new StringDecoder("utf8"),
     offset: client.offset, replayQueue: Promise.resolve(), graceTimer: null,
     startedAt: client.startedAt || Date.now(),
     lastOutputAt: client.lastOutputAt || Date.now(),
@@ -1017,7 +1023,7 @@ async function openSession(sid, cols, rows) {
         code: "ECANCELED", exitHandled: true, exitPromise,
       });
     }
-    for (const input of pendingSessionInput.get(sid) || []) adopted.pty.write(input);
+    for (const input of pendingSessionInput.get(sid) || []) writeSessionInput(adopted, input);
     pendingSessionInput.delete(sid);
     return adopted;
   }).finally(() => {
@@ -1288,7 +1294,7 @@ function connect() {
       const sid = data.toString("utf8", 1, 1 + sidLen);
       const s = sessions.get(sid);
       const input = data.subarray(1 + sidLen);
-      if (s) s.pty.write(input.toString("utf8"));
+      if (s) writeSessionInput(s, input);
       else if (openingSessions.has(sid)) {
         const pending = pendingSessionInput.get(sid) || [];
         if (pending.reduce((sum, chunk) => sum + chunk.length, 0) + input.length <= 1024 * 1024) {

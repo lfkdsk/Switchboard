@@ -5,6 +5,7 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { EventEmitter } = require("events");
+const { StringDecoder } = require("string_decoder");
 const { spawn } = require("child_process");
 const { SessionLogStore, validId } = require("./session-log");
 const { SessionScreen, buildSessionReplay } = require("./session-replay");
@@ -400,9 +401,11 @@ async function runHolder(config) {
       rows: shell.rows || rows,
       recording: !!log,
     }));
+    const inputDecoder = new StringDecoder("utf8");
     const decode = decodePackets((type, message) => {
       if (type === DATA_PACKET) {
-        shell.write(message.toString("utf8"));
+        const text = inputDecoder.write(message);
+        if (text) shell.write(text);
         return;
       }
       switch (message.type) {

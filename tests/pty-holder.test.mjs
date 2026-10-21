@@ -150,6 +150,40 @@ test("a detached PTY holder survives daemon replacement and replays missed outpu
   assert.equal(observer.stat(sid).status, "closed");
 });
 
+test("holder preserves UTF-8 input split across data packets", {
+  skip: process.platform === "win32"
+    ? "Unix sockets are not used on Windows"
+    : !holderRuntimeAvailable ? "CLI runtime dependencies are not installed" : false,
+  timeout: 15000,
+}, async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-utf8-"));
+  const scope = "utf8-scope";
+  const sid = "split-input";
+  const socketPath = holderSocketPath(rootDir, scope, sid);
+  let daemon;
+  t.after(async () => {
+    await stopChild(daemon);
+    await stopPtyHolders({ rootDir, scope, timeout: 2000 });
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  const launcher = await spawnPtyHolder({
+    rootDir,
+    scope,
+    sid,
+    shell: "/bin/sh",
+    cwd: rootDir,
+  });
+  launcher.disconnect();
+
+  daemon = startDaemon(socketPath, "split-utf8");
+  const result = await nextMessage(daemon, "utf8");
+  assert.match(result.output, /UTF8_SPLIT=雪\r\n/);
+  assert.doesNotMatch(result.output, /�/);
+  await nextMessage(daemon, "exit");
+  await once(daemon, "exit");
+});
+
 test("concurrent launches share one holder and explicit close force-kills a resistant shell", {
   skip: process.platform === "win32"
     ? "Unix sockets are not used on Windows"

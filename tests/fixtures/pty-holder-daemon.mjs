@@ -37,10 +37,15 @@ client.on("data", (chunk) => {
     });
     client.write("exit\n");
   }
+  if (mode === "split-utf8" && output.includes("UTF8_SPLIT=雪\r\n")) {
+    reported = true;
+    process.send?.({ type: "utf8", output });
+    client.write("exit\n");
+  }
 });
 client.on("session-replay", (message) => { replay = message; });
 client.on("exit", (message) => {
-  if (mode === "second") {
+  if (mode === "second" || mode === "split-utf8") {
     clearTimeout(timer);
     process.send?.({ type: "exit", code: message.code });
     setTimeout(() => process.exit(0), 10);
@@ -59,6 +64,12 @@ if (mode === "first") {
   client.write("printf 'HOLDER_BEFORE\\n'; (sleep 0.5; printf 'HOLDER_DURING\\n') &\n");
 } else if (mode === "second") {
   client.replay(Number(process.env.HOLDER_TEST_SINCE), false);
+} else if (mode === "split-utf8") {
+  const command = Buffer.from("printf 'UTF8_SPLIT=雪\\n'\n");
+  const snow = Buffer.from("雪");
+  const split = command.indexOf(snow) + 1;
+  client.write(command.subarray(0, split));
+  client.write(command.subarray(split));
 } else {
   throw new Error(`unknown holder test mode: ${mode}`);
 }
