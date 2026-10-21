@@ -215,6 +215,38 @@ test("holder preserves UTF-8 input split across data packets", {
   await once(daemon, "exit");
 });
 
+test("an orphaned holder expires its lease after the daemon disappears", {
+  skip: process.platform === "win32"
+    ? "Unix sockets are not used on Windows"
+    : !holderRuntimeAvailable ? "CLI runtime dependencies are not installed" : false,
+  timeout: 15000,
+}, async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-lease-"));
+  const scope = "lease-scope";
+  const sid = "lease-session";
+  let client;
+  t.after(async () => {
+    client?.disconnect();
+    await stopPtyHolders({ rootDir, scope, timeout: 1000 });
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  client = await spawnPtyHolder({
+    rootDir, scope, sid, shell: "/bin/sh", cwd: rootDir,
+    recording: true,
+    env: { ...process.env, SWITCHBOARD_SESSION_GRACE: "150ms" },
+  });
+  const holderPid = client.holderPid;
+  const shellPid = client.pid;
+  const socketPath = holderSocketPath(rootDir, scope, sid);
+  client.disconnect();
+  client = null;
+
+  await waitFor(() => !pidAlive(holderPid), "orphan holder lease expiry", 5000);
+  await waitFor(() => !pidAlive(shellPid), "orphan shell termination", 5000);
+  assert.equal(fs.existsSync(socketPath), false, "expired holder must clean up its socket");
+});
+
 test("concurrent launches share one holder and explicit close force-kills a resistant shell", {
   skip: process.platform === "win32"
     ? "Unix sockets are not used on Windows"

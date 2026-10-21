@@ -8,7 +8,7 @@ const { EventEmitter } = require("events");
 const { StringDecoder } = require("string_decoder");
 const { spawn } = require("child_process");
 const { SessionLogStore, validId } = require("./session-log");
-const { SessionScreen, buildSessionReplay } = require("./session-replay");
+const { SessionScreen, buildSessionReplay, parseSessionGrace } = require("./session-replay");
 
 const CONTROL_PACKET = 0;
 const DATA_PACKET = 1;
@@ -236,6 +236,7 @@ async function spawnPtyHolder(options) {
     cols: dimension(options.cols, 80),
     rows: dimension(options.rows, 24),
     recording: options.recording !== false,
+    graceMs: parseSessionGrace((options.env || process.env).SWITCHBOARD_SESSION_GRACE),
   };
   const encoded = Buffer.from(JSON.stringify(config), "utf8").toString("base64url");
   const child = spawn(process.execPath, [__filename, "--run", encoded], {
@@ -351,6 +352,9 @@ async function runHolder(config) {
   let replayQueue = Promise.resolve();
   let closing = false;
   let killTimer = null;
+  let leaseTimer = null;
+  const graceMs = Number.isSafeInteger(config.graceMs) && config.graceMs >= 0
+    ? config.graceMs : parseSessionGrace(undefined);
   const clients = new Set();
   const shell = pty.spawn(config.shell || defaultShell(), [], {
     name: "xterm-color",
@@ -372,6 +376,20 @@ async function runHolder(config) {
       try { shell.resume(); } catch {}
     }
   };
+  // The holder is detached from the daemon, so it owns the orphan lease. A
+  // daemon connection cancels the countdown; the last disconnect starts a new
+  // full grace period. Zero deliberately means retain the session forever.
+  const armLease = () => {
+    clearTimeout(leaseTimer);
+    leaseTimer = null;
+    if (closing || clients.size || graceMs === 0) return;
+    leaseTimer = setTimeout(terminateShell, graceMs);
+    leaseTimer.unref?.();
+  };
+  const renewLease = () => {
+    clearTimeout(leaseTimer);
+    leaseTimer = null;
+  };
 
   shell.onData((value) => {
     const output = Buffer.from(value, "utf8");
@@ -391,6 +409,7 @@ async function runHolder(config) {
 
   const server = net.createServer((socket) => {
     clients.add(socket);
+    renewLease();
     send(socket, control({
       type: "ready",
       sid: config.sid,
@@ -459,7 +478,10 @@ async function runHolder(config) {
       try { decode(chunk); } catch { socket.destroy(); }
     });
     socket.on("error", () => {});
-    socket.on("close", () => clients.delete(socket));
+    socket.on("close", () => {
+      clients.delete(socket);
+      armLease();
+    });
   });
 
   await new Promise((resolve, reject) => {
@@ -470,6 +492,7 @@ async function runHolder(config) {
     server.listen(path.basename(socketPath), () => {
       server.off("error", reject);
       fs.chmodSync(socketPath, 0o600);
+      armLease();
       resolve();
     });
   });
@@ -478,6 +501,7 @@ async function runHolder(config) {
     if (closing) return;
     closing = true;
     clearTimeout(killTimer);
+    clearTimeout(leaseTimer);
     broadcast(control({ type: "exit", sid: config.sid, code: result.exitCode ?? null }));
     for (const socket of clients) socket.end();
     try { await log?.close(result); } catch {}
