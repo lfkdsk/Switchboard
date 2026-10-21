@@ -6,6 +6,7 @@
 const ALT_RE = /^\x1b\[\?(?:47|1047|1049)([hl])/;
 const CSI_RE = /^\x1b\[[0-?]*[ -/]*[@-~]/;
 const OSC_RE = /^\x1b\](?:[^\x07\x1b]|\x1b(?!\\))*(?:\x07|\x1b\\)/;
+const CONTROL_STRING_RE = /^\x1b[PX^_](?:[^\x1b]|\x1b(?!\\))*\x1b\\/;
 const ESC_RE = /^\x1b(?:[@-_]|[()][0-2A-Z])/;
 
 function createTextState() {
@@ -66,7 +67,7 @@ function renderHistoryText(value, state = createTextState(), options = {}) {
       index += alt[0].length;
       continue;
     }
-    const sequence = CSI_RE.exec(rest) || OSC_RE.exec(rest) ||
+    const sequence = CSI_RE.exec(rest) || OSC_RE.exec(rest) || CONTROL_STRING_RE.exec(rest) ||
       (!/^\x1b[\[\]PX^_]/.test(rest) && ESC_RE.exec(rest));
     if (sequence) { index += sequence[0].length; continue; }
     // Hold incomplete control strings and escape sequences for the next chunk.

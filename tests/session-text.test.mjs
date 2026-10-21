@@ -10,6 +10,15 @@ test("history text strips ANSI across chunks", () => {
   assert.equal(renderHistoryText("mafter\x1b[0m\n", state), "after\n");
 });
 
+test("history text strips split terminal control strings without losing later output", () => {
+  for (const introducer of ["P", "X", "^", "_"]) {
+    const state = createTextState();
+    assert.equal(renderHistoryText(`before\x1b${introducer}ignored\x1b`, state), "before");
+    assert.equal(renderHistoryText("\\after\n", state), "after\n");
+    assert.equal(state.pending, "");
+  }
+});
+
 test("history text folds alternate screens with the application name", () => {
   const state = createTextState();
   assert.equal(renderHistoryText("$ vim file.txt\n\x1b[?1049hvim noise", state, { now: 1_000 }),
