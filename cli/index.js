@@ -36,11 +36,14 @@ const activity = require("./activity");
 const peer = require("./peer");
 const { JobStore } = require("./lib/job-store");
 const {
-  SessionLogStore, recordingEnabled, sessionLogListResponse, sessionLogReadResponse,
+  SessionLogStore, recordingEnabled, sessionLogListResponse, sessionLogReadResponse, validId,
 } = require("./lib/session-log");
 const {
   SessionScreen, buildSessionReplay, parseSessionGrace,
 } = require("./lib/session-replay");
+const {
+  recoverPtyHolders, spawnPtyHolder, usePtyHolder,
+} = require("./lib/pty-holder");
 const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
 const pkg = require("./package.json");
 
@@ -155,7 +158,9 @@ Notes:
   Anonymous → the token is the credential; anyone who has it gets a shell here.
   One daemon serves this machine at a time. If another one is already up — the
   menu-bar app, the systemd service, another terminal — starting this one takes
-  its circuit over and closes the shells open in it, so you're asked first.`);
+  its circuit over, so you're asked first. On Unix, detached shell holders keep
+  webshell sessions alive across that daemon handoff; Windows shells remain
+  owned by the daemon and close when it stops.`);
 }
 
 function parseArgs(argv) {
@@ -747,7 +752,9 @@ async function confirmSoleDaemon(circuit, { ignoreService = false, intent = "sta
   // carry on: this is the behaviour those callers have always had.
   if (FORCE || !(process.stdin.isTTY && process.stdout.isTTY)) {
     logErr(`! Switchboard is already running on this machine (${who})` +
-      (takeover ? " — taking over its circuit; the shells open in it will close."
+      (takeover ? (USE_PTY_HOLDER
+        ? " — taking over its circuit; detached shells will be recovered."
+        : " — taking over its circuit; the shells open in it will close.")
                 : " — on a different circuit; both will run."));
     return;
   }
@@ -837,9 +844,17 @@ function setupConnection() {
 // explicit `close` from either kills it for both. The browser's + button creates
 // a fresh sid. Merely disconnecting never closes a session; sessions outlive
 // relay reconnects so a flaky link or tab reload doesn't lose work.
-const sessions = new Map(); // sid -> { pty, log, screen, offset, replayQueue, graceTimer, exitPromise }
+const sessions = new Map(); // sid -> { pty, holder, log, screen, offset, graceTimer, exitPromise }
+const openingSessions = new Map();
+const openingSessionAborts = new Map();
+const openingSessionInfo = new Map();
+const cancelledOpenSessions = new Set();
+const pendingSessionInput = new Map();
 const SESSION_GRACE_MS = parseSessionGrace(process.env.SWITCHBOARD_SESSION_GRACE);
 const RECORD_SESSIONS = recordingEnabled();
+const USE_PTY_HOLDER = usePtyHolder();
+let sessionRoot = null;
+let sessionScope = null;
 
 // Binary frame format shared with the relay/browser:
 //   [1 byte sid length][sid utf8 bytes][payload bytes]
@@ -853,15 +868,18 @@ function sendSessionData(sid, data) {
   }
 }
 
-function openSession(sid, cols, rows) {
+function resizeSession(s, cols, rows) {
+  if (!(cols > 0 && rows > 0)) return;
+  try { s.pty.resize(cols, rows); } catch {}
+  s.log?.resize(cols, rows);
+  s.screen?.resize(cols, rows);
+}
+
+function openInProcessSession(sid, cols, rows) {
   let s = sessions.get(sid);
   if (s) {
     if (s.graceTimer) { clearTimeout(s.graceTimer); s.graceTimer = null; }
-    if (cols > 0 && rows > 0) {
-      try { s.pty.resize(cols, rows); } catch {}
-      s.log?.resize(cols, rows);
-      s.screen.resize(cols, rows);
-    }
+    resizeSession(s, cols, rows);
     return s;
   }
   const p = pty.spawn(SHELL, [], {
@@ -915,7 +933,109 @@ function openSession(sid, cols, rows) {
   return s;
 }
 
+function adoptHolder(client, recovered = false) {
+  const existing = sessions.get(client.sid);
+  if (existing) {
+    client.disconnect();
+    return existing;
+  }
+  let settleExit;
+  const exitPromise = new Promise((resolve) => { settleExit = resolve; });
+  const s = {
+    pty: client, holder: true, log: null, screen: null,
+    offset: client.offset, replayQueue: Promise.resolve(), graceTimer: null,
+    startedAt: client.startedAt || Date.now(),
+    lastOutputAt: client.lastOutputAt || Date.now(),
+    exitPromise, settleExit, finished: false,
+  };
+  sessions.set(client.sid, s);
+  // The holder owns the writer, but the daemon's observer needs to discover a
+  // newly-created record so history listing can include it immediately.
+  sessionLog?.stat(client.sid);
+
+  const finish = (code, reason) => {
+    if (s.finished) return;
+    s.finished = true;
+    if (s.graceTimer) clearTimeout(s.graceTimer);
+    if (sessions.get(client.sid) === s) sessions.delete(client.sid);
+    s.settleExit();
+    sendCtl({ type: "exit", sid: client.sid, code });
+    broadcastSessions();
+    log(`[session ${client.sid}] ${reason}${code == null ? "" : ` (${code})`}`);
+  };
+  client.on("data", (output) => {
+    s.offset = client.offset;
+    s.lastOutputAt = client.lastOutputAt || Date.now();
+    sendSessionData(client.sid, output);
+  });
+  client.on("reset", (message) => sendCtl(message));
+  client.on("session-replay", (message) => {
+    s.offset = message.to;
+    sendCtl(message);
+  });
+  client.on("holder-error", (message) => {
+    logErr(`[session ${client.sid}] holder replay failed: ${message.message}`);
+  });
+  client.on("exit", (message) => finish(message.code, "shell exited"));
+  client.on("disconnect", () => finish(null, "holder disconnected"));
+  client.activate();
+
+  broadcastSessions();
+  log(`[session ${client.sid}] ${recovered ? "holder recovered" : "shell started"} ` +
+    `(pid ${client.pid}, holder ${client.holderPid})`);
+  return s;
+}
+
+async function openSession(sid, cols, rows) {
+  if (!validId(sid)) throw new Error("invalid session id");
+  let s = sessions.get(sid);
+  if (s) {
+    if (s.graceTimer) { clearTimeout(s.graceTimer); s.graceTimer = null; }
+    resizeSession(s, cols, rows);
+    return s;
+  }
+  if (!USE_PTY_HOLDER) return openInProcessSession(sid, cols, rows);
+  if (openingSessions.has(sid)) return openingSessions.get(sid);
+  const controller = new AbortController();
+  openingSessionAborts.set(sid, controller);
+  openingSessionInfo.set(sid, { sid, startedAt: Date.now(), cwd: process.env.HOME || process.cwd() });
+  const opening = spawnPtyHolder({
+    rootDir: sessionRoot,
+    scope: sessionScope,
+    sid,
+    shell: SHELL,
+    cwd: process.env.HOME || process.cwd(),
+    cols,
+    rows,
+    recording: RECORD_SESSIONS,
+    signal: controller.signal,
+  }).then((client) => {
+    const adopted = adoptHolder(client);
+    if (cancelledOpenSessions.delete(sid)) {
+      const exitPromise = killSession(sid);
+      throw Object.assign(new Error("session opening was cancelled"), {
+        code: "ECANCELED", exitHandled: true, exitPromise,
+      });
+    }
+    for (const input of pendingSessionInput.get(sid) || []) adopted.pty.write(input);
+    pendingSessionInput.delete(sid);
+    return adopted;
+  }).finally(() => {
+    openingSessions.delete(sid);
+    openingSessionAborts.delete(sid);
+    openingSessionInfo.delete(sid);
+    cancelledOpenSessions.delete(sid);
+    pendingSessionInput.delete(sid);
+  });
+  openingSessions.set(sid, opening);
+  return opening;
+}
+
 function replaySession(sid, s, msg) {
+  if (s.holder) {
+    s.pty.replay(msg.since, msg.snapshot);
+    return;
+  }
   s.replayQueue = s.replayQueue.then(async () => {
     if (!sessions.has(sid)) return;
     s.replayPaused = true;
@@ -950,17 +1070,42 @@ function replaySession(sid, s, msg) {
 
 // Report the live session list so a browser can show/attach tabs (tmux-style):
 // sessions persist for the daemon's lifetime in bound mode and are reattachable.
-function buildSessionList() {
-  return Promise.all([...sessions.entries()].map(([sid, s]) =>
-    new Promise((res) => getShellCwd(sid, (cwd) => res({ sid, startedAt: s.startedAt, cwd })))));
+async function buildSessionList() {
+  while (true) {
+    const liveEntries = [...sessions.entries()];
+    const openingEntries = [...openingSessionInfo.entries()]
+      .filter(([sid]) => !sessions.has(sid));
+    const list = await Promise.all(liveEntries.map(([sid, s]) =>
+      new Promise((res) => getShellCwd(sid, (cwd) => res({ sid, startedAt: s.startedAt, cwd })))));
+    const unchanged = liveEntries.length === sessions.size &&
+      liveEntries.every(([sid, s]) => sessions.get(sid) === s) &&
+      openingEntries.length === [...openingSessionInfo.keys()].filter((sid) => !sessions.has(sid)).length &&
+      openingEntries.every(([sid, info]) => openingSessionInfo.get(sid) === info && !sessions.has(sid));
+    if (!unchanged) continue;
+    for (const [, info] of openingEntries) list.push(info);
+    return list;
+  }
 }
-async function broadcastSessions() {
-  try { sendCtl({ type: "sessions", list: await buildSessionList() }); } catch {}
+let sessionBroadcastQueue = Promise.resolve();
+function broadcastSessions() {
+  const next = sessionBroadcastQueue.then(async () => {
+    try { sendCtl({ type: "sessions", list: await buildSessionList() }); } catch {}
+  });
+  sessionBroadcastQueue = next.catch(() => {});
+  return next;
 }
 
 function killSession(sid) {
   const s = sessions.get(sid);
-  if (!s) return null;
+  if (!s) {
+    const opening = openingSessions.get(sid);
+    if (!opening) return null;
+    cancelledOpenSessions.add(sid);
+    openingSessionInfo.delete(sid);
+    pendingSessionInput.delete(sid);
+    openingSessionAborts.get(sid)?.abort();
+    return opening.catch((error) => error.exitPromise || null);
+  }
   if (s.graceTimer) clearTimeout(s.graceTimer);
   sessions.delete(sid);
   try { s.pty.kill(); }
@@ -994,7 +1139,27 @@ let stopping = false;
 async function stopDaemon(code) {
   if (stopping) return;
   stopping = true;
-  const exits = [...sessions.keys()].map(killSession).filter(Boolean);
+  if (openingSessions.size) {
+    await Promise.race([Promise.allSettled([...openingSessions.values()]), sleep(2000)]);
+  }
+  const exits = [];
+  for (const sid of openingSessions.keys()) {
+    const exit = killSession(sid);
+    if (exit) exits.push(exit);
+  }
+  for (const [sid, s] of sessions) {
+    if (!s.holder) {
+      const exit = killSession(sid);
+      if (exit) exits.push(exit);
+      continue;
+    }
+    // The detached holder deliberately outlives this daemon. A replacement
+    // daemon scans the scope and reconnects to its socket during startup.
+    if (s.graceTimer) clearTimeout(s.graceTimer);
+    sessions.delete(sid);
+    s.pty.disconnect();
+    s.settleExit();
+  }
   for (const id of activeExecs.keys()) killExec(id, "SIGTERM");
   if (exits.length) {
     await Promise.race([Promise.allSettled(exits), sleep(500)]);
@@ -1057,7 +1222,9 @@ const activeDownloads = new Map(); // id -> fs.ReadStream
 const activeUploads = new Map(); // id -> { stream, finalPath }
 let jobStore = null;
 let sessionLog = null;
-const PROTOCOL_FEATURES = ["cp-sha256-v1", "exec-options-v1", "jobs-v1", "history-v1", "session-replay-v1"];
+const PROTOCOL_FEATURES = [
+  "cp-sha256-v1", "exec-options-v1", "jobs-v1", "history-v1", "session-replay-v1", "pty-holder-v1",
+];
 
 function sendCtl(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -1075,6 +1242,9 @@ function connect() {
     if (!announced) { banner(); announced = true; }
     log("[relay] connected");
     emitStatus("connected", { mode: BOUND ? "account" : "token" });
+    // Recovered holders existed before this relay connection, so announce
+    // them now as well as in response to a browser's list-sessions request.
+    if (sessions.size) void broadcastSessions();
   });
 
   // Fatal server responses: 409 (another daemon on this circuit) and, in bound
@@ -1117,7 +1287,15 @@ function connect() {
       const sidLen = data[0];
       const sid = data.toString("utf8", 1, 1 + sidLen);
       const s = sessions.get(sid);
-      if (s) s.pty.write(data.subarray(1 + sidLen).toString("utf8"));
+      const input = data.subarray(1 + sidLen);
+      if (s) s.pty.write(input.toString("utf8"));
+      else if (openingSessions.has(sid)) {
+        const pending = pendingSessionInput.get(sid) || [];
+        if (pending.reduce((sum, chunk) => sum + chunk.length, 0) + input.length <= 1024 * 1024) {
+          pending.push(Buffer.from(input));
+          pendingSessionInput.set(sid, pending);
+        }
+      }
       return;
     }
     const text = data.toString("utf8");
@@ -1133,19 +1311,19 @@ function connect() {
         sendCtl({ type: "capabilities", id: msg.id, version: pkg.version, features: PROTOCOL_FEATURES });
         break;
       case "open": {
-        const session = openSession(msg.sid, msg.cols, msg.rows);
-        replaySession(msg.sid, session, msg);
-        sendStats();
+        void openSession(msg.sid, msg.cols, msg.rows).then((session) => {
+          replaySession(msg.sid, session, msg);
+          sendStats();
+        }).catch((error) => {
+          logErr(`[session ${msg.sid}] could not open: ${error.message}`);
+          if (!error.exitHandled) sendCtl({ type: "exit", sid: msg.sid, code: null });
+        });
         break;
       }
       case "resize": {
         if (!(msg.cols > 0 && msg.rows > 0)) break;
         const s = sessions.get(msg.sid);
-        if (s) {
-          try { s.pty.resize(msg.cols, msg.rows); } catch {}
-          s.log?.resize(msg.cols, msg.rows);
-          s.screen.resize(msg.cols, msg.rows);
-        }
+        if (s) resizeSession(s, msg.cols, msg.rows);
         break;
       }
       // Kept for old browser clients. Cleanup is driven by peer-status below,
@@ -1753,14 +1931,21 @@ function sendStats() {
   // their job ledgers apart so one startup cannot mark the other's jobs unknown.
   const storageScope = BOUND ? MACHINE : circuitId(false, TOKEN);
   jobStore = new JobStore({ dir: path.join(CONFIG_DIR, "jobs", storageScope) }).init();
+  sessionRoot = path.join(CONFIG_DIR, "sessions");
+  sessionScope = storageScope;
   if (RECORD_SESSIONS) {
     try {
       sessionLog = new SessionLogStore({
-        dir: path.join(CONFIG_DIR, "sessions"), scope: storageScope,
+        dir: sessionRoot, scope: storageScope,
       }).init();
     } catch (e) {
       logErr("session recording unavailable: " + e.message);
     }
+  }
+  if (USE_PTY_HOLDER) {
+    const recovered = await recoverPtyHolders({ rootDir: sessionRoot, scope: sessionScope });
+    for (const client of recovered) adoptHolder(client, true);
+    if (recovered.length) log(`recovered ${recovered.length} detached shell holder(s)`);
   }
   setInterval(() => jobStore.cleanup(), 60 * 60 * 1000);
   if (sessionLog) setInterval(() => sessionLog.prune(), 60 * 60 * 1000);

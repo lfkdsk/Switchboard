@@ -11,6 +11,7 @@ import { chromium } from "playwright-core";
 
 const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const { stopPtyHolders } = require(path.join(root, "cli/lib/pty-holder.js"));
 const token = "webshell-e2e-" + crypto.randomUUID();
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-webshell-e2e-"));
 const logs = new Map();
@@ -206,6 +207,12 @@ async function cleanup() {
   cleaning = (async () => {
     try { await browser?.close(); } catch {}
     await terminate(daemon);
+    try {
+      await stopPtyHolders({
+        rootDir: path.join(home, ".switchboard", "sessions"),
+        timeout: 2000,
+      });
+    } catch {}
     await terminate(relay);
     fs.rmSync(home, { recursive: true, force: true });
   })();
@@ -283,6 +290,54 @@ try {
   );
   assert.equal(reloadInteractive.match(/RELOAD_PID=(\d+)/)?.[1], pid);
 
+  await terminate(daemon);
+  await page.waitForFunction(
+    () => /disconnected|offline/.test(document.querySelector("#connText")?.textContent || ""),
+    null,
+    { timeout: 15000 },
+  );
+  daemon = start("daemon-restarted", process.execPath, [
+    path.join(root, "cli/index.js"),
+    "--server", origin,
+    "--token", token,
+    "--force",
+  ], {
+    cwd: path.join(root, "cli"),
+    env: {
+      ...process.env,
+      HOME: home,
+      SWITCHBOARD_RECORD: "1",
+      SWITCHBOARD_SESSION_GRACE: "24h",
+      SWITCHBOARD_SHELL: process.env.SWITCHBOARD_E2E_SHELL || "/bin/bash",
+    },
+  });
+  await waitForConnection(page);
+  await sendCommand(page, "echo DAEMON_RESTART_PID=$$; echo DAEMON_RESTART_INTERACTIVE_OK");
+  const daemonRestartInteractive = await waitForTerminal(
+    page,
+    (text) => text.includes("DAEMON_RESTART_INTERACTIVE_OK") && /DAEMON_RESTART_PID=\d+/.test(text),
+    "in-page reattach after daemon restart",
+  );
+  assert.equal(daemonRestartInteractive.match(/DAEMON_RESTART_PID=(\d+)/)?.[1], pid);
+
+  await page.reload();
+  await waitForConnection(page);
+  const daemonRestarted = await waitForTerminal(
+    page,
+    (text) => text.split("\n").some((line) => line.trim() === "12000") &&
+      text.split("\n").some((line) => line.trim() === "20000"),
+    "scrollback after daemon restart",
+  );
+  assert.match(daemonRestarted, /(?:^|\n)12000(?:\n|$)/);
+  assert.match(daemonRestarted, /(?:^|\n)20000(?:\n|$)/);
+  await sendCommand(page, "echo DAEMON_REFRESH_PID=$$; echo DAEMON_REFRESH_INTERACTIVE_OK");
+  const daemonRefreshInteractive = await waitForTerminal(
+    page,
+    (text) => text.includes("DAEMON_REFRESH_INTERACTIVE_OK") && /DAEMON_REFRESH_PID=\d+/.test(text),
+    "interactive command after daemon restart and page refresh",
+  );
+  assert.equal(daemonRefreshInteractive.match(/DAEMON_REFRESH_PID=(\d+)/)?.[1], pid);
+
   await terminate(relay);
   await page.waitForFunction(
     () => /disconnected|offline/.test(document.querySelector("#connText")?.textContent || ""),
@@ -322,9 +377,13 @@ try {
   assert.equal(reopenInteractive.match(/REOPEN_PID=(\d+)/)?.[1], pid);
 
   console.log(`webshell reload E2E passed (relay port ${port})`);
-  console.log(`same shell PID ${pid}: reload, network reconnect, and page reopen`);
+  console.log(`same shell PID ${pid}: reload, daemon restart, network reconnect, and page reopen`);
   console.log("restored terminal buffer lines: 12000 and 20000");
-  console.log("interactive markers: RELOAD_INTERACTIVE_OK, RECONNECT_INTERACTIVE_OK, REOPEN_INTERACTIVE_OK");
+  console.log(
+    "interactive markers: RELOAD_INTERACTIVE_OK, DAEMON_RESTART_INTERACTIVE_OK, " +
+    "DAEMON_REFRESH_INTERACTIVE_OK, " +
+    "RECONNECT_INTERACTIVE_OK, REOPEN_INTERACTIVE_OK",
+  );
 } catch (error) {
   failure = error;
   console.error(error.stack || error);

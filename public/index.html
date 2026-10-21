@@ -661,6 +661,7 @@
 
     // ===================== TERMINAL (multi-shell) ===========================
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
+    let awaitingInitialDaemonState = false;
     let pingTimer = null, lastPingT = 0;
     const shellState = SwitchboardSessionState;
     // localStorage is shared by same-origin pages, so another page restores the
@@ -871,6 +872,7 @@
       const current = () => ws === sock; // a superseded socket drives nothing
       sock.onopen = () => {
         if (!current()) return;
+        awaitingInitialDaemonState = true;
         reconnectDelay = 1000; setConn("wait", "waiting for host…");
         for (const s of shells.values()) s.opened = false; // re-attach after reconnect
         for (const [sid, sh] of shells) attachShell(sid, sh);
@@ -963,6 +965,13 @@
             dropSocket(ws); ws = null;
             setTimeout(() => { if (session) { closeTerminal(); goDashboard(); } }, 600);
           } else {
+            const initialDaemonState = awaitingInitialDaemonState;
+            awaitingInitialDaemonState = false;
+            if (m.event === "daemon-online" && !initialDaemonState) {
+              for (const sh of shells.values()) sh.opened = false;
+              for (const [sid, sh] of shells) attachShell(sid, sh);
+              sendJson({ type: "list-sessions" });
+            }
             setConn(m.event === "daemon-online" ? "on" : "off", m.event === "daemon-online" ? "connected" : "host offline");
           }
           break;

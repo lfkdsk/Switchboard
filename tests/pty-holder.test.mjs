@@ -88,9 +88,11 @@ test("a detached PTY holder survives daemon replacement and replays missed outpu
     : !holderRuntimeAvailable ? "CLI runtime dependencies are not installed" : false,
   timeout: 30000,
 }, async (t) => {
-  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-"));
+  const rootDir = path.join(tempDir, "long-session-root-" + "x".repeat(48));
+  fs.mkdirSync(rootDir);
   const scope = "test-scope";
-  const sid = "holder-restart";
+  const sid = "12345678-1234-4234-8234-123456789abc";
   const socketPath = holderSocketPath(rootDir, scope, sid);
   let firstDaemon;
   let secondDaemon;
@@ -98,9 +100,10 @@ test("a detached PTY holder survives daemon replacement and replays missed outpu
     await stopChild(firstDaemon);
     await stopChild(secondDaemon);
     await stopPtyHolders({ rootDir, scope, timeout: 2000 });
-    fs.rmSync(rootDir, { recursive: true, force: true });
+    fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  assert.ok(Buffer.byteLength(socketPath) > 100, "test must exercise a long Unix socket path");
   const launcher = await spawnPtyHolder({
     rootDir,
     scope,
@@ -145,4 +148,58 @@ test("a detached PTY holder survives daemon replacement and replays missed outpu
   assert.match(transcript, /HOLDER_BEFORE/);
   assert.match(transcript, /HOLDER_DURING/);
   assert.equal(observer.stat(sid).status, "closed");
+});
+
+test("concurrent launches share one holder and explicit close force-kills a resistant shell", {
+  skip: process.platform === "win32"
+    ? "Unix sockets are not used on Windows"
+    : !holderRuntimeAvailable ? "CLI runtime dependencies are not installed" : false,
+  timeout: 15000,
+}, async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-race-"));
+  const scope = "race-scope";
+  const sid = "singleton";
+  const socketPath = holderSocketPath(rootDir, scope, sid);
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  fs.writeFileSync(path.join(path.dirname(socketPath), "holder.pid"), "2147483647", { mode: 0o600 });
+  let first;
+  let second;
+  t.after(async () => {
+    first?.disconnect();
+    second?.disconnect();
+    await stopPtyHolders({ rootDir, scope, timeout: 2000 });
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  [first, second] = await Promise.all([
+    spawnPtyHolder({ rootDir, scope, sid, shell: "/bin/sh", cwd: rootDir }),
+    spawnPtyHolder({ rootDir, scope, sid, shell: "/bin/sh", cwd: rootDir }),
+  ]);
+  assert.equal(first.holderPid, second.holderPid);
+  assert.equal(first.pid, second.pid);
+  const holderPid = first.holderPid;
+  const shellPid = first.pid;
+
+  let output = "";
+  const trapsReady = new Promise((resolve) => {
+    first.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+      if (output.includes("TRAPS_READY\r\n")) resolve();
+    });
+  });
+  const exited = new Promise((resolve) => first.once("exit", resolve));
+  first.activate();
+  second.activate();
+  first.write("trap '' HUP TERM; printf 'TRAPS_READY\\n'\n");
+  await trapsReady;
+  second.kill();
+  await Promise.race([
+    exited,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("resistant shell was not killed")), 4000)),
+  ]);
+
+  await waitFor(() => !fs.existsSync(socketPath), "singleton socket cleanup");
+  await waitFor(() => !pidAlive(holderPid), "singleton holder exit");
+  await waitFor(() => !pidAlive(shellPid), "resistant shell exit");
+  assert.equal(fs.existsSync(path.join(rootDir, scope, sid, "holder.pid")), false);
 });

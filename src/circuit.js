@@ -108,8 +108,15 @@ export class Circuit extends DurableObject {
     const { role, machineId } = ws.deserializeAttachment() || {};
     try { ws.close(code, reason); } catch {}
     if (role === "daemon") {
-      this.broadcastToBrowsers(JSON.stringify({ type: "_relay", event: "daemon-offline" }));
-      if (machineId) { try { await setMachineOffline(this.env, machineId); } catch {} }
+      // A replacement daemon may already be accepted when the incumbent's
+      // delayed close callback runs. Do not announce or persist a false offline
+      // transition over the newer live connection.
+      const replacement = this.ctx.getWebSockets("daemon")
+        .some((candidate) => candidate !== ws && candidate.readyState === WS_OPEN);
+      if (!replacement) {
+        this.broadcastToBrowsers(JSON.stringify({ type: "_relay", event: "daemon-offline" }));
+        if (machineId) { try { await setMachineOffline(this.env, machineId); } catch {} }
+      }
     } else {
       this.notifyDaemonPeer(ws);
     }

@@ -14,6 +14,7 @@ const DATA_PACKET = 1;
 const MAX_PACKET_BYTES = 64 * 1024 * 1024;
 const CONNECT_TIMEOUT_MS = 5000;
 const START_TIMEOUT_MS = 10000;
+let lockClaimCounter = 0;
 
 function usePtyHolder(platform = process.platform) {
   // ConPTY handles cannot currently be inherited by an independent holder.
@@ -171,7 +172,19 @@ class PtyHolderClient extends EventEmitter {
 function connectPtyHolder(socketPath, options = {}) {
   const timeout = options.timeout ?? CONNECT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(socketPath);
+    const target = socketConnectTarget(socketPath);
+    const socket = net.createConnection(target.path);
+    const releaseTarget = () => {
+      if (target.fd != null) {
+        try { fs.closeSync(target.fd); } catch {}
+        target.fd = null;
+      }
+      target.cleanup?.();
+      target.cleanup = null;
+    };
+    socket.once("connect", releaseTarget);
+    socket.once("error", releaseTarget);
+    socket.once("close", releaseTarget);
     const client = new PtyHolderClient(socket, socketPath);
     let settled = false;
     const timer = setTimeout(() => finish(new Error(`timed out connecting to PTY holder ${socketPath}`)), timeout);
@@ -209,14 +222,9 @@ async function spawnPtyHolder(options) {
   try {
     return await connectPtyHolder(socketPath, { timeout: 250 });
   } catch (error) {
-    if (!["ENOENT", "ECONNREFUSED"].includes(error.code)) {
-      try { fs.unlinkSync(socketPath); } catch (unlinkError) {
-        if (unlinkError.code !== "ENOENT") throw error;
-      }
-    } else if (error.code === "ECONNREFUSED") {
-      try { fs.unlinkSync(socketPath); } catch {}
-    }
+    if (!["ENOENT", "ECONNREFUSED"].includes(error.code)) throw error;
   }
+  if (options.signal?.aborted) throw abortError();
 
   const config = {
     rootDir: options.rootDir,
@@ -234,22 +242,32 @@ async function spawnPtyHolder(options) {
     stdio: "ignore",
     env: options.env || process.env,
   });
+  let childError = null;
+  child.on("error", (error) => { childError = error; });
   child.unref();
+  const abort = () => {
+    try { child.kill("SIGTERM"); } catch {}
+  };
+  options.signal?.addEventListener("abort", abort, { once: true });
 
-  const deadline = Date.now() + (options.timeout ?? START_TIMEOUT_MS);
-  let lastError;
-  while (Date.now() < deadline) {
-    if (child.exitCode != null) {
-      throw new Error(`PTY holder exited during startup (${child.exitCode})`);
+  try {
+    const deadline = Date.now() + (options.timeout ?? START_TIMEOUT_MS);
+    let lastError;
+    while (Date.now() < deadline) {
+      if (options.signal?.aborted) throw abortError();
+      if (childError) throw childError;
+      try {
+        return await connectPtyHolder(socketPath, { timeout: 250 });
+      } catch (error) {
+        lastError = error;
+        await delay(25);
+      }
     }
-    try {
-      return await connectPtyHolder(socketPath, { timeout: 250 });
-    } catch (error) {
-      lastError = error;
-      await delay(25);
-    }
+    abort();
+    throw new Error(`PTY holder did not start: ${lastError?.message || socketPath}`);
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
   }
-  throw new Error(`PTY holder did not start: ${lastError?.message || socketPath}`);
 }
 
 function listPtyHolderSockets(rootDir, scope = null) {
@@ -277,8 +295,7 @@ async function recoverPtyHolders(options) {
     try {
       clients.push(await connectPtyHolder(socketPath, { timeout: options.timeout }));
     } catch (error) {
-      if (["ENOENT", "ECONNREFUSED"].includes(error.code) ||
-          /disconnected before ready|timed out/.test(error.message)) {
+      if (["ENOENT", "ECONNREFUSED"].includes(error.code)) {
         try { fs.unlinkSync(socketPath); } catch {}
       }
     }
@@ -304,6 +321,12 @@ async function runHolder(config) {
   const socketPath = holderSocketPath(config.rootDir, config.scope, config.sid);
   const sessionDir = path.dirname(socketPath);
   secureDir(sessionDir);
+  const releaseLock = acquireHolderLock(sessionDir);
+  const cleanupFiles = () => {
+    try { fs.unlinkSync(socketPath); } catch {}
+    releaseLock();
+  };
+  process.on("exit", cleanupFiles);
   try { fs.unlinkSync(socketPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
 
   process.title = `switchboard-pty-holder:${config.sid}`;
@@ -323,6 +346,7 @@ async function runHolder(config) {
   let replayPaused = false;
   let replayQueue = Promise.resolve();
   let closing = false;
+  let killTimer = null;
   const clients = new Set();
   const shell = pty.spawn(config.shell || defaultShell(), [], {
     name: "xterm-color",
@@ -422,9 +446,7 @@ async function runHolder(config) {
             }
           });
           break;
-        case "kill":
-          try { shell.kill(); } catch {}
-          break;
+        case "kill": terminateShell(); break;
       }
     });
     socket.on("data", (chunk) => {
@@ -434,14 +456,12 @@ async function runHolder(config) {
     socket.on("close", () => clients.delete(socket));
   });
 
-  const cleanupSocket = () => {
-    try { fs.unlinkSync(socketPath); } catch {}
-  };
-  process.on("exit", cleanupSocket);
-
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(socketPath, () => {
+    // Binding a relative name avoids sockaddr_un's ~104-byte absolute-path
+    // limit while still creating the required <session>/sock filesystem node.
+    process.chdir(sessionDir);
+    server.listen(path.basename(socketPath), () => {
       server.off("error", reject);
       fs.chmodSync(socketPath, 0o600);
       resolve();
@@ -451,6 +471,7 @@ async function runHolder(config) {
   const finish = async (result) => {
     if (closing) return;
     closing = true;
+    clearTimeout(killTimer);
     broadcast(control({ type: "exit", sid: config.sid, code: result.exitCode ?? null }));
     for (const socket of clients) socket.end();
     try { await log?.close(result); } catch {}
@@ -458,15 +479,20 @@ async function runHolder(config) {
       new Promise((resolve) => server.close(resolve)),
       delay(500),
     ]);
-    cleanupSocket();
+    cleanupFiles();
     screen.dispose();
   };
 
-  const stop = () => {
-    try { shell.kill(); } catch {}
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  function terminateShell() {
+    if (closing || killTimer) return;
+    try { shell.kill("SIGTERM"); } catch {}
+    killTimer = setTimeout(() => {
+      try { process.kill(-shell.pid, "SIGKILL"); }
+      catch { try { shell.kill("SIGKILL"); } catch {} }
+    }, 1000);
+  }
+  process.on("SIGINT", terminateShell);
+  process.on("SIGTERM", terminateShell);
 
   const { exitCode } = await shellExit;
   await finish({ exitCode });
@@ -485,6 +511,75 @@ function secureDir(dir) {
 }
 function safeReadDir(dir) {
   try { return fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+}
+function socketConnectTarget(socketPath) {
+  // Linux can resolve a long socket path through an open directory descriptor,
+  // keeping the actual sockaddr short without moving the required socket file.
+  if (process.platform === "linux" && Buffer.byteLength(socketPath) > 100) {
+    const fd = fs.openSync(path.dirname(socketPath), "r");
+    return { path: `/proc/self/fd/${fd}/${path.basename(socketPath)}`, fd };
+  }
+  if (Buffer.byteLength(socketPath) > 100) {
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const aliasRoot = fs.mkdtempSync(`/tmp/sbpty-${uid}-`);
+    fs.chmodSync(aliasRoot, 0o700);
+    const alias = path.join(aliasRoot, "session");
+    fs.symlinkSync(path.dirname(socketPath), alias, process.platform === "win32" ? "junction" : "dir");
+    return {
+      path: path.join(alias, path.basename(socketPath)),
+      fd: null,
+      cleanup: () => { try { fs.rmSync(aliasRoot, { recursive: true, force: true }); } catch {} },
+    };
+  }
+  return { path: socketPath, fd: null };
+}
+function acquireHolderLock(sessionDir) {
+  const lockPath = path.join(sessionDir, "holder.pid");
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      fs.writeFileSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return () => {
+        try {
+          if (Number(fs.readFileSync(lockPath, "utf8")) === process.pid) fs.unlinkSync(lockPath);
+        } catch {}
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const claimPath = lockPath + `.claim-${process.pid}-${lockClaimCounter++}`;
+      try {
+        // A hard link pins the exact inode we inspected. If another starter
+        // replaces holder.pid meanwhile, the inode check prevents us from
+        // unlinking its new live lock while recovering this stale one.
+        fs.linkSync(lockPath, claimPath);
+        const owner = Number(fs.readFileSync(claimPath, "utf8"));
+        if (pidAlive(owner)) {
+          throw Object.assign(new Error("PTY holder is already running"), { code: "EEXIST" });
+        }
+        const claimed = fs.statSync(claimPath);
+        let current = null;
+        try { current = fs.statSync(lockPath); } catch {}
+        if (current && current.dev === claimed.dev && current.ino === claimed.ino) {
+          try { fs.unlinkSync(lockPath); } catch {}
+        }
+      } catch (claimError) {
+        if (claimError.code === "EEXIST" && /already running/.test(claimError.message)) throw claimError;
+        if (!["ENOENT", "EEXIST"].includes(claimError.code)) throw claimError;
+      } finally {
+        try { fs.unlinkSync(claimPath); } catch {}
+      }
+    }
+  }
+  throw new Error("could not acquire PTY holder lock");
+}
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === "EPERM"; }
+}
+function abortError() {
+  return Object.assign(new Error("PTY holder startup cancelled"), { code: "ECANCELED" });
 }
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
