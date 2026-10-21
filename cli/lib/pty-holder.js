@@ -158,8 +158,8 @@ class PtyHolderClient extends EventEmitter {
     }
   }
 
-  replay(since, snapshot) {
-    this.sendControl({ type: "replay", since, snapshot: !!snapshot });
+  replay(since, snapshot, relayClientId) {
+    this.sendControl({ type: "replay", since, snapshot: !!snapshot, relayClientId });
   }
 
   kill() { this.sendControl({ type: "kill" }); }
@@ -452,7 +452,10 @@ async function runHolder(config) {
                 forceSnapshot: !!message.snapshot,
               });
               if (replay.mode === "snapshot") {
-                send(socket, control({ type: "reset", sid: config.sid, offset: replay.to }));
+                send(socket, control({
+                  type: "reset", sid: config.sid, offset: replay.to,
+                  relayClientId: message.relayClientId,
+                }));
               }
               send(socket, control({
                 type: "session-replay",
@@ -461,6 +464,7 @@ async function runHolder(config) {
                 from: replay.from,
                 to: replay.to,
                 bytes: replay.payload.length,
+                relayClientId: message.relayClientId,
               }));
               if (replay.payload.length) send(socket, data(replay.payload));
             } catch (error) {

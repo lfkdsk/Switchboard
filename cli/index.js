@@ -1047,7 +1047,7 @@ async function openSession(sid, cols, rows) {
 
 function replaySession(sid, s, msg) {
   if (s.holder) {
-    s.pty.replay(msg.since, msg.snapshot);
+    s.pty.replay(msg.since, msg.snapshot, msg.relayClientId);
     return;
   }
   s.replayQueue = s.replayQueue.then(async () => {
@@ -1062,15 +1062,16 @@ function replaySession(sid, s, msg) {
         currentOffset: s.offset,
         forceSnapshot: !!msg.snapshot,
       });
-      // Replay is broadcast by the relay. Delta metadata lets already-current
-      // clients ignore bytes intended for a reconnecting peer; snapshots reset
-      // every attached view so all of them remain identical.
+      // The relay strips relayClientId and routes this metadata plus its following
+      // binary payload only to the browser that requested replay. Live output
+      // remains broadcast, so already attached terminals never receive duplicates.
       if (replay.mode === "snapshot") {
-        sendCtl({ type: "reset", sid, offset: replay.to });
+        sendCtl({ type: "reset", sid, offset: replay.to, relayClientId: msg.relayClientId });
       }
       sendCtl({
         type: "session-replay", sid, mode: replay.mode,
         from: replay.from, to: replay.to, bytes: replay.payload.length,
+        relayClientId: msg.relayClientId,
       });
       if (replay.payload.length) sendSessionData(sid, replay.payload);
     } catch (error) {

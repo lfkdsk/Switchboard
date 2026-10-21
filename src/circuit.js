@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { setMachineOffline, updateMachineStats } from "./registry.js";
+import { browserMessage, daemonRoute } from "./replay-routing.js";
 
 const WS_OPEN = 1;
 
@@ -59,6 +60,7 @@ export class Circuit extends DurableObject {
     server.serializeAttachment({
       role,
       machineId,
+      clientId: role === "browser" ? crypto.randomUUID() : null,
       accountId: request.headers.get("x-switchboard-account") || null,
       accessVia: request.headers.get("x-switchboard-access") || null,
       expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
@@ -84,13 +86,17 @@ export class Circuit extends DurableObject {
       if (att.machineId && typeof message === "string" && message.length < 8000) {
         this.recordHeartbeat(att.machineId, message);
       }
+      const route = daemonRoute(message, this._replayTargets);
+      this._replayTargets = route.replayTargets;
       for (const b of this.ctx.getWebSockets("browser")) {
-        if (!this.closeIfBlocked(b)) this.safeSend(b, message);
+        const browser = b.deserializeAttachment() || {};
+        if (route.target && browser.clientId !== route.target) continue;
+        if (!this.closeIfBlocked(b)) this.safeSend(b, route.message);
       }
     } else {
       if (this.closeIfBlocked(ws)) return;
       const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);
-      if (daemon) this.safeSend(daemon, message);
+      if (daemon) this.safeSend(daemon, browserMessage(message, att.clientId));
     }
   }
 
