@@ -112,7 +112,7 @@ quick remote help. No sign-in required; the token *is* the key (see
 | Sign-in                  | GitHub, once per machine              | none                                   |
 | Who can open the shell   | you + GitHub users you share with     | anyone holding the token               |
 | Appears in the dashboard | ✅ with live stats                     | —                                      |
-| Shell lifetime           | persists — reattach anytime           | persists across reloads (60s grace)    |
+| Shell lifetime           | reattachable (24h detached grace)     | reattachable (24h detached grace)      |
 | Best for                 | persistent, identity-based access     | pairing · one-offs                     |
 
 Both modes give you the multi-tab terminal and file transfer; they differ only in
@@ -335,6 +335,10 @@ reading a transcript. Each session keeps at most 1 GiB, all scopes together keep
 at most 5 GiB, and segments older than 30 days are pruned oldest-first. Set
 `SWITCHBOARD_RECORD=0` on the target to turn recording off.
 
+Detached shells are kept for 24 hours after the last browser or CLI peer leaves.
+Set `SWITCHBOARD_SESSION_GRACE` on the target to change that duration (a bare
+number is seconds; `0` keeps shells until they exit or are explicitly closed).
+
 The repo ships a [Claude Code skill](.claude/skills/switchboard/SKILL.md) for
 exactly this: which command to reach for, what the exit codes mean, when `exec`
 beats `shell`, and what the error messages are telling you. It's picked up
@@ -520,7 +524,8 @@ switchboard shell <node>     Open an interactive shell on a reachable peer
 | `shell [sid]`, `shell --attach` | Reattach to that session, or to the newest one. |
 
 Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
-`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`, `SWITCHBOARD_FORCE`, `SWITCHBOARD_RECORD`.
+`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`, `SWITCHBOARD_FORCE`, `SWITCHBOARD_RECORD`,
+`SWITCHBOARD_SESSION_GRACE`.
 The `WEBTERM_*`
 equivalents are also accepted for drop-in compatibility. Account credentials live
 in `~/.switchboard/config.json` (mode `0600`), and whoever is currently serving
