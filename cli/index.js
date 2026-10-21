@@ -832,10 +832,11 @@ function setupConnection() {
 }
 
 // ---- sessions ------------------------------------------------------------
-// One PTY per browser window. Each window carries a session id (sid); a reload
-// reuses its sid and resumes, a new window gets a fresh sid and its own shell.
-// Sessions outlive relay reconnects so a flaky link or tab reload doesn't lose
-// work.
+// One PTY per session id (sid). Reloads and same-origin tabs that restore the
+// same sid share that PTY: both can type, both receive its output, and an
+// explicit `close` from either kills it for both. The browser's + button creates
+// a fresh sid. Merely disconnecting never closes a session; sessions outlive
+// relay reconnects so a flaky link or tab reload doesn't lose work.
 const sessions = new Map(); // sid -> { pty, log, screen, offset, replayQueue, graceTimer, exitPromise }
 const SESSION_GRACE_MS = parseSessionGrace(process.env.SWITCHBOARD_SESSION_GRACE);
 const RECORD_SESSIONS = recordingEnabled();

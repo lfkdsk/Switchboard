@@ -663,6 +663,10 @@
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
     let pingTimer = null, lastPingT = 0;
     const shellState = SwitchboardSessionState;
+    // localStorage is shared by same-origin pages, so another page restores the
+    // same sids and mirrors the same PTYs. Either page may type; clicking ×
+    // explicitly closes that PTY for every page, while reload/Back/page close
+    // only detach and leave it available for the grace period.
     const shells = new Map(); // sid -> { term, fit, host, tab, label, opened, offset, rendered, replay }
     let activeSid = null, bootstrapped = false;
     let shellStorageKey = null, shellNode = null, persistTimer = null;
