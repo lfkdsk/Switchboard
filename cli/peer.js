@@ -576,6 +576,7 @@ async function cmdHistory(ctx, opts) {
       const initial = await readLastLines(ws, sid, session, tail.value);
       if (initial.data.length || opts.json) await writer.write(initial.data, {
         off: initial.off, next: session.off, eof: true, stat: session,
+        alternateScreens: initial.alternateScreens,
       });
       offset = Number(session.off) || 0;
       if (!opts.follow) {
@@ -671,12 +672,16 @@ async function readLastLines(ws, sid, stat, count) {
   const first = Number(stat.from) || 0;
   let cursor = Number(stat.off) || 0;
   const parts = [];
+  const alternateScreens = new Map();
   let newlines = 0;
   let terminalNewline = false;
   while (cursor > first) {
     const from = Math.max(first, cursor - 64 * 1024);
     const m = await readSessionChunk(ws, sid, from, cursor - from);
     const chunk = Buffer.from(m.data || "", "base64");
+    for (const interval of Array.isArray(m.alternateScreens) ? m.alternateScreens : []) {
+      alternateScreens.set(`${interval.start}:${interval.end}`, interval);
+    }
     if (!chunk.length && !m.eof) {
       await delay(20);
       continue;
@@ -690,7 +695,11 @@ async function readLastLines(ws, sid, stat, count) {
   }
   const data = lastLines(Buffer.concat(parts), count);
   const loaded = parts.reduce((sum, part) => sum + part.length, 0);
-  return { data, off: cursor + loaded - data.length };
+  return {
+    data,
+    off: cursor + loaded - data.length,
+    alternateScreens: [...alternateScreens.values()],
+  };
 }
 
 function lastLines(buffer, count) {

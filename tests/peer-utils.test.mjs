@@ -81,6 +81,7 @@ class FakeSocket extends EventEmitter {
   static uploadCommand = null;
   static downloadBase = null;
   static historyContent = Buffer.from("\x1b[31mred\x1b[0m\nblue\n");
+  static historyAlternateScreens = [];
   static features = ["cp-sha256-v1"];
   static ignoreCapabilities = false;
   constructor() {
@@ -142,6 +143,9 @@ class FakeSocket extends EventEmitter {
       this.reply({
         type: "sess-chunk", id: m.id, sid: m.sid, data: chunk.toString("base64"),
         off: from, next, eof: next >= FakeSocket.historyContent.length,
+        alternateScreens: FakeSocket.historyAlternateScreens.filter(
+          (interval) => interval.end > from && interval.start < next,
+        ),
         stat: { active: false, from: 0, off: FakeSocket.historyContent.length },
       });
     }
@@ -392,6 +396,40 @@ test("history grep includes alternate-screen contents with include-alt", async (
     FakeSocket.features = ["cp-sha256-v1"];
   }
   assert.equal(output, "secret match\nvisible match\n");
+});
+
+test("history line tails use indexed alternate-screen intervals when the enter sequence was trimmed", async () => {
+  const originalContent = FakeSocket.historyContent;
+  const originalIntervals = FakeSocket.historyAlternateScreens;
+  const enter = "$ vim file.txt\n\x1b[?1049h";
+  const hidden = "secret match\nmore secret match\n";
+  const leave = "\x1b[?1049l";
+  FakeSocket.historyContent = Buffer.from(enter + hidden + leave + "visible match\n");
+  FakeSocket.historyAlternateScreens = [{
+    start: Buffer.byteLength("$ vim file.txt\n"),
+    end: Buffer.byteLength(enter + hidden + leave),
+    startedAt: 1_000,
+    endedAt: 193_000,
+    application: "vim",
+  }];
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", tail: "2l", text: true, grep: "match",
+      includeAlt: false, raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.historyAlternateScreens = originalIntervals;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "visible match\n");
 });
 
 test("history CLI forwards grep and alternate-screen flags to the peer client", () => {

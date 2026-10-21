@@ -73,6 +73,12 @@
     return supported.has("session-replay-v1") && supported.has("pty-holder-v1");
   }
 
+  function shouldNotifyClientGone(features) {
+    // Unknown capabilities must remain compatible with legacy daemons. Modern
+    // holder-aware daemons ignore client-gone and advertise both features.
+    return !daemonRetainsSessions(features);
+  }
+
   function emptyState() {
     return { version: VERSION, activeSid: null, shells: [] };
   }
@@ -105,6 +111,7 @@
     load,
     normalize,
     save,
+    shouldNotifyClientGone,
     storageKey,
   };
 })(typeof globalThis === "object" ? globalThis : window);

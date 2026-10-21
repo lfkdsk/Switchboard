@@ -63,6 +63,13 @@ test("daemon session retention requires both replay and PTY holder features", ()
   assert.equal(state.daemonRetainsSessions(null), false);
 });
 
+test("client-gone stays enabled until holder-aware retention is confirmed", () => {
+  assert.equal(state.shouldNotifyClientGone(null), true);
+  assert.equal(state.shouldNotifyClientGone([]), true);
+  assert.equal(state.shouldNotifyClientGone(["session-replay-v1"]), true);
+  assert.equal(state.shouldNotifyClientGone(["session-replay-v1", "pty-holder-v1"]), false);
+});
+
 test("storage failures are contained and byte offsets accumulate safely", () => {
   const broken = {
     getItem() { throw new Error("blocked"); },

@@ -685,7 +685,7 @@
     // ===================== TERMINAL (multi-shell) ===========================
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
     let awaitingInitialDaemonState = false;
-    let daemonRetainsSessions = null, capabilitiesId = null;
+    let daemonFeatures = null, capabilitiesId = null;
     let pingTimer = null, lastPingT = 0;
     const shellState = SwitchboardSessionState;
     // localStorage is shared by same-origin pages, so another page restores the
@@ -1047,7 +1047,7 @@
       sock.onopen = () => {
         if (!current()) return;
         awaitingInitialDaemonState = true;
-        daemonRetainsSessions = null;
+        daemonFeatures = null;
         capabilitiesId = crypto.randomUUID();
         sendJson({ type: "capabilities", id: capabilitiesId });
         reconnectDelay = 1000; setConn("wait", "waiting for host…");
@@ -1129,7 +1129,7 @@
       switch (m.type) {
         case "capabilities":
           if (m.id === capabilitiesId) {
-            daemonRetainsSessions = shellState.daemonRetainsSessions(m.features);
+            daemonFeatures = m.features;
             capabilitiesId = null;
           }
           break;
@@ -1208,7 +1208,7 @@
       persistShells(true);
       // Legacy daemons use client-gone to reap PTYs. Holder-aware daemons own
       // their disconnected-session lease, so notifying them would defeat reload recovery.
-      if (daemonRetainsSessions === false) {
+      if (shellState.shouldNotifyClientGone(daemonFeatures)) {
         for (const sid of shells.keys()) sendJson({ type: "client-gone", sid });
       }
     });
