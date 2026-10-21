@@ -122,6 +122,16 @@
   #newTab { padding: 5px 10px; flex: none; }
   #termHost { flex: 1; min-height: 0; position: relative; }
   .shell-host { position: absolute; inset: 0; padding: 6px 8px; }
+  #historyPanel { position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--bg); }
+  .history-tools { display: flex; gap: 6px; align-items: center; padding: 8px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .history-tools input { flex: 1; min-width: 120px; }
+  #historyStatus { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #historyScroll { flex: 1; overflow: auto; position: relative; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #historyCanvas { position: relative; min-width: max-content; }
+  #historyRows { position: absolute; left: 0; right: 0; }
+  .history-line { height: 19px; padding: 0 10px; white-space: pre; }
+  .history-line mark { color: inherit; background: #6e5b16; }
+  .history-line.current mark { background: #b36b00; outline: 1px solid #f0a020; }
   /* toast + drop */
   #toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
   .toast { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 9px 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
@@ -145,6 +155,7 @@
     </div>
     <span class="spacer"></span>
     <div class="row" id="termTools" hidden>
+      <button id="btnHistory" title="Browse persistent shell history">History</button>
       <button id="btnUpload" title="Upload into the active shell's directory">Upload</button>
       <button id="btnDownload" title="Download a file from the host">Download</button>
     </div>
@@ -202,7 +213,19 @@
   <!-- TERMINAL -->
   <div class="view" id="view-terminal">
     <div id="tabbar"><button id="newTab" title="Open a new shell">+ shell</button></div>
-    <div id="termHost"></div>
+    <div id="termHost">
+      <section id="historyPanel" hidden>
+        <div class="history-tools">
+          <button id="historyClose">Close</button>
+          <button id="historyOlder">Load older</button>
+          <input id="historySearch" type="search" placeholder="Search history" />
+          <button id="historyPrev" title="Previous match">↑</button>
+          <button id="historyNext" title="Next match">↓</button>
+          <span id="historyStatus">History</span>
+        </div>
+        <div id="historyScroll"><div id="historyCanvas"><div id="historyRows"></div></div></div>
+      </section>
+    </div>
   </div>
 
   <!-- CLI AUTHORIZED -->
@@ -672,6 +695,11 @@
     let activeSid = null, bootstrapped = false;
     let shellStorageKey = null, shellNode = null, persistTimer = null;
     const uploads = new Map(), downloads = new Map();
+    const historyRequests = new Map();
+    const historyView = {
+      sid: null, from: 0, end: 0, loading: false, lines: [], matches: [], match: -1,
+      decoder: new TextDecoder(), pending: "",
+    };
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -837,6 +865,115 @@
     }
     $("newTab").onclick = newShell;
 
+    // Persistent history is rendered independently of xterm's bounded scrollback.
+    // Only visible rows enter the DOM; sess-read pages retain logical byte offsets.
+    function historyRequest(message) {
+      const id = crypto.randomUUID(); message.id = id;
+      return new Promise((resolve, reject) => {
+        historyRequests.set(id, { resolve, reject });
+        sendJson(message);
+      });
+    }
+    function stripHistoryAnsi(input) {
+      return input
+        .replace(/\x1b\](?:[^\x07\x1b]|\x1b(?!\\))*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+        .replace(/\x1b[@-_]/g, "")
+        .replace(/\r(?!\n)/g, "\n");
+    }
+    function foldHistoryAlt(input) {
+      return input.replace(/\x1b\[\?(?:47|1047|1049)h[\s\S]*?\x1b\[\?(?:47|1047|1049)l/g,
+        "\n[alternate screen]\n");
+    }
+    async function openHistory() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return toast("Not connected", "err");
+      $("historyPanel").hidden = false;
+      $("historyStatus").textContent = "Loading sessions…";
+      try {
+        const list = await historyRequest({ type: "sess-list" });
+        const sessions = list.sessions || [];
+        const stat = sessions.find((item) => item.sid === activeSid) || sessions[0];
+        if (!stat) throw new Error("No recorded sessions");
+        historyView.sid = stat.sid;
+        historyView.first = Number(stat.from) || 0;
+        historyView.end = Number(stat.off) || 0;
+        historyView.from = Math.max(historyView.first, historyView.end - 256 * 1024);
+        await loadHistoryRange(historyView.from, historyView.end);
+      } catch (error) { $("historyStatus").textContent = error.message; }
+    }
+    async function loadHistoryRange(from, end) {
+      if (historyView.loading) return;
+      historyView.loading = true; historyView.pending = ""; historyView.lines = [];
+      $("historyStatus").textContent = "Loading history…";
+      let cursor = from;
+      try {
+        while (cursor < end) {
+          const result = await historyRequest({ type: "sess-read", sid: historyView.sid,
+            from: cursor, len: Math.min(64 * 1024, end - cursor) });
+          if (result.type === "sess-error") throw new Error(result.message || "History read failed");
+          const bytes = b64ToBytes(result.data || "");
+          const text = historyView.decoder.decode(bytes, { stream: true });
+          historyView.pending += text;
+          const parts = historyView.pending.split("\n");
+          historyView.pending = parts.pop(); historyView.lines.push(...parts);
+          const next = Number(result.next);
+          if (!bytes.length || !Number.isSafeInteger(next) || next <= cursor) break;
+          cursor = next;
+        }
+        historyView.pending += historyView.decoder.decode();
+        const clean = stripHistoryAnsi(foldHistoryAlt(historyView.lines.join("\n") + "\n" + historyView.pending));
+        historyView.lines = clean.split("\n"); historyView.from = from;
+        updateHistorySearch(); renderHistoryRows();
+      } catch (error) { $("historyStatus").textContent = error.message; }
+      finally { historyView.loading = false; }
+    }
+    function updateHistorySearch() {
+      const query = $("historySearch").value.toLowerCase();
+      historyView.matches = [];
+      if (query) historyView.lines.forEach((line, index) => {
+        if (line.toLowerCase().includes(query)) historyView.matches.push(index);
+      });
+      historyView.match = historyView.matches.length ? 0 : -1;
+      $("historyStatus").textContent = `${historyView.lines.length.toLocaleString()} lines` +
+        (query ? ` · ${historyView.matches.length} matches` : "");
+    }
+    function renderHistoryRows() {
+      const scroll = $("historyScroll"), rows = $("historyRows"), lineHeight = 19;
+      const start = Math.max(0, Math.floor(scroll.scrollTop / lineHeight) - 20);
+      const count = Math.ceil(scroll.clientHeight / lineHeight) + 40;
+      const end = Math.min(historyView.lines.length, start + count);
+      $("historyCanvas").style.height = `${historyView.lines.length * lineHeight}px`;
+      rows.style.top = `${start * lineHeight}px`; rows.replaceChildren();
+      const query = $("historySearch").value;
+      for (let index = start; index < end; index++) {
+        const row = document.createElement("div"); row.className = "history-line";
+        if (historyView.matches[historyView.match] === index) row.classList.add("current");
+        const line = historyView.lines[index];
+        if (!query) row.textContent = line;
+        else {
+          const at = line.toLowerCase().indexOf(query.toLowerCase());
+          if (at < 0) row.textContent = line;
+          else { row.append(document.createTextNode(line.slice(0, at)));
+            const mark = document.createElement("mark"); mark.textContent = line.slice(at, at + query.length);
+            row.append(mark, document.createTextNode(line.slice(at + query.length))); }
+        }
+        rows.appendChild(row);
+      }
+    }
+    function moveHistoryMatch(delta) {
+      if (!historyView.matches.length) return;
+      historyView.match = (historyView.match + delta + historyView.matches.length) % historyView.matches.length;
+      $("historyScroll").scrollTop = historyView.matches[historyView.match] * 19;
+      renderHistoryRows();
+    }
+    $("btnHistory").onclick = openHistory;
+    $("historyClose").onclick = () => { $("historyPanel").hidden = true; };
+    $("historyOlder").onclick = () => loadHistoryRange(Math.max(historyView.first, historyView.from - 256 * 1024), historyView.end);
+    $("historySearch").oninput = () => { updateHistorySearch(); renderHistoryRows(); };
+    $("historyPrev").onclick = () => moveHistoryMatch(-1);
+    $("historyNext").onclick = () => moveHistoryMatch(1);
+    $("historyScroll").onscroll = renderHistoryRows;
+
     function syncSessions(listArr) {
       const ids = new Set();
       for (const e of listArr) {
@@ -945,6 +1082,10 @@
     }
     function handleJson(str) {
       let m; try { m = JSON.parse(str); } catch { return; }
+      if (m.id && historyRequests.has(m.id)) {
+        const request = historyRequests.get(m.id); historyRequests.delete(m.id);
+        request.resolve(m); return;
+      }
       switch (m.type) {
         case "sessions": syncSessions(m.list || []); break;
         case "reset": {

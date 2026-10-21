@@ -75,19 +75,9 @@ async function waitForHttp(url, child, timeout = 30000) {
 }
 
 function browserExecutable() {
-  const candidates = [
-    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
-    ...walkExecutables("/opt/pw-browsers"),
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-  ];
-  const executable = candidates.find((candidate) => candidate && isExecutable(candidate));
-  if (!executable) {
-    throw new Error(
-      "Chromium not found (checked /opt/pw-browsers and common system paths); " +
-      "set PLAYWRIGHT_CHROMIUM_EXECUTABLE",
-    );
+  const executable = "/usr/bin/google-chrome";
+  if (!isExecutable(executable)) {
+    throw new Error(`Chrome not found or not executable: ${executable}`);
   }
   return executable;
 }
@@ -261,7 +251,7 @@ try {
   await page.goto(`${origin}/?token=${encodeURIComponent(token)}`);
   await waitForConnection(page);
 
-  await sendCommand(page, "echo PID=$$; sleep 1; seq 1 20000");
+  await sendCommand(page, "echo PID=$$; echo HISTORY_EARLY_SEQUENCE_000001; sleep 1; seq 1 20000");
   const pidText = await waitForTerminal(page, (text) => /PID=\d+/.test(text), "initial PID");
   const pid = pidText.match(/PID=(\d+)/)?.[1];
   assert.ok(pid, "initial PID was not printed");
@@ -271,6 +261,22 @@ try {
     "20,000 output lines",
     60000,
   );
+
+  await page.click("#btnHistory");
+  await page.waitForFunction(
+    () => /lines/.test(document.querySelector("#historyStatus")?.textContent || ""),
+    null,
+    { timeout: 30000 },
+  );
+  await page.fill("#historySearch", "HISTORY_EARLY_SEQUENCE_000001");
+  await page.waitForFunction(
+    () => /[1-9]\d* matches/.test(document.querySelector("#historyStatus")?.textContent || ""),
+    null,
+    { timeout: 15000 },
+  );
+  const historyMatch = await page.locator("#historyRows .history-line.current").textContent();
+  assert.match(historyMatch || "", /HISTORY_EARLY_SEQUENCE_000001/);
+  await page.click("#historyClose");
 
   await page.reload();
   await waitForConnection(page);
