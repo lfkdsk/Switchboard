@@ -284,6 +284,22 @@ test("history reads a line tail and strips terminal escape sequences", async () 
   assert.equal(output, "blue\n");
 });
 
+test("history reports a target without history-v1 before requesting sessions", async () => {
+  FakeSocket.mode = "history";
+  FakeSocket.features = [];
+  try {
+    await assert.rejects(
+      peer.cmdHistory(fakeContext(), {
+        target: "target", sid: null, text: false, raw: false, follow: false, json: false,
+      }),
+      /does not support session history; update it first/,
+    );
+  } finally {
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+});
+
 test("history text mode strips an ANSI sequence split across protocol chunks", async () => {
   const originalContent = FakeSocket.historyContent;
   FakeSocket.historyContent = Buffer.concat([Buffer.alloc(65535, 0x78), Buffer.from("\x1b[31mred\x1b[0m\n")]);
@@ -306,9 +322,34 @@ test("history text mode strips an ANSI sequence split across protocol chunks", a
   assert.equal(output, "x".repeat(65535) + "red\n");
 });
 
+test("history text mode streams a long OSC sequence without leaking its payload", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.from(
+    "before\x1b]0;" + "x".repeat(70_000) + "\x1b[31mhidden\x07after\n",
+  );
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true,
+      raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "beforeafter\n");
+});
+
 test("history helpers parse byte and line tails without a dependency", () => {
   assert.deepEqual(parseTailSpec("64KiB"), { unit: "bytes", value: 65536 });
   assert.deepEqual(parseTailSpec("200 lines"), { unit: "lines", value: 200 });
   assert.equal(stripAnsi("\x1b[32mok\x1b[0m"), "ok");
+  assert.equal(stripAnsi("a\x1bPignored\x1b\\b"), "ab");
   assert.equal(lastLines(Buffer.from("one\ntwo\nthree\n"), 2).toString(), "two\nthree\n");
 });

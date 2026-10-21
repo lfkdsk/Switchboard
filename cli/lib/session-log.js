@@ -35,7 +35,9 @@ class SessionLogStore {
       if (!entry.isDirectory() || !validId(entry.name)) continue;
       const record = this._loadRecord(entry.name);
       if (!record) continue;
-      if (record.status === "running") {
+      // A replacement daemon can initialize this store before the relay has
+      // disconnected the old one. Do not make its live segment prunable.
+      if (record.status === "running" && !pidAlive(record.pid)) {
         record.status = "interrupted";
         record.pid = null;
         record.closedAt = this.now();
@@ -54,8 +56,13 @@ class SessionLogStore {
     if (this.active.has(sid)) return this.active.get(sid).handle;
     const sessionDir = this.sessionDir(sid);
     secureDir(sessionDir);
-    let record = this.records.get(sid) || this._loadRecord(sid);
+    // Opening is cold-path work. Reload from disk first so a daemon that
+    // overlapped its predecessor sees the predecessor's final bytes and state.
+    let record = this._loadRecord(sid) || this.records.get(sid);
     const now = this.now();
+    if (record?.status === "running" && record.pid !== process.pid && pidAlive(record.pid)) {
+      throw Object.assign(new Error("session log is still owned by another daemon"), { code: "EBUSY" });
+    }
     if (!record) {
       record = {
         version: 1,
@@ -188,6 +195,7 @@ class SessionLogStore {
     indexDone.finally(() => state.pending.delete(indexDone));
     state.closePromise = Promise.all([...state.pending, segmentDone]).then(() => {
       const record = state.record;
+      this._reconcileSegments(record);
       record.status = result.status || "closed";
       record.pid = null;
       record.closedAt = this.now();
@@ -219,6 +227,7 @@ class SessionLogStore {
       ? Math.max(...segments.map((segment) => segment.start + segment.size))
       : logicalEnd;
     const activeState = this.active.get(sid);
+    const activelyWriting = !!activeState && !activeState.failed;
     let cursor = Math.max(first, Math.min(requested, logicalEnd));
     const parts = [];
     let remaining = length;
@@ -226,8 +235,22 @@ class SessionLogStore {
     let found = false;
     for (const segment of segments) {
       const end = segment.start + segment.size;
-      if (cursor >= end) continue;
-      if (cursor < segment.start) cursor = segment.start;
+      const logicalSegmentEnd = segment.start + segment.bytes;
+      if (cursor >= logicalSegmentEnd) continue;
+      if (cursor >= end) {
+        // A rolled stream can still be flushing while the next stream already
+        // has bytes. Do not jump that temporary gap and mislabel later bytes.
+        if (activelyWriting) {
+          if (!found) { off = cursor; found = true; }
+          break;
+        }
+        cursor = logicalSegmentEnd;
+        continue;
+      }
+      if (cursor < segment.start) {
+        if (found) break;
+        cursor = segment.start;
+      }
       if (!found) { off = cursor; found = true; }
       if (!remaining) break;
       const available = end - cursor;
@@ -239,7 +262,7 @@ class SessionLogStore {
         if (bytesRead) parts.push(buffer.subarray(0, bytesRead));
         cursor += bytesRead;
         remaining -= bytesRead;
-        if (bytesRead < take) break;
+        if (bytesRead < take || cursor < logicalSegmentEnd) break;
       } finally {
         fs.closeSync(fd);
       }
@@ -247,6 +270,7 @@ class SessionLogStore {
     if (!found) off = cursor;
     const data = parts.length === 1 ? parts[0] : Buffer.concat(parts);
     const next = off + data.length;
+    const stat = this._publicStat(record, segments);
     return {
       data,
       off,
@@ -255,6 +279,7 @@ class SessionLogStore {
       from: first,
       size: logicalEnd,
       active: this.active.has(sid),
+      stat,
     };
   }
 
@@ -329,7 +354,9 @@ class SessionLogStore {
     if (state.writer) return;
     const record = state.record;
     let segment = record.segments.at(-1);
-    if (!segment || segment.bytes >= record.segmentSize || !fs.existsSync(this.segmentPath(record.sid, segment.seg))) {
+    if (!segment || segment.bytes >= record.segmentSize ||
+        segment.start + segment.bytes !== record.nextOffset ||
+        !fs.existsSync(this.segmentPath(record.sid, segment.seg))) {
       const now = this.now();
       segment = {
         seg: record.lastSeg + 1,
@@ -401,10 +428,9 @@ class SessionLogStore {
     return record;
   }
 
-  _publicStat(record) {
+  _publicStat(record, readable = this._readableSegments(record)) {
     const state = this.active.get(record.sid);
     const active = !!state && !state.failed;
-    const readable = this._readableSegments(record);
     const first = readable[0]?.start ?? record.nextOffset;
     return {
       sid: record.sid,
@@ -428,10 +454,39 @@ class SessionLogStore {
 
   _readableSegments(record) {
     const sessionDir = record._dir || this.sessionDir(record.sid);
+    const state = record.scope === this.scope ? this.active.get(record.sid) : null;
+    const firstFile = record.segments[0] &&
+      path.join(sessionDir, `seg-${record.segments[0].seg}.log`);
+    // A daemon for another scope may enforce the global quota and persist a
+    // shorter prefix. Refresh only when that is observable, keeping normal
+    // reads to O(1) filesystem metadata calls rather than one per segment.
+    if (!state && (record.status === "running" || (firstFile && !fs.existsSync(firstFile)))) {
+      const refreshed = loadRecordAt(sessionDir, record.sid, record.scope, record.segmentSize, this.now);
+      if (refreshed) Object.assign(record, refreshed);
+    }
     return record.segments.map((segment) => {
       const file = path.join(sessionDir, `seg-${segment.seg}.log`);
+      // Closed streams were reconciled when loaded or closed, so their saved
+      // byte counts are stable. Only streams that can still have buffered
+      // writes need a stat on every read.
+      if (!state || (state.segment?.seg !== segment.seg && !state.pendingSegments.has(segment.seg))) {
+        return { ...segment, file, size: segment.bytes };
+      }
       try { return { ...segment, file, size: fs.statSync(file).size }; } catch { return null; }
     }).filter(Boolean).sort((a, b) => a.start - b.start);
+  }
+
+  _reconcileSegments(record) {
+    const sessionDir = record._dir || this.sessionDir(record.sid);
+    record.segments = record.segments.map((segment) => {
+      try {
+        return { ...segment, bytes: fs.statSync(path.join(sessionDir, `seg-${segment.seg}.log`)).size };
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+    record.bytesStored = record.segments.reduce((sum, segment) => sum + segment.bytes, 0);
+    record.firstOffset = record.segments[0]?.start ?? record.nextOffset;
   }
 
   _firstReadableOffset(record) {
@@ -635,6 +690,40 @@ function closeStream(stream) {
   });
 }
 
+function sessionLogListResponse(store, id) {
+  return {
+    type: "sess-list",
+    id,
+    recording: !!store,
+    sessions: store ? store.list() : [],
+  };
+}
+
+function sessionLogReadResponse(store, msg) {
+  if (!store) {
+    return { type: "sess-error", id: msg.id, sid: msg.sid, message: "session recording is disabled" };
+  }
+  try {
+    const requested = Number(msg.len);
+    const len = Number.isSafeInteger(requested) && requested >= 0
+      ? Math.min(DEFAULT_READ_LENGTH, requested)
+      : DEFAULT_READ_LENGTH;
+    const chunk = store.read(String(msg.sid), { from: msg.from, len });
+    return {
+      type: "sess-chunk",
+      id: msg.id,
+      sid: msg.sid,
+      data: chunk.data.toString("base64"),
+      off: chunk.off,
+      next: chunk.next,
+      eof: chunk.eof,
+      stat: chunk.stat,
+    };
+  } catch (error) {
+    return { type: "sess-error", id: msg.id, sid: msg.sid, message: error.message };
+  }
+}
+
 module.exports = {
   DEFAULT_INDEX_BYTES,
   DEFAULT_INDEX_INTERVAL_MS,
@@ -647,5 +736,7 @@ module.exports = {
   SessionLog: SessionLogStore,
   SessionLogStore,
   recordingEnabled,
+  sessionLogListResponse,
+  sessionLogReadResponse,
   validId,
 };

@@ -753,24 +753,63 @@ function historyWriter(opts, sid) {
   };
 }
 
-const ANSI_PATTERN = "\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\)|[@-_])";
 function stripAnsi(value) {
-  return value.replace(new RegExp(ANSI_PATTERN, "g"), "");
+  const parser = ansiStream();
+  return parser.write(value) + parser.end("");
 }
 function ansiStream() {
-  let carry = "";
-  const complete = new RegExp("^" + ANSI_PATTERN);
-  const take = (value, final) => {
-    let input = carry + value;
-    carry = "";
-    const lastEscape = input.lastIndexOf("\x1b");
-    if (lastEscape >= 0 && !complete.test(input.slice(lastEscape))) {
-      if (!final) carry = input.slice(lastEscape);
-      input = input.slice(0, lastEscape);
+  let state = "text";
+  const take = (value) => {
+    let output = "";
+    let start = 0;
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      const char = value[index];
+      if (state === "text") {
+        if (code === 0x1b) {
+          output += value.slice(start, index);
+          state = "escape";
+          start = index + 1;
+        }
+      } else {
+        start = index + 1;
+        if (state === "escape") {
+          if (char === "[") state = "csi";
+          else if (char === "]") state = "osc";
+          else if ("PX^_".includes(char)) state = "string";
+          else if (code >= 0x20 && code <= 0x2f) state = "escape-intermediate";
+          else if (code !== 0x1b) state = "text";
+        } else if (state === "escape-intermediate") {
+          if (code >= 0x30 && code <= 0x7e) state = "text";
+          else if (code === 0x1b) state = "escape";
+        } else if (state === "csi") {
+          if (code >= 0x40 && code <= 0x7e) state = "text";
+          else if (code === 0x1b) state = "escape";
+        } else if (state === "osc") {
+          if (code === 0x07) state = "text";
+          else if (code === 0x1b) state = "osc-escape";
+        } else if (state === "osc-escape") {
+          if (char === "\\") state = "text";
+          else if (code !== 0x1b) state = "osc";
+        } else if (state === "string") {
+          if (code === 0x1b) state = "string-escape";
+        } else if (state === "string-escape") {
+          if (char === "\\") state = "text";
+          else if (code !== 0x1b) state = "string";
+        }
+      }
     }
-    return stripAnsi(input);
+    if (state === "text") output += value.slice(start);
+    return output;
   };
-  return { write: (value) => take(value, false), end: (value) => take(value, true) };
+  return {
+    write: take,
+    end(value) {
+      const output = take(value);
+      state = "text";
+      return output;
+    },
+  };
 }
 
 async function cmdWait(ctx, opts) {

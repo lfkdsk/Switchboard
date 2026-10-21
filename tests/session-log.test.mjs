@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import sessionLogs from "../cli/lib/session-log.js";
 
-const { SessionLogStore, recordingEnabled } = sessionLogs;
+const {
+  SessionLogStore, recordingEnabled, sessionLogListResponse, sessionLogReadResponse,
+} = sessionLogs;
 
 function tempStore(options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-sessions-"));
@@ -35,11 +37,129 @@ test("session output rolls segments and reads continuously across their boundari
   const index = fs.readFileSync(path.join(sessionDir, "index.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
   assert.ok(index.every((entry) => Number.isInteger(entry.off) && Number.isInteger(entry.seg)));
   assert.deepEqual(index.find((entry) => entry.type === "resize").resize, { cols: 100, rows: 40 });
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(sessionDir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(path.join(sessionDir, "seg-0.log")).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(sessionDir, "index.jsonl")).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(sessionDir, "meta.json")).mode & 0o777, 0o600);
   const reloaded = new SessionLogStore({ dir, segmentSize: 4, now: () => now }).init();
   assert.equal(reloaded.read("session-one", { from: 0, len: 20 }).data.toString(), "abcdefghij");
   assert.equal(reloaded.stat("session-one").status, "closed");
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("close flushes a burst of queued writes before the record becomes closed", async () => {
+  const { dir, store } = tempStore({ segmentSize: 31 });
+  const log = store.open("session-burst");
+  const chunks = Array.from({ length: 300 }, (_, index) => Buffer.from(`${index}:` + "x".repeat(index % 23)));
+  for (const chunk of chunks) log.append(chunk);
+  await log.close({ exitCode: 0 });
+
+  const expected = Buffer.concat(chunks);
+  const reloaded = new SessionLogStore({ dir, segmentSize: 31 }).init();
+  assert.deepEqual(reloaded.read("session-burst", { from: 0, len: expected.length + 1 }).data, expected);
+  assert.equal(reloaded.stat("session-burst").off, expected.length);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("pruning never removes the current or still-flushing segment", async () => {
+  const { dir, store } = tempStore({
+    segmentSize: 4, maxSessionBytes: 0, maxTotalBytes: 0, retentionMs: 0,
+  });
+  const log = store.open("session-live");
+  log.append("abcdefgh");
+  store.prune();
+
+  const sessionDir = path.join(dir, "session-live");
+  assert.deepEqual(
+    fs.readdirSync(sessionDir).filter((name) => name.endsWith(".log")).sort(),
+    ["seg-0.log", "seg-1.log"],
+  );
+  await log.close();
+  assert.deepEqual(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".log")), []);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("active reads wait at a flushing segment gap instead of skipping bytes", async () => {
+  const { dir, store } = tempStore({ segmentSize: 4 });
+  const log = store.open("session-flushing");
+  log.append("abcdefgh");
+  // Model the observable state while seg-0's queued write is only half on
+  // disk. Both segment streams are still pending until this turn yields.
+  fs.writeFileSync(path.join(dir, "session-flushing", "seg-0.log"), "ab");
+  const first = store.read("session-flushing", { from: 0, len: 8 });
+  assert.deepEqual(
+    { text: first.data.toString(), off: first.off, next: first.next, eof: first.eof },
+    { text: "ab", off: 0, next: 2, eof: false },
+  );
+  const waiting = store.read("session-flushing", { from: first.next, len: 8 });
+  assert.deepEqual(
+    { bytes: waiting.data.length, off: waiting.off, next: waiting.next, eof: waiting.eof },
+    { bytes: 0, off: 2, next: 2, eof: false },
+  );
+  await log.close();
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("initializing another store does not prune a live writer's segment", async () => {
+  let now = 1_000;
+  const { dir, store } = tempStore({
+    segmentSize: 4, maxSessionBytes: 100, maxTotalBytes: 100, retentionMs: 0, now: () => now,
+  });
+  const log = store.open("session-owned");
+  log.append("abc");
+  now += 1;
+
+  const observer = new SessionLogStore({
+    dir, segmentSize: 4, maxSessionBytes: 100, maxTotalBytes: 100, retentionMs: 0, now: () => now,
+  }).init();
+  assert.equal(observer.stat("session-owned").status, "running");
+  assert.equal(fs.existsSync(path.join(dir, "session-owned", "seg-0.log")), true);
+
+  await log.close();
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("a replacement store reloads the previous writer before appending", async () => {
+  const { dir, store } = tempStore({ segmentSize: 4 });
+  const first = store.open("session-handoff");
+  first.append("abc");
+  const replacement = new SessionLogStore({ dir, segmentSize: 4 }).init();
+  first.append("def");
+  await first.close();
+
+  const second = replacement.open("session-handoff");
+  second.append("ghi");
+  await second.close();
+  const transcript = replacement.read("session-handoff", { from: 0, len: 20 });
+  assert.deepEqual(
+    { text: transcript.data.toString(), off: transcript.off, next: transcript.next },
+    { text: "abcdefghi", off: 0, next: 9 },
+  );
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("reopening after a short failed write preserves the global offset gap", async () => {
+  const { dir, store } = tempStore({ segmentSize: 16 });
+  const first = store.open("session-gap");
+  first.append("abcd");
+  await first.close();
+
+  const metaPath = path.join(dir, "session-gap", "meta.json");
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  meta.nextOffset = 8;
+  fs.writeFileSync(metaPath, JSON.stringify(meta));
+
+  const reloaded = new SessionLogStore({ dir, segmentSize: 16 }).init();
+  const second = reloaded.open("session-gap");
+  second.append("Z");
+  await second.close();
+  assert.equal(reloaded.read("session-gap", { from: 0, len: 20 }).data.toString(), "abcd");
+  const afterGap = reloaded.read("session-gap", { from: 4, len: 20 });
+  assert.deepEqual(
+    { text: afterGap.data.toString(), off: afterGap.off, next: afterGap.next },
+    { text: "Z", off: 8, next: 9 },
+  );
   fs.rmSync(dir, { recursive: true });
 });
 
@@ -103,4 +223,41 @@ test("SWITCHBOARD_RECORD=0 disables recording while recording defaults on", () =
   assert.equal(recordingEnabled({}), true);
   assert.equal(recordingEnabled({ SWITCHBOARD_RECORD: "1" }), true);
   assert.equal(recordingEnabled({ SWITCHBOARD_RECORD: "0" }), false);
+});
+
+test("sess-list and sess-read protocol responses use the persisted store", async () => {
+  const { dir, store } = tempStore({ segmentSize: 4 });
+  const log = store.open("session-protocol");
+  log.append("abcdefghij");
+  await log.close({ exitCode: 7 });
+
+  const listed = sessionLogListResponse(store, "list-1");
+  assert.equal(listed.type, "sess-list");
+  assert.equal(listed.recording, true);
+  assert.equal(listed.sessions[0].sid, "session-protocol");
+
+  const first = sessionLogReadResponse(store, {
+    id: "read-1", sid: "session-protocol", from: 2, len: 5,
+  });
+  assert.equal(first.type, "sess-chunk");
+  assert.equal(Buffer.from(first.data, "base64").toString(), "cdefg");
+  assert.deepEqual(
+    { off: first.off, next: first.next, eof: first.eof, exitCode: first.stat.exitCode },
+    { off: 2, next: 7, eof: false, exitCode: 7 },
+  );
+
+  const rest = sessionLogReadResponse(store, {
+    id: "read-2", sid: "session-protocol", from: first.next, len: 64 * 1024,
+  });
+  assert.equal(Buffer.from(rest.data, "base64").toString(), "hij");
+  assert.equal(rest.eof, true);
+
+  assert.deepEqual(sessionLogListResponse(null, "list-off"), {
+    type: "sess-list", id: "list-off", recording: false, sessions: [],
+  });
+  assert.match(
+    sessionLogReadResponse(null, { id: "read-off", sid: "session-protocol" }).message,
+    /recording is disabled/,
+  );
+  fs.rmSync(dir, { recursive: true });
 });

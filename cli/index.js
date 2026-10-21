@@ -35,7 +35,9 @@ const fixPtyPerms = require("./scripts/fix-pty-perms");
 const activity = require("./activity");
 const peer = require("./peer");
 const { JobStore } = require("./lib/job-store");
-const { SessionLogStore, recordingEnabled } = require("./lib/session-log");
+const {
+  SessionLogStore, recordingEnabled, sessionLogListResponse, sessionLogReadResponse,
+} = require("./lib/session-log");
 const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
 const pkg = require("./package.json");
 
@@ -1546,38 +1548,11 @@ function sendJobStatus(msg) {
 
 function sendSessionLogList(id) {
   if (!id) return;
-  sendCtl({
-    type: "sess-list",
-    id,
-    recording: !!sessionLog,
-    sessions: sessionLog ? sessionLog.list() : [],
-  });
+  sendCtl(sessionLogListResponse(sessionLog, id));
 }
 function sendSessionLogRead(msg) {
   if (!msg.id || !msg.sid) return;
-  if (!sessionLog) {
-    sendCtl({ type: "sess-error", id: msg.id, sid: msg.sid, message: "session recording is disabled" });
-    return;
-  }
-  try {
-    const requested = Number(msg.len);
-    const len = Number.isSafeInteger(requested) && requested >= 0
-      ? Math.min(64 * 1024, requested)
-      : 64 * 1024;
-    const chunk = sessionLog.read(String(msg.sid), { from: msg.from, len });
-    sendCtl({
-      type: "sess-chunk",
-      id: msg.id,
-      sid: msg.sid,
-      data: chunk.data.toString("base64"),
-      off: chunk.off,
-      next: chunk.next,
-      eof: chunk.eof,
-      stat: sessionLog.stat(String(msg.sid)),
-    });
-  } catch (e) {
-    sendCtl({ type: "sess-error", id: msg.id, sid: msg.sid, message: e.message });
-  }
+  sendCtl(sessionLogReadResponse(sessionLog, msg));
 }
 
 // ---- host metrics --------------------------------------------------------
