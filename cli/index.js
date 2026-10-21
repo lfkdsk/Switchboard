@@ -133,6 +133,8 @@ Options:
   history: --from <off>        Start at this byte offset.
            --tail <N|Nl>       Read the last N bytes, or N lines with an l suffix.
            --text              Strip terminal escape sequences.
+           --grep <pattern>    Print matching text lines; skips alternate screens.
+           --include-alt       Include alternate-screen text with --grep/--text.
            --raw               Write recorded PTY bytes (the default).
            --follow            Poll for new output while the session is live.
            --json              Machine-readable list/chunks.
@@ -203,6 +205,11 @@ function parsePeerArgs(argv, command) {
       else if (a === "--follow" && (command === "logs" || command === "history")) opts.follow = true;
       else if (a === "--json" && ["nodes", "ls", "jobs", "history"].includes(command)) opts.json = true;
       else if (a === "--text" && command === "history") opts.text = true;
+      else if ((a === "--grep" || a.startsWith("--grep=")) && command === "history") {
+        opts.grep = (a.includes("=") ? a.slice(a.indexOf("=") + 1) : argv[++i]) ?? "";
+        opts.text = true;
+      }
+      else if (a === "--include-alt" && command === "history") opts.includeAlt = true;
       else if (a === "--raw" && command === "history") opts.raw = true;
       else if ((a === "--from" || a.startsWith("--from=")) && command === "history") {
         opts.from = (a.includes("=") ? a.slice(a.indexOf("=") + 1) : argv[++i]) ?? "";

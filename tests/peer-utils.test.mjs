@@ -346,6 +346,54 @@ test("history text mode streams a long OSC sequence without leaking its payload"
   assert.equal(output, "beforeafter\n");
 });
 
+test("history grep skips alternate-screen contents by default", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.from(
+    "$ vim file.txt\n\x1b[?1049hsecret match\n\x1b[?1049lvisible match\n",
+  );
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true, grep: "match",
+      includeAlt: false, raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "visible match\n");
+});
+
+test("history grep includes alternate-screen contents with include-alt", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.from(
+    "$ vim file.txt\n\x1b[?1049hsecret match\n\x1b[?1049lvisible match\n",
+  );
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true, grep: "match",
+      includeAlt: true, raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "secret match\nvisible match\n");
+});
+
 test("history helpers parse byte and line tails without a dependency", () => {
   assert.deepEqual(parseTailSpec("64KiB"), { unit: "bytes", value: 65536 });
   assert.deepEqual(parseTailSpec("200 lines"), { unit: "lines", value: 200 });

@@ -21,6 +21,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { StringDecoder } = require("string_decoder");
+const { createTextState, renderHistoryText } = require("./lib/session-text");
 const { finalizeDownload, parseCopyOperands, removeFile } = require("./lib/peer-utils");
 
 const CAPABILITY_TIMEOUT_MS = 2000;
@@ -606,12 +607,14 @@ async function cmdHistory(ctx, opts) {
 }
 
 function validateHistoryOptions(opts) {
-  if (!opts.sid && (opts.from != null || opts.tail != null || opts.text || opts.raw || opts.follow)) {
+  if (!opts.sid && (opts.from != null || opts.tail != null || opts.text || opts.raw || opts.follow || opts.grep != null || opts.includeAlt)) {
     throw new Error("History read options need a session id: switchboard history <node> <sid> [options]");
   }
   if (opts.from != null && opts.tail != null) throw new Error("--from and --tail cannot be used together");
   if (opts.text && opts.raw) throw new Error("--text and --raw cannot be used together");
-  if (opts.json && (opts.text || opts.raw)) throw new Error("--json cannot be combined with --text or --raw");
+  if (opts.json && (opts.text || opts.raw || opts.grep != null || opts.includeAlt)) throw new Error("--json cannot be combined with text options");
+  if (opts.grep === "") throw new Error("--grep needs a pattern");
+  if (opts.includeAlt && !opts.text) throw new Error("--include-alt needs --text or --grep");
   if (opts.from != null) parseHistoryOffset(opts.from);
   if (opts.tail != null) parseTailSpec(opts.tail);
 }
@@ -726,7 +729,17 @@ function safeCount(value, label) {
 
 function historyWriter(opts, sid) {
   const decoder = opts.text ? new StringDecoder("utf8") : null;
-  const ansi = decoder ? ansiStream() : null;
+  const textState = decoder ? createTextState() : null;
+  let lineBuffer = "";
+  const selectLines = (text, final = false) => {
+    if (opts.grep == null) return text;
+    lineBuffer += text;
+    const lines = lineBuffer.split("\n");
+    if (!final) lineBuffer = lines.pop();
+    else lineBuffer = "";
+    const expression = new RegExp(opts.grep);
+    return lines.filter((line) => expression.test(line)).map((line) => `${line}\n`).join("");
+  };
   return {
     async write(chunk, meta) {
       if (opts.json) {
@@ -739,7 +752,7 @@ function historyWriter(opts, sid) {
           active: !!meta.stat?.active,
         }));
       } else if (decoder) {
-        const text = ansi.write(decoder.write(chunk));
+        const text = selectLines(renderHistoryText(decoder.write(chunk), textState, { includeAlt: opts.includeAlt }));
         if (text) await writeOutput(process.stdout, text);
       } else if (chunk.length) {
         await writeOutput(process.stdout, chunk);
@@ -747,7 +760,8 @@ function historyWriter(opts, sid) {
     },
     async end() {
       if (!decoder) return;
-      const text = ansi.end(decoder.end());
+      const rendered = renderHistoryText(decoder.end(), textState, { includeAlt: opts.includeAlt });
+      const text = selectLines(rendered, true);
       if (text) await writeOutput(process.stdout, text);
     },
   };
