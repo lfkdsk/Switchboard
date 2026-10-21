@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import peer from "../cli/peer.js";
 import utils from "../cli/lib/peer-utils.js";
 
@@ -392,6 +392,42 @@ test("history grep includes alternate-screen contents with include-alt", async (
     FakeSocket.features = ["cp-sha256-v1"];
   }
   assert.equal(output, "secret match\nvisible match\n");
+});
+
+test("history CLI forwards grep and alternate-screen flags to the peer client", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-history-cli-"));
+  const configDir = path.join(home, ".switchboard");
+  fs.mkdirSync(configDir);
+  fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({
+    agentToken: "test-agent-token",
+    machineId: "test-machine",
+  }));
+  try {
+    const result = spawnSync(process.execPath, [
+      "--require", path.resolve("tests/fixtures/peer-history-stub.cjs"),
+      path.resolve("cli/index.js"),
+      "history", "target", "session-remote", "--grep", "needle", "--include-alt",
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const prefix = "HISTORY_OPTS ";
+    const line = result.stdout.split("\n").find((value) => value.startsWith(prefix));
+    assert.ok(line, `missing history options in output: ${result.stdout}`);
+    assert.deepEqual(JSON.parse(line.slice(prefix.length)), {
+      target: "target",
+      sid: "session-remote",
+      text: true,
+      raw: false,
+      follow: false,
+      json: false,
+      grep: "needle",
+      includeAlt: true,
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("history helpers parse byte and line tails without a dependency", () => {

@@ -391,6 +391,7 @@ function doPeer() {
     return run(peer.cmdHistory(ctx, {
       target: args.target, sid: args.rest[0] || null, from: args.from, tail: args.tail,
       text: !!args.text, raw: !!args.raw, follow: !!args.follow, json: !!args.json,
+      grep: args.grep, includeAlt: !!args.includeAlt,
     }));
   }
   if (sub === "logs" || sub === "wait") {
