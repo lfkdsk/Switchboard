@@ -55,6 +55,14 @@ test("local storage round-trips shell tabs, offsets, labels, dimensions, and act
   });
 });
 
+test("daemon session retention requires both replay and PTY holder features", () => {
+  assert.equal(state.daemonRetainsSessions(["session-replay-v1", "pty-holder-v1"]), true);
+  assert.equal(state.daemonRetainsSessions(["session-replay-v1"]), false);
+  assert.equal(state.daemonRetainsSessions(["pty-holder-v1"]), false);
+  assert.equal(state.daemonRetainsSessions([]), false);
+  assert.equal(state.daemonRetainsSessions(null), false);
+});
+
 test("storage failures are contained and byte offsets accumulate safely", () => {
   const broken = {
     getItem() { throw new Error("blocked"); },

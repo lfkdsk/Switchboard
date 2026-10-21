@@ -68,6 +68,11 @@
       : start;
   }
 
+  function daemonRetainsSessions(features) {
+    const supported = new Set(Array.isArray(features) ? features : []);
+    return supported.has("session-replay-v1") && supported.has("pty-holder-v1");
+  }
+
   function emptyState() {
     return { version: VERSION, activeSid: null, shells: [] };
   }
@@ -94,6 +99,7 @@
 
   root.SwitchboardSessionState = {
     advanceOffset,
+    daemonRetainsSessions,
     connectionNode,
     emptyState,
     load,

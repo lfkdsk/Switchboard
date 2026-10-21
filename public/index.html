@@ -685,6 +685,7 @@
     // ===================== TERMINAL (multi-shell) ===========================
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
     let awaitingInitialDaemonState = false;
+    let daemonRetainsSessions = null, capabilitiesId = null;
     let pingTimer = null, lastPingT = 0;
     const shellState = SwitchboardSessionState;
     // localStorage is shared by same-origin pages, so another page restores the
@@ -1024,6 +1025,9 @@
       sock.onopen = () => {
         if (!current()) return;
         awaitingInitialDaemonState = true;
+        daemonRetainsSessions = null;
+        capabilitiesId = crypto.randomUUID();
+        sendJson({ type: "capabilities", id: capabilitiesId });
         reconnectDelay = 1000; setConn("wait", "waiting for host…");
         for (const s of shells.values()) s.opened = false; // re-attach after reconnect
         for (const [sid, sh] of shells) attachShell(sid, sh);
@@ -1101,6 +1105,12 @@
         request.resolve(m); return;
       }
       switch (m.type) {
+        case "capabilities":
+          if (m.id === capabilitiesId) {
+            daemonRetainsSessions = shellState.daemonRetainsSessions(m.features);
+            capabilitiesId = null;
+          }
+          break;
         case "sessions": syncSessions(m.list || []); break;
         case "reset": {
           const sh = shells.get(m.sid);
@@ -1172,7 +1182,14 @@
     window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); } });
     window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
     window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh) fitShell(activeSid, sh); });
-    window.addEventListener("pagehide", () => persistShells(true));
+    window.addEventListener("pagehide", () => {
+      persistShells(true);
+      // Legacy daemons use client-gone to reap PTYs. Holder-aware daemons own
+      // their disconnected-session lease, so notifying them would defeat reload recovery.
+      if (daemonRetainsSessions === false) {
+        for (const sid of shells.keys()) sendJson({ type: "client-gone", sid });
+      }
+    });
     function toast(text, kind) { const el = document.createElement("div"); el.className = "toast " + (kind || ""); el.textContent = text; $("toasts").appendChild(el); setTimeout(() => el.remove(), 4000); }
 
     init();
