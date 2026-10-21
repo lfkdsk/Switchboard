@@ -1,5 +1,12 @@
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
+
+// Segment encryption intentionally remains an interface seam: compressed bytes
+// can later be passed through AES-GCM here without changing logical offsets.
+const COMPRESS = zlib.zstdCompressSync
+  ? { ext: ".zst", encode: zlib.zstdCompressSync, decode: zlib.zstdDecompressSync }
+  : { ext: ".gz", encode: zlib.gzipSync, decode: zlib.gunzipSync };
 
 const DEFAULT_SEGMENT_SIZE = 16 * 1024 * 1024;
 const DEFAULT_INDEX_BYTES = 64 * 1024;
@@ -263,17 +270,26 @@ class SessionLogStore {
       if (!remaining) break;
       const available = end - cursor;
       const take = Math.min(remaining, available);
-      const fd = fs.openSync(segment.file, "r");
-      try {
-        const buffer = Buffer.allocUnsafe(take);
-        const bytesRead = take ? fs.readSync(fd, buffer, 0, take, cursor - segment.start) : 0;
-        if (bytesRead) parts.push(buffer.subarray(0, bytesRead));
-        cursor += bytesRead;
-        remaining -= bytesRead;
-        if (bytesRead < take || cursor < logicalSegmentEnd) break;
-      } finally {
-        fs.closeSync(fd);
+      let buffer;
+      let bytesRead = 0;
+      if (segment.compression) {
+        const raw = decompressSegment(segment.file, segment.compression);
+        buffer = raw.subarray(cursor - segment.start, cursor - segment.start + take);
+        bytesRead = buffer.length;
+      } else {
+        const fd = fs.openSync(segment.file, "r");
+        try {
+          buffer = Buffer.allocUnsafe(take);
+          bytesRead = take ? fs.readSync(fd, buffer, 0, take, cursor - segment.start) : 0;
+          buffer = buffer.subarray(0, bytesRead);
+        } finally {
+          fs.closeSync(fd);
+        }
       }
+      if (bytesRead) parts.push(buffer);
+      cursor += bytesRead;
+      remaining -= bytesRead;
+      if (bytesRead < take || cursor < logicalSegmentEnd) break;
     }
     if (!found) off = cursor;
     const data = parts.length === 1 ? parts[0] : Buffer.concat(parts);
@@ -398,14 +414,31 @@ class SessionLogStore {
     if (!writer) return Promise.resolve();
     const seg = state.segment?.seg;
     state.pendingSegments.add(seg);
-    const done = closeStream(writer);
+    const done = closeStream(writer).then(() => this._compressSegment(state.record, seg));
     state.pending.add(done);
-    done.finally(() => {
+    done.catch((error) => { state.failed ||= error; }).finally(() => {
       state.pending.delete(done);
       state.pendingSegments.delete(seg);
       if (!state.closing) this._schedulePrune();
     });
     return done;
+  }
+
+  _compressSegment(record, seg) {
+    const segment = record.segments.find((item) => item.seg === seg);
+    if (!segment || segment.compression) return;
+    const source = this.segmentPath(record.sid, seg);
+    let input;
+    try { input = fs.readFileSync(source); } catch (error) { if (error.code === "ENOENT") return; throw error; }
+    const target = source + COMPRESS.ext;
+    const temporary = target + `.tmp-${process.pid}`;
+    fs.writeFileSync(temporary, COMPRESS.encode(input), { mode: 0o600 });
+    fs.renameSync(temporary, target);
+    fs.unlinkSync(source);
+    segment.bytes = input.length;
+    segment.compression = COMPRESS.ext.slice(1);
+    segment.storedBytes = fs.statSync(target).size;
+    this._persist(record);
   }
 
   _writeIndex(state, extra = null) {
@@ -428,7 +461,7 @@ class SessionLogStore {
     const record = loadRecordAt(sessionDir, sid, this.scope, this.segmentSize, this.now);
     if (!record) return null;
     for (const segment of record.segments) {
-      try { fs.chmodSync(path.join(sessionDir, `seg-${segment.seg}.log`), 0o600); } catch {}
+      try { fs.chmodSync(segmentFile(sessionDir, segment), 0o600); } catch {}
     }
     for (const name of ["meta.json", "index.jsonl"]) {
       try { fs.chmodSync(path.join(sessionDir, name), 0o600); } catch {}
@@ -463,8 +496,7 @@ class SessionLogStore {
   _readableSegments(record) {
     const sessionDir = record._dir || this.sessionDir(record.sid);
     const state = record.scope === this.scope ? this.active.get(record.sid) : null;
-    const firstFile = record.segments[0] &&
-      path.join(sessionDir, `seg-${record.segments[0].seg}.log`);
+    const firstFile = record.segments[0] && segmentFile(sessionDir, record.segments[0]);
     // A daemon for another scope may enforce the global quota and persist a
     // shorter prefix. Refresh only when that is observable, keeping normal
     // reads to O(1) filesystem metadata calls rather than one per segment.
@@ -473,11 +505,11 @@ class SessionLogStore {
       if (refreshed) Object.assign(record, refreshed);
     }
     return record.segments.map((segment) => {
-      const file = path.join(sessionDir, `seg-${segment.seg}.log`);
+      const file = segmentFile(sessionDir, segment);
       // Closed streams were reconciled when loaded or closed, so their saved
       // byte counts are stable. Only streams that can still have buffered
       // writes need a stat on every read.
-      if (!state || (state.segment?.seg !== segment.seg && !state.pendingSegments.has(segment.seg))) {
+      if (segment.compression || !state || (state.segment?.seg !== segment.seg && !state.pendingSegments.has(segment.seg))) {
         return { ...segment, file, size: segment.bytes };
       }
       try { return { ...segment, file, size: fs.statSync(file).size }; } catch { return null; }
@@ -488,7 +520,11 @@ class SessionLogStore {
     const sessionDir = record._dir || this.sessionDir(record.sid);
     record.segments = record.segments.map((segment) => {
       try {
-        return { ...segment, bytes: fs.statSync(path.join(sessionDir, `seg-${segment.seg}.log`)).size };
+        if (segment.compression) {
+          fs.statSync(segmentFile(sessionDir, segment));
+          return segment;
+        }
+        return { ...segment, bytes: fs.statSync(segmentFile(sessionDir, segment)).size };
       } catch {
         return null;
       }
@@ -539,7 +575,7 @@ class SessionLogStore {
     }).map((segment) => ({
       record,
       segment,
-      file: path.join(sessionDir, `seg-${segment.seg}.log`),
+      file: segmentFile(sessionDir, segment),
       size: segment.bytes,
       updatedAt: segment.updatedAt || record.updatedAt || record.createdAt,
     }));
@@ -590,9 +626,9 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
   let meta = {};
   try { meta = JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8")); } catch {}
   const files = safeReadDir(sessionDir)
-    .map((entry) => ({ entry, match: /^seg-(\d+)\.log$/.exec(entry.name) }))
+    .map((entry) => ({ entry, match: /^seg-(\d+)\.log(?:\.(gz|zst))?$/.exec(entry.name) }))
     .filter(({ entry, match }) => entry.isFile() && match)
-    .map(({ entry, match }) => ({ name: entry.name, seg: Number(match[1]) }))
+    .map(({ entry, match }) => ({ name: entry.name, seg: Number(match[1]), compression: match[2] || null }))
     .sort((a, b) => a.seg - b.seg);
   if (!files.length && !meta.sid) return null;
   const saved = new Map((Array.isArray(meta.segments) ? meta.segments : [])
@@ -603,12 +639,14 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
     const st = fs.statSync(path.join(sessionDir, file.name));
     const prior = saved.get(file.seg);
     const start = Number.isSafeInteger(prior?.start) ? prior.start : inferredStart;
+    const compression = file.compression || prior?.compression || null;
+    const bytes = compression ? nonNegativeInt(prior?.bytes, decompressSegment(path.join(sessionDir, file.name), compression).length) : st.size;
     const segment = {
-      seg: file.seg, start, bytes: st.size,
+      seg: file.seg, start, bytes, ...(compression ? { compression, storedBytes: st.size } : {}),
       createdAt: prior?.createdAt || st.birthtimeMs || st.mtimeMs,
       updatedAt: Math.max(Number(prior?.updatedAt) || 0, st.mtimeMs),
     };
-    inferredStart = start + st.size;
+    inferredStart = start + bytes;
     return segment;
   });
   const ends = segments.map((segment) => segment.start + segment.bytes);
@@ -636,6 +674,17 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
     rows: positiveInt(meta.rows, null),
     _dir: sessionDir,
   };
+}
+
+function segmentFile(sessionDir, segment) {
+  return path.join(sessionDir, `seg-${segment.seg}.log${segment.compression ? `.${segment.compression}` : ""}`);
+}
+
+function decompressSegment(file, compression) {
+  const input = fs.readFileSync(file);
+  if (compression === "zst" && zlib.zstdDecompressSync) return zlib.zstdDecompressSync(input);
+  if (compression === "gz") return zlib.gunzipSync(input);
+  throw new Error(`unsupported session segment compression: ${compression}`);
 }
 
 function recordingEnabled(env = process.env) {

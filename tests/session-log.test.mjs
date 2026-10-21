@@ -24,10 +24,19 @@ test("session output rolls segments and reads continuously across their boundari
   await log.close({ exitCode: 0 });
 
   const sessionDir = path.join(dir, "session-one");
+  const segmentNames = fs.readdirSync(sessionDir)
+    .filter((name) => /^seg-\d+\.log(?:\.(?:gz|zst))?$/.test(name));
   assert.deepEqual(
-    fs.readdirSync(sessionDir).filter((name) => name.endsWith(".log")).sort(),
+    segmentNames.map((name) => name.match(/^seg-\d+\.log/)[0]).sort(),
     ["seg-0.log", "seg-1.log", "seg-2.log"],
   );
+  assert.ok(segmentNames.every((name) => /\.(?:gz|zst)$/.test(name)),
+    "closed session segments should be compressed");
+  const meta = JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8"));
+  assert.deepEqual(meta.segments.map(({ start, bytes }) => ({ start, bytes })), [
+    { start: 0, bytes: 4 }, { start: 4, bytes: 4 }, { start: 8, bytes: 2 },
+  ]);
+  assert.ok(meta.segments.every((segment) => ["gz", "zst"].includes(segment.compression)));
   const chunk = store.read("session-one", { from: 2, len: 7 });
   assert.equal(chunk.data.toString(), "cdefghi");
   assert.deepEqual({ off: chunk.off, next: chunk.next, eof: chunk.eof }, { off: 2, next: 9, eof: false });
@@ -39,7 +48,8 @@ test("session output rolls segments and reads continuously across their boundari
   assert.deepEqual(index.find((entry) => entry.type === "resize").resize, { cols: 100, rows: 40 });
   assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(sessionDir).mode & 0o777, 0o700);
-  assert.equal(fs.statSync(path.join(sessionDir, "seg-0.log")).mode & 0o777, 0o600);
+  const firstSegment = fs.readdirSync(sessionDir).find((name) => name.startsWith("seg-0.log"));
+  assert.equal(fs.statSync(path.join(sessionDir, firstSegment)).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.join(sessionDir, "index.jsonl")).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.join(sessionDir, "meta.json")).mode & 0o777, 0o600);
   const reloaded = new SessionLogStore({ dir, segmentSize: 4, now: () => now }).init();
@@ -208,11 +218,11 @@ test("the global cap prunes the oldest segments across scope directories", async
   await secondLog.close();
 
   assert.deepEqual(
-    fs.readdirSync(path.join(dir, "scope-a", "session-a")).filter((name) => name.endsWith(".log")),
+    fs.readdirSync(path.join(dir, "scope-a", "session-a")).filter((name) => /^seg-\d+\.log(?:\.(?:gz|zst))?$/.test(name)),
     [],
   );
   assert.deepEqual(
-    fs.readdirSync(path.join(dir, "scope-b", "session-b")).filter((name) => name.endsWith(".log")).sort(),
+    fs.readdirSync(path.join(dir, "scope-b", "session-b")).filter((name) => /^seg-\d+\.log(?:\.(?:gz|zst))?$/.test(name)).map((name) => name.match(/^seg-\d+\.log/)[0]).sort(),
     ["seg-0.log", "seg-1.log"],
   );
   assert.equal(first.stat("session-a").bytes, 0);
