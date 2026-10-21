@@ -323,7 +323,10 @@ async function runHolder(config) {
   const sessionDir = path.dirname(socketPath);
   secureDir(sessionDir);
   const releaseLock = acquireHolderLock(sessionDir);
+  let cleanedUp = false;
   const cleanupFiles = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     try { fs.unlinkSync(socketPath); } catch {}
     releaseLock();
   };

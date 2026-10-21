@@ -18,6 +18,7 @@ const {
 } = holderModule;
 const { SessionLogStore } = sessionLogModule;
 const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/pty-holder-daemon.mjs");
+const cleanupFixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/pty-holder-cleanup.mjs");
 const requireFromCli = createRequire(new URL("../cli/package.json", import.meta.url));
 let holderRuntimeAvailable = true;
 try { requireFromCli.resolve("node-pty"); } catch { holderRuntimeAvailable = false; }
@@ -80,6 +81,36 @@ test("holder selection keeps Windows on the in-process PTY path", () => {
   assert.equal(usePtyHolder("linux"), true);
   assert.equal(usePtyHolder("darwin"), true);
   assert.equal(usePtyHolder("win32"), false);
+});
+
+test("completed holder cleanup cannot unlink a replacement holder socket", {
+  skip: process.platform === "win32"
+    ? "Unix sockets are not used on Windows"
+    : !holderRuntimeAvailable ? "CLI runtime dependencies are not installed" : false,
+  timeout: 15000,
+}, async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-cleanup-"));
+  const scope = "cleanup-scope";
+  const sid = "replacement";
+  let child;
+  t.after(async () => {
+    await stopChild(child);
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  child = spawn(process.execPath, [cleanupFixture], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env: {
+      ...process.env,
+      HOLDER_TEST_ROOT: rootDir,
+      HOLDER_TEST_SCOPE: scope,
+      HOLDER_TEST_SID: sid,
+    },
+  });
+  const result = await nextMessage(child, "replacement");
+  assert.equal(result.socketExists, true, "exiting predecessor must not unlink the replacement socket");
+  if (child.exitCode == null && child.signalCode == null) await once(child, "exit");
+  assert.equal(child.exitCode, 0);
 });
 
 test("a detached PTY holder survives daemon replacement and replays missed output", {
