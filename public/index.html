@@ -870,9 +870,22 @@
     function historyRequest(message) {
       const id = crypto.randomUUID(); message.id = id;
       return new Promise((resolve, reject) => {
-        historyRequests.set(id, { resolve, reject });
+        // Old daemons do not answer sess-list/sess-read at all; fail instead of
+        // leaving the history panel on "Loading sessions…" forever.
+        const timer = setTimeout(() => {
+          historyRequests.delete(id);
+          reject(new Error("history request timed out"));
+        }, 5000);
+        historyRequests.set(id, {
+          resolve: (value) => { clearTimeout(timer); resolve(value); },
+          reject: (error) => { clearTimeout(timer); reject(error); },
+        });
         sendJson(message);
       });
+    }
+    function failHistoryRequests(reason) {
+      for (const request of historyRequests.values()) request.reject(new Error(reason));
+      historyRequests.clear();
     }
     function stripHistoryAnsi(input) {
       return input
@@ -994,6 +1007,7 @@
     function dropSocket(sock) {
       if (!sock) return;
       sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+      failHistoryRequests("disconnected");
       try { sock.close(); } catch {}
     }
     function connect() {
@@ -1018,7 +1032,7 @@
         startPing();
       };
       sock.onmessage = (ev) => { if (!current()) return; if (typeof ev.data === "string") handleJson(ev.data); else handleBinary(ev.data); };
-      sock.onclose = () => { if (!current()) return; stopPing(); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
+      sock.onclose = () => { if (!current()) return; stopPing(); failHistoryRequests("disconnected"); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
       sock.onerror = () => { try { sock.close(); } catch {} }; // its own onclose drives the retry
     }
     function sendJson(o) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); }

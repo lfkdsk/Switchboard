@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import sessionLogs from "../cli/lib/session-log.js";
 
 const {
@@ -270,4 +271,110 @@ test("sess-list and sess-read protocol responses use the persisted store", async
     /recording is disabled/,
   );
   fs.rmSync(dir, { recursive: true });
+});
+
+function compressBytes(value) {
+  return zlib.zstdCompressSync ? zlib.zstdCompressSync(value) : zlib.gzipSync(value);
+}
+function compressExt() {
+  return zlib.zstdCompressSync ? "zst" : "gz";
+}
+
+test("an interrupted segment roll keeps one logical segment and does not double-count bytes", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-segdup-"));
+  const scope = "dup-scope";
+  const sid = "dup-session";
+  const sessionDir = path.join(dir, scope, sid);
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  const raw = Buffer.from("HELLO_WORLD_RAW_BYTES_XXXX");
+  // Crash window: the compressed sibling has been renamed into place but the
+  // raw segment has not been unlinked yet, and meta.json still lacks the
+  // compression marker.
+  fs.writeFileSync(path.join(sessionDir, "seg-0.log"), raw, { mode: 0o600 });
+  fs.writeFileSync(path.join(sessionDir, `seg-0.log.${compressExt()}`), compressBytes(raw), { mode: 0o600 });
+  fs.writeFileSync(path.join(sessionDir, "meta.json"), JSON.stringify({
+    version: 1, sid, scope, segmentSize: 1024,
+    createdAt: 1, startedAt: 1, updatedAt: 1, closedAt: 2, status: "closed",
+    pid: null, error: null, exitCode: 0, firstOffset: 0, nextOffset: raw.length,
+    bytesStored: raw.length, lastSeg: 0,
+    segments: [{ seg: 0, start: 0, bytes: raw.length, createdAt: 1, updatedAt: 1 }],
+    cols: 80, rows: 24,
+  }), { mode: 0o600 });
+
+  const store = new SessionLogStore({ dir, scope }).init();
+  const stat = store.stat(sid);
+  assert.equal(stat.bytes, raw.length, "bytes must not count the raw leftover twice");
+  assert.equal(stat.segments, 1);
+  assert.equal(stat.off, raw.length);
+  const chunk = store.read(sid, { from: 0, len: 1024 });
+  assert.equal(chunk.data.toString(), raw.toString());
+  assert.deepEqual({ off: chunk.off, next: chunk.next }, { off: 0, next: raw.length });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a stale compression marker never makes an uncompressed segment unreadable", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-segraw-"));
+  const scope = "raw-scope";
+  const sid = "raw-session";
+  const sessionDir = path.join(dir, scope, sid);
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  const raw = Buffer.from("PLAIN_TEXT_SEGMENT_BYTES");
+  fs.writeFileSync(path.join(sessionDir, "seg-0.log"), raw, { mode: 0o600 });
+  fs.writeFileSync(path.join(sessionDir, "meta.json"), JSON.stringify({
+    version: 1, sid, scope, segmentSize: 1024,
+    createdAt: 1, startedAt: 1, updatedAt: 1, closedAt: 2, status: "closed",
+    pid: null, error: null, exitCode: 0, firstOffset: 0, nextOffset: raw.length,
+    bytesStored: raw.length, lastSeg: 0,
+    segments: [{
+      seg: 0, start: 0, bytes: raw.length, createdAt: 1, updatedAt: 1,
+      compression: compressExt(), storedBytes: 12,
+    }],
+    cols: 80, rows: 24,
+  }), { mode: 0o600 });
+
+  const store = new SessionLogStore({ dir, scope }).init();
+  const chunk = store.read(sid, { from: 0, len: 1024 });
+  assert.equal(chunk.data.toString(), raw.toString());
+  assert.equal(store.stat(sid).bytes, raw.length);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("one unreadable session record cannot stop the store from loading the rest", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-segbroken-"));
+  const scope = "broken-scope";
+  const good = path.join(dir, scope, "good-session");
+  const bad = path.join(dir, scope, "bad-session");
+  fs.mkdirSync(good, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(bad, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(good, "seg-0.log"), Buffer.from("GOOD"), { mode: 0o600 });
+  fs.writeFileSync(path.join(good, "meta.json"), JSON.stringify({
+    version: 1, sid: "good-session", scope, segmentSize: 1024,
+    createdAt: 1, startedAt: 1, updatedAt: 1, closedAt: 2, status: "closed",
+    firstOffset: 0, nextOffset: 4, bytesStored: 4, lastSeg: 0,
+    segments: [{ seg: 0, start: 0, bytes: 4, createdAt: 1, updatedAt: 1 }],
+  }), { mode: 0o600 });
+  fs.writeFileSync(path.join(bad, "seg-0.log"), Buffer.from("BAD"), { mode: 0o600 });
+  fs.writeFileSync(path.join(bad, "meta.json"), JSON.stringify({
+    version: 1, sid: "bad-session", scope, segmentSize: 1024,
+    createdAt: 1, startedAt: 1, updatedAt: 1, closedAt: 2, status: "closed",
+    firstOffset: 0, nextOffset: 3, bytesStored: 3, lastSeg: 0,
+    segments: [{ seg: 0, start: 0, bytes: 3, createdAt: 1, updatedAt: 1 }],
+  }), { mode: 0o600 });
+
+  const originalStatSync = fs.statSync;
+  fs.statSync = (file, ...args) => {
+    if (path.dirname(String(file)) === bad) throw Object.assign(new Error("unreadable record"), { code: "EIO" });
+    return originalStatSync(file, ...args);
+  };
+  let store;
+  try {
+    store = new SessionLogStore({ dir, scope }).init();
+  } finally {
+    fs.statSync = originalStatSync;
+  }
+  const sids = store.list().map((entry) => entry.sid);
+  assert.ok(sids.includes("good-session"), `expected good-session in ${sids}`);
+  assert.ok(!sids.includes("bad-session"), `did not expect bad-session in ${sids}`);
+  assert.equal(store.read("good-session", { from: 0, len: 10 }).data.toString(), "GOOD");
+  fs.rmSync(dir, { recursive: true, force: true });
 });

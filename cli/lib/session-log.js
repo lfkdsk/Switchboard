@@ -40,7 +40,8 @@ class SessionLogStore {
     secureDir(this.dir);
     for (const entry of safeReadDir(this.dir)) {
       if (!entry.isDirectory() || !validId(entry.name)) continue;
-      const record = this._loadRecord(entry.name);
+      let record;
+      try { record = this._loadRecord(entry.name); } catch { continue; }
       if (!record) continue;
       // A replacement daemon can initialize this store before the relay has
       // disconnected the old one. Do not make its live segment prunable.
@@ -555,7 +556,8 @@ class SessionLogStore {
         if (!sidEntry.isDirectory() || !validId(sidEntry.name)) continue;
         const location = path.join(scopeDir, sidEntry.name);
         if (seen.has(location)) continue;
-        add(loadRecordAt(location, sidEntry.name, scopeEntry.name, this.segmentSize, this.now));
+        try { add(loadRecordAt(location, sidEntry.name, scopeEntry.name, this.segmentSize, this.now)); }
+        catch {}
       }
     }
     return records;
@@ -625,11 +627,19 @@ class SessionLogHandle {
 function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
   let meta = {};
   try { meta = JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8")); } catch {}
-  const files = safeReadDir(sessionDir)
+  const discovered = safeReadDir(sessionDir)
     .map((entry) => ({ entry, match: /^seg-(\d+)\.log(?:\.(gz|zst))?$/.exec(entry.name) }))
     .filter(({ entry, match }) => entry.isFile() && match)
-    .map(({ entry, match }) => ({ name: entry.name, seg: Number(match[1]), compression: match[2] || null }))
-    .sort((a, b) => a.seg - b.seg);
+    .map(({ entry, match }) => ({ name: entry.name, seg: Number(match[1]), compression: match[2] || null }));
+  // A crash between the compressed rename and the raw unlink can leave both
+  // seg-N.log and its compressed sibling. Keep one entry per N, preferring the
+  // compressed file that compression already committed to disk.
+  const bySeg = new Map();
+  for (const file of discovered) {
+    const existing = bySeg.get(file.seg);
+    if (!existing || (file.compression && !existing.compression)) bySeg.set(file.seg, file);
+  }
+  const files = [...bySeg.values()].sort((a, b) => a.seg - b.seg);
   if (!files.length && !meta.sid) return null;
   const saved = new Map((Array.isArray(meta.segments) ? meta.segments : [])
     .filter((segment) => Number.isSafeInteger(segment.seg))
@@ -639,8 +649,21 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
     const st = fs.statSync(path.join(sessionDir, file.name));
     const prior = saved.get(file.seg);
     const start = Number.isSafeInteger(prior?.start) ? prior.start : inferredStart;
-    const compression = file.compression || prior?.compression || null;
-    const bytes = compression ? nonNegativeInt(prior?.bytes, decompressSegment(path.join(sessionDir, file.name), compression).length) : st.size;
+    // The filename is authoritative: a stale meta.compression must not be
+    // applied to an uncompressed sibling left behind by an interrupted roll.
+    const compression = file.compression;
+    let bytes;
+    if (compression) {
+      // Only decompress to recover the logical length when meta cannot tell us.
+      if (Number.isSafeInteger(prior?.bytes) && prior.bytes >= 0) {
+        bytes = prior.bytes;
+      } else {
+        try { bytes = decompressSegment(path.join(sessionDir, file.name), compression).length; }
+        catch { return null; }
+      }
+    } else {
+      bytes = st.size;
+    }
     const segment = {
       seg: file.seg, start, bytes, ...(compression ? { compression, storedBytes: st.size } : {}),
       createdAt: prior?.createdAt || st.birthtimeMs || st.mtimeMs,
@@ -648,7 +671,7 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
     };
     inferredStart = start + bytes;
     return segment;
-  });
+  }).filter(Boolean);
   const ends = segments.map((segment) => segment.start + segment.bytes);
   const nextOffset = Math.max(finiteOffset(meta.nextOffset), ...ends, 0);
   const createdAt = Number(meta.createdAt) || segments[0]?.createdAt || now();
