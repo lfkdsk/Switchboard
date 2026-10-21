@@ -1,0 +1,339 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright-core";
+
+const require = createRequire(import.meta.url);
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const token = "webshell-e2e-" + crypto.randomUUID();
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-webshell-e2e-"));
+const logs = new Map();
+let relay;
+let daemon;
+let browser;
+let cleaning = null;
+
+function capture(child, name) {
+  const output = [];
+  logs.set(name, output);
+  for (const stream of [child.stdout, child.stderr]) {
+    stream?.setEncoding("utf8");
+    stream?.on("data", (chunk) => {
+      output.push(chunk);
+      if (output.length > 200) output.shift();
+    });
+  }
+  child.on("error", (error) => output.push(error.stack + "\n"));
+  return child;
+}
+
+function start(name, command, args, options = {}) {
+  return capture(spawn(command, args, {
+    cwd: root,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
+    ...options,
+  }), name);
+}
+
+async function freePort() {
+  while (true) {
+    const server = net.createServer();
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = server.address().port;
+    await new Promise((resolve) => server.close(resolve));
+    if (port < 8700 || port > 8799) return port;
+  }
+}
+
+async function waitForHttp(url, child, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  let lastError;
+  while (Date.now() < deadline) {
+    if (child.exitCode != null) throw new Error(`relay exited with ${child.exitCode}`);
+    try {
+      const response = await fetch(url);
+      if (response.ok) return;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(100);
+  }
+  throw new Error(`relay did not become ready: ${lastError?.message || "timeout"}`);
+}
+
+function browserExecutable() {
+  const candidates = [
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
+    ...walkExecutables("/opt/pw-browsers"),
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ];
+  const executable = candidates.find((candidate) => candidate && isExecutable(candidate));
+  if (!executable) {
+    throw new Error(
+      "Chromium not found (checked /opt/pw-browsers and common system paths); " +
+      "set PLAYWRIGHT_CHROMIUM_EXECUTABLE",
+    );
+  }
+  return executable;
+}
+
+function walkExecutables(directory) {
+  if (!fs.existsSync(directory)) return [];
+  const matches = [];
+  for (const entry of fs.readdirSync(directory, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile() || !["chrome-headless-shell", "chrome"].includes(entry.name)) continue;
+    matches.push(path.join(entry.parentPath, entry.name));
+  }
+  return matches;
+}
+
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function instrument(page) {
+  // Keep the production page free of test hooks. This wraps xterm's constructor
+  // before the CDN script assigns it, exposing each real Terminal to this test.
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis, "Terminal", {
+      configurable: true,
+      set(Constructor) {
+        function InstrumentedTerminal(...args) {
+          const terminal = new Constructor(...args);
+          (globalThis.__switchboardE2eTerminals ||= []).push(terminal);
+          return terminal;
+        }
+        Object.setPrototypeOf(InstrumentedTerminal, Constructor);
+        InstrumentedTerminal.prototype = Constructor.prototype;
+        Object.defineProperty(globalThis, "Terminal", {
+          configurable: true,
+          writable: true,
+          value: InstrumentedTerminal,
+        });
+      },
+    });
+  });
+}
+
+async function terminalText(page) {
+  return page.evaluate(() => {
+    const terminal = globalThis.__switchboardE2eTerminals?.at(-1);
+    if (!terminal) return "";
+    const buffer = terminal.buffer.active;
+    const lines = [];
+    for (let index = 0; index < buffer.length; index++) {
+      lines.push(buffer.getLine(index)?.translateToString(true) || "");
+    }
+    return lines.join("\n");
+  });
+}
+
+async function waitForTerminal(page, predicate, description, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  let text = "";
+  while (Date.now() < deadline) {
+    try {
+      text = await terminalText(page);
+      if (predicate(text)) return text;
+    } catch {}
+    await delay(100);
+  }
+  throw new Error(`timed out waiting for ${description}\nTerminal tail:\n${text.slice(-2000)}`);
+}
+
+async function waitForConnection(page, timeout = 30000) {
+  await page.waitForFunction(
+    () => document.querySelector("#connText")?.textContent === "connected",
+    null,
+    { timeout },
+  );
+}
+
+async function sendCommand(page, command) {
+  const input = page.locator(".xterm-helper-textarea");
+  await input.focus();
+  await page.keyboard.insertText(command);
+  await page.keyboard.press("Enter");
+}
+
+async function terminate(child) {
+  if (!child || child.exitCode != null || child.signalCode != null) return;
+  try {
+    if (process.platform === "win32") child.kill("SIGTERM");
+    else process.kill(-child.pid, "SIGTERM");
+  } catch {}
+  if (await exitedWithin(child, 3000)) return;
+  try {
+    if (process.platform === "win32") child.kill("SIGKILL");
+    else process.kill(-child.pid, "SIGKILL");
+  } catch {}
+  await exitedWithin(child, 3000);
+}
+
+async function exitedWithin(child, timeout) {
+  if (child.exitCode != null || child.signalCode != null) return true;
+  return Promise.race([
+    once(child, "exit").then(() => true),
+    delay(timeout).then(() => false),
+  ]);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function cleanup() {
+  if (cleaning) return cleaning;
+  cleaning = (async () => {
+    try { await browser?.close(); } catch {}
+    await terminate(daemon);
+    await terminate(relay);
+    fs.rmSync(home, { recursive: true, force: true });
+  })();
+  return cleaning;
+}
+
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+  process.once(signal, () => {
+    void cleanup().finally(() => process.exit(code));
+  });
+}
+
+let failure;
+try {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  relay = start("relay", process.execPath, [
+    require.resolve("wrangler"), "dev", "--ip", "127.0.0.1", "--port", String(port),
+  ]);
+  await waitForHttp(`${origin}/healthz`, relay);
+
+  daemon = start("daemon", process.execPath, [
+    path.join(root, "cli/index.js"),
+    "--server", origin,
+    "--token", token,
+    "--force",
+  ], {
+    cwd: path.join(root, "cli"),
+    env: {
+      ...process.env,
+      HOME: home,
+      SWITCHBOARD_RECORD: "1",
+      SWITCHBOARD_SESSION_GRACE: "24h",
+      SWITCHBOARD_SHELL: process.env.SWITCHBOARD_E2E_SHELL || "/bin/bash",
+    },
+  });
+
+  browser = await chromium.launch({
+    headless: true,
+    executablePath: browserExecutable(),
+    args: ["--no-sandbox"],
+  });
+  const context = await browser.newContext();
+  let page = await context.newPage();
+  await instrument(page);
+  await page.goto(`${origin}/?token=${encodeURIComponent(token)}`);
+  await waitForConnection(page);
+
+  await sendCommand(page, "echo PID=$$; sleep 1; seq 1 20000");
+  const pidText = await waitForTerminal(page, (text) => /PID=\d+/.test(text), "initial PID");
+  const pid = pidText.match(/PID=(\d+)/)?.[1];
+  assert.ok(pid, "initial PID was not printed");
+  await waitForTerminal(
+    page,
+    (text) => text.split("\n").some((line) => line.trim() === "20000"),
+    "20,000 output lines",
+    60000,
+  );
+
+  await page.reload();
+  await waitForConnection(page);
+  const reloaded = await waitForTerminal(
+    page,
+    (text) => text.split("\n").some((line) => line.trim() === "12000") &&
+      text.split("\n").some((line) => line.trim() === "20000"),
+    "restored early and final scrollback lines",
+  );
+  assert.match(reloaded, /(?:^|\n)12000(?:\n|$)/);
+  assert.match(reloaded, /(?:^|\n)20000(?:\n|$)/);
+  await sendCommand(page, "echo RELOAD_PID=$$; echo RELOAD_INTERACTIVE_OK");
+  const reloadInteractive = await waitForTerminal(
+    page,
+    (text) => text.includes("RELOAD_INTERACTIVE_OK") && /RELOAD_PID=\d+/.test(text),
+    "interactive command after reload",
+  );
+  assert.equal(reloadInteractive.match(/RELOAD_PID=(\d+)/)?.[1], pid);
+
+  await terminate(relay);
+  await page.waitForFunction(
+    () => /disconnected|offline/.test(document.querySelector("#connText")?.textContent || ""),
+    null,
+    { timeout: 15000 },
+  );
+  relay = start("relay-restarted", process.execPath, [
+    require.resolve("wrangler"), "dev", "--ip", "127.0.0.1", "--port", String(port),
+  ]);
+  await waitForHttp(`${origin}/healthz`, relay);
+  await waitForConnection(page, 30000);
+  await sendCommand(page, "echo RECONNECT_PID=$$; echo RECONNECT_INTERACTIVE_OK");
+  const reconnectInteractive = await waitForTerminal(
+    page,
+    (text) => text.includes("RECONNECT_INTERACTIVE_OK") && /RECONNECT_PID=\d+/.test(text),
+    "interactive command after network reconnect",
+  );
+  assert.equal(reconnectInteractive.match(/RECONNECT_PID=(\d+)/)?.[1], pid);
+
+  await page.close();
+  page = await context.newPage();
+  await instrument(page);
+  await page.goto(`${origin}/?token=${encodeURIComponent(token)}`);
+  await waitForConnection(page);
+  await waitForTerminal(
+    page,
+    (text) => text.split("\n").some((line) => line.trim() === "12000") &&
+      text.split("\n").some((line) => line.trim() === "20000"),
+    "scrollback after closing and reopening the page",
+  );
+  await sendCommand(page, "echo REOPEN_PID=$$; echo REOPEN_INTERACTIVE_OK");
+  const reopenInteractive = await waitForTerminal(
+    page,
+    (text) => text.includes("REOPEN_INTERACTIVE_OK") && /REOPEN_PID=\d+/.test(text),
+    "interactive command after page reopen",
+  );
+  assert.equal(reopenInteractive.match(/REOPEN_PID=(\d+)/)?.[1], pid);
+
+  console.log(`webshell reload E2E passed (relay port ${port})`);
+  console.log(`same shell PID ${pid}: reload, network reconnect, and page reopen`);
+  console.log("restored terminal buffer lines: 12000 and 20000");
+  console.log("interactive markers: RELOAD_INTERACTIVE_OK, RECONNECT_INTERACTIVE_OK, REOPEN_INTERACTIVE_OK");
+} catch (error) {
+  failure = error;
+  console.error(error.stack || error);
+  for (const [name, chunks] of logs) {
+    console.error(`\n--- ${name} output ---\n${chunks.join("").slice(-10000)}`);
+  }
+} finally {
+  await cleanup();
+  console.log("E2E cleanup complete: browser, daemon, and relay stopped");
+}
+
+if (failure) process.exitCode = 1;
