@@ -218,6 +218,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="/session-state.js"></script>
   <script>
   (function () {
     "use strict";
@@ -661,8 +662,10 @@
     // ===================== TERMINAL (multi-shell) ===========================
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
     let pingTimer = null, lastPingT = 0;
-    const shells = new Map(); // sid -> { term, fit, host, tab, label, opened }
+    const shellState = SwitchboardSessionState;
+    const shells = new Map(); // sid -> { term, fit, host, tab, label, opened, offset, rendered, replay }
     let activeSid = null, bootstrapped = false;
+    let shellStorageKey = null, shellNode = null, persistTimer = null;
     const uploads = new Map(), downloads = new Map();
 
     function wsUrl() {
@@ -673,25 +676,58 @@
     function setConn(state, text) { $("connDot").className = "dot " + state; $("connText").textContent = text; }
     function frame(sid, payload) { const s = enc.encode(sid), p = enc.encode(payload); const o = new Uint8Array(1 + s.length + p.length); o[0] = s.length; o.set(s, 1); o.set(p, 1 + s.length); return o.buffer; }
 
+    function persistedShellState() {
+      return {
+        activeSid,
+        shells: [...shells].map(([sid, sh]) => ({
+          sid, node: shellNode, label: sh.label.textContent || "shell",
+          offset: sh.offset, cols: sh.cols || null, rows: sh.rows || null,
+        })),
+      };
+    }
+    function persistShells(now) {
+      if (!shellStorageKey) return;
+      if (now) {
+        if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+        shellState.save(localStorage, shellStorageKey, persistedShellState());
+      } else if (!persistTimer) {
+        persistTimer = setTimeout(() => {
+          persistTimer = null;
+          shellState.save(localStorage, shellStorageKey, persistedShellState());
+        }, 50);
+      }
+    }
+    function disposeShells() {
+      for (const sh of shells.values()) { try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); }
+      shells.clear(); activeSid = null;
+    }
+
     function openTerminal(c) {
+      persistShells(true);
+      disposeShells();
       conn = c;
+      shellNode = shellState.connectionNode(c);
+      shellStorageKey = shellState.storageKey(location.origin, c, session);
       const u = new URL(location.href); u.search = ""; u.hash = "";
       u.searchParams.set(c.mode === "machine" ? "machine" : "token", c.mode === "machine" ? c.machineId : c.token);
       history.replaceState(null, "", u);
-      // reset shells
-      for (const s of shells.values()) { try { s.term.dispose(); } catch {} s.host.remove(); s.tab.remove(); }
-      shells.clear(); activeSid = null; bootstrapped = false;
+      const saved = shellState.load(localStorage, shellStorageKey, shellNode);
+      for (const entry of saved.shells) ensureShell(entry.sid, entry);
+      activeSid = saved.activeSid;
+      bootstrapped = false;
       $("rttVal").textContent = "—";
       showView("terminal");
+      if (activeSid) activate(activeSid);
       reconnectDelay = 1000;
       connect();
     }
     function closeTerminal() {
+      persistShells(true);
       manualClose = true; stopPing();
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       dropSocket(ws); ws = null;
-      for (const s of shells.values()) { try { s.term.dispose(); } catch {} s.host.remove(); s.tab.remove(); }
-      shells.clear(); activeSid = null;
+      disposeShells();
+      shellStorageKey = null; shellNode = null;
       $("stats").hidden = true;
     }
 
@@ -716,19 +752,30 @@
     // which is what the unicode-range split exists to avoid.
     document.fonts.load(`${TERM_FONT_SIZE}px "Symbols Nerd Font Mono"`, "\ue0b0").catch(() => {});
 
-    function ensureShell(sid) {
+    function ensureShell(sid, saved) {
       if (shells.has(sid)) return shells.get(sid);
       const host = document.createElement("div"); host.className = "shell-host"; host.hidden = true; $("termHost").appendChild(host);
-      const term = new Terminal({ cursorBlink: true, fontSize: TERM_FONT_SIZE, fontFamily: TERM_FONT, theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" }, scrollback: 10000 });
+      const term = new Terminal({
+        cursorBlink: true, fontSize: TERM_FONT_SIZE, fontFamily: TERM_FONT,
+        theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" },
+        scrollback: 10000,
+        ...(saved?.cols && saved?.rows ? { cols: saved.cols, rows: saved.rows } : {}),
+      });
       const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
       term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(frame(sid, d)); });
       const tab = document.createElement("div"); tab.className = "tab";
-      const lbl = document.createElement("span"); lbl.textContent = "shell";
+      const lbl = document.createElement("span"); lbl.textContent = saved?.label || "shell";
       const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
       tab.append(lbl, x); tab.onclick = (e) => { if (e.target === x) closeShell(sid); else activate(sid); };
       $("tabbar").insertBefore(tab, $("newTab"));
-      const sh = { term, fit, host, tab, label: lbl, opened: false, cols: 0, rows: 0 };
+      const sh = {
+        term, fit, host, tab, label: lbl, opened: false,
+        cols: saved?.cols || 0, rows: saved?.rows || 0,
+        offset: Number.isSafeInteger(saved?.offset) ? saved.offset : null,
+        rendered: false, replay: null,
+      };
       shells.set(sid, sh);
+      persistShells();
       return sh;
     }
     // Re-measure a shell and tell the daemon, so the PTY and the terminal never
@@ -752,21 +799,37 @@
       const sh = shells.get(sid); if (!sh) return;
       try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); shells.delete(sid);
       if (activeSid === sid) { activeSid = null; const next = shells.keys().next().value; if (next) activate(next); }
+      persistShells();
+    }
+    function attachShell(sid, sh) {
+      if (sh.opened || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!sh.host.hidden) {
+        try { sh.fit.fit(); } catch {}
+      }
+      sh.opened = true;
+      sh.cols = sh.term.cols; sh.rows = sh.term.rows;
+      sendJson({
+        type: "open", sid, cols: sh.cols, rows: sh.rows,
+        ...(Number.isSafeInteger(sh.offset) ? { since: sh.offset } : {}),
+        // A page reload restores the offset but not xterm's in-memory cells.
+        // In-page WebSocket reconnects retain the cells and can use a delta.
+        snapshot: !sh.rendered,
+      });
     }
     function activate(sid) {
       const sh = shells.get(sid); if (!sh) return;
       activeSid = sid;
       for (const [id, s] of shells) { s.host.hidden = id !== sid; s.tab.classList.toggle("active", id === sid); }
       fitShell(sid, sh); // it may have been hidden while the window resized
-      if (!sh.opened && ws && ws.readyState === WebSocket.OPEN) {
-        sh.opened = true;
-        sh.cols = sh.term.cols; sh.rows = sh.term.rows;
-        sendJson({ type: "open", sid, cols: sh.cols, rows: sh.rows });
-      }
+      attachShell(sid, sh);
+      persistShells();
       sh.term.focus();
     }
     function newShell() { const sid = crypto.randomUUID(); ensureShell(sid); activate(sid); }
-    function closeShell(sid) { sendJson({ type: "close", sid }); } // daemon broadcasts the new list → removeShell
+    function closeShell(sid) {
+      sendJson({ type: "close", sid });
+      removeShell(sid);
+    }
     $("newTab").onclick = newShell;
 
     function syncSessions(listArr) {
@@ -776,10 +839,12 @@
         const sh = ensureShell(e.sid);
         sh.label.textContent = e.cwd ? e.cwd.split("/").filter(Boolean).pop() || "/" : "shell";
         sh.tab.title = e.cwd || "";
+        attachShell(e.sid, sh);
       }
       for (const sid of [...shells.keys()]) if (!ids.has(sid)) removeShell(sid);
       if (!activeSid && shells.size) activate(shells.keys().next().value);
       if (!bootstrapped) { bootstrapped = true; if (!shells.size) newShell(); }
+      persistShells();
     }
 
     // Detaching the handlers before closing matters: a socket we are walking away
@@ -804,6 +869,7 @@
         if (!current()) return;
         reconnectDelay = 1000; setConn("wait", "waiting for host…");
         for (const s of shells.values()) s.opened = false; // re-attach after reconnect
+        for (const [sid, sh] of shells) attachShell(sid, sh);
         sendJson({ type: "list-sessions" });
         if (activeSid) activate(activeSid);
         startPing();
@@ -816,11 +882,71 @@
     function startPing() { stopPing(); const probe = () => { if (ws && ws.readyState === WebSocket.OPEN) { lastPingT = Date.now(); sendJson({ type: "ping", t: lastPingT }); } }; probe(); pingTimer = setInterval(probe, 4000); }
     function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } }
 
-    function handleBinary(buf) { const a = new Uint8Array(buf); const sh = shells.get(dec.decode(a.subarray(1, 1 + a[0]))); if (sh) sh.term.write(a.subarray(1 + a[0])); }
+    function finishReplay(sid, sh) {
+      const replay = sh.replay;
+      if (!replay) return;
+      sh.replay = null;
+      if (replay.apply || sh.offset === replay.to) {
+        sh.offset = replay.to;
+        sh.rendered = true;
+      }
+      persistShells();
+      if (replay.resync && ws && ws.readyState === WebSocket.OPEN) {
+        sendJson({
+          type: "open", sid, cols: sh.cols || sh.term.cols, rows: sh.rows || sh.term.rows,
+          ...(Number.isSafeInteger(sh.offset) ? { since: sh.offset } : {}),
+          snapshot: true,
+        });
+      }
+    }
+    function beginReplay(m) {
+      const sh = shells.get(m.sid);
+      if (!sh || !Number.isSafeInteger(m.from) || !Number.isSafeInteger(m.to) ||
+          !Number.isSafeInteger(m.bytes) || m.bytes < 0) return;
+      let apply = m.mode === "snapshot" || sh.offset === m.from;
+      const current = sh.offset;
+      const resync = m.mode === "delta" && current !== m.from && current !== m.to;
+      if (m.mode === "delta" && current === m.to) apply = false;
+      sh.replay = { mode: m.mode, from: m.from, to: m.to, remaining: m.bytes, apply, resync };
+      if (m.bytes === 0) finishReplay(m.sid, sh);
+    }
+    function handleBinary(buf) {
+      const frameBytes = new Uint8Array(buf);
+      const sidLength = frameBytes[0];
+      const sid = dec.decode(frameBytes.subarray(1, 1 + sidLength));
+      const sh = shells.get(sid);
+      if (!sh) return;
+      const payload = frameBytes.subarray(1 + sidLength);
+      let cursor = 0;
+      if (sh.replay?.remaining) {
+        const count = Math.min(sh.replay.remaining, payload.length);
+        const part = payload.subarray(0, count);
+        if (sh.replay.apply && count) sh.term.write(part);
+        if (sh.replay.mode === "delta" && sh.replay.apply) {
+          sh.offset = shellState.advanceOffset(sh.offset, count);
+        }
+        sh.replay.remaining -= count;
+        cursor = count;
+        if (!sh.replay.remaining) finishReplay(sid, sh);
+      }
+      if (cursor < payload.length) {
+        const live = payload.subarray(cursor);
+        sh.term.write(live);
+        sh.offset = shellState.advanceOffset(sh.offset, live.length);
+        sh.rendered = true;
+        persistShells();
+      }
+    }
     function handleJson(str) {
       let m; try { m = JSON.parse(str); } catch { return; }
       switch (m.type) {
         case "sessions": syncSessions(m.list || []); break;
+        case "reset": {
+          const sh = shells.get(m.sid);
+          if (sh) { sh.term.reset(); sh.rendered = false; }
+          break;
+        }
+        case "session-replay": beginReplay(m); break;
         case "pong": if (m.t === lastPingT) $("rttVal").textContent = (Date.now() - m.t) + "ms"; break;
         case "stats": updateStats(m); break;
         case "exit": { const sh = shells.get(m.sid); if (sh) sh.term.write(`\r\n\x1b[33m[exited ${m.code}]\x1b[0m\r\n`); break; }
@@ -878,7 +1004,7 @@
     window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); } });
     window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
     window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh) fitShell(activeSid, sh); });
-    window.addEventListener("beforeunload", () => { for (const sid of shells.keys()) sendJson({ type: "client-gone", sid }); });
+    window.addEventListener("pagehide", () => persistShells(true));
     function toast(text, kind) { const el = document.createElement("div"); el.className = "toast " + (kind || ""); el.textContent = text; $("toasts").appendChild(el); setTimeout(() => el.remove(), 4000); }
 
     init();
