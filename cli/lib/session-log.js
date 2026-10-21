@@ -4,9 +4,19 @@ const zlib = require("zlib");
 
 // Segment encryption intentionally remains an interface seam: compressed bytes
 // can later be passed through AES-GCM here without changing logical offsets.
-const COMPRESS = zlib.zstdCompressSync
-  ? { ext: ".zst", encode: zlib.zstdCompressSync, decode: zlib.zstdDecompressSync }
-  : { ext: ".gz", encode: zlib.gzipSync, decode: zlib.gunzipSync };
+function compressionCodec(env = process.env, runtime = zlib) {
+  const requested = String(env.SWITCHBOARD_LOG_COMPRESSION || "gzip").trim().toLowerCase();
+  if (requested === "zstd") {
+    if (!runtime.zstdCompressSync || !runtime.zstdDecompressSync) {
+      throw new Error("zstd session log compression is unavailable in this Node.js runtime");
+    }
+    return { ext: ".zst", encode: runtime.zstdCompressSync };
+  }
+  if (requested !== "gzip" && requested !== "gz") {
+    throw new Error(`unsupported session log compression: ${requested}`);
+  }
+  return { ext: ".gz", encode: runtime.gzipSync };
+}
 
 const DEFAULT_SEGMENT_SIZE = 16 * 1024 * 1024;
 const DEFAULT_INDEX_BYTES = 64 * 1024;
@@ -31,6 +41,8 @@ class SessionLogStore {
     this.maxSessionBytes = nonNegativeInt(options.maxSessionBytes, DEFAULT_MAX_SESSION_BYTES);
     this.maxTotalBytes = nonNegativeInt(options.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES);
     this.retentionMs = nonNegativeInt(options.retentionMs, DEFAULT_RETENTION_MS);
+    this.compressionRuntime = options.compressionRuntime || zlib;
+    this.compression = compressionCodec(options.env, this.compressionRuntime);
     this.compressionBlockSize = positiveInt(
       options.compressionBlockSize,
       DEFAULT_COMPRESSION_BLOCK_SIZE,
@@ -441,14 +453,14 @@ class SessionLogStore {
     const source = this.segmentPath(record.sid, seg);
     let input;
     try { input = fs.readFileSync(source); } catch (error) { if (error.code === "ENOENT") return; throw error; }
-    const target = source + COMPRESS.ext;
+    const target = source + this.compression.ext;
     const temporary = target + `.tmp-${process.pid}`;
     const parts = [];
     const blocks = [];
     let storedOffset = 0;
     for (let offset = 0; offset < input.length; offset += this.compressionBlockSize) {
       const raw = input.subarray(offset, offset + this.compressionBlockSize);
-      const compressed = COMPRESS.encode(raw);
+      const compressed = this.compression.encode(raw);
       parts.push(compressed);
       blocks.push({
         offset,
@@ -462,7 +474,7 @@ class SessionLogStore {
     fs.renameSync(temporary, target);
     fs.unlinkSync(source);
     segment.bytes = input.length;
-    segment.compression = COMPRESS.ext.slice(1);
+    segment.compression = this.compression.ext.slice(1);
     segment.compressionBlocks = blocks;
     segment.storedBytes = storedOffset;
     this._persist(record);
@@ -476,7 +488,7 @@ class SessionLogStore {
         this.legacyCompressionCache.delete(key);
         this.legacyCompressionCache.set(key, raw);
       } else {
-        raw = decompressSegment(segment.file, segment.compression);
+        raw = decompressSegment(segment.file, segment.compression, this.compressionRuntime);
         this.legacyCompressionCache.set(key, raw);
         while (this.legacyCompressionCache.size > LEGACY_CACHE_ENTRIES) {
           this.legacyCompressionCache.delete(this.legacyCompressionCache.keys().next().value);
@@ -495,7 +507,7 @@ class SessionLogStore {
         const encoded = Buffer.allocUnsafe(block.storedBytes);
         const read = fs.readSync(fd, encoded, 0, block.storedBytes, block.storedOffset);
         if (read !== block.storedBytes) throw new Error("truncated compressed session block");
-        const raw = decompressBuffer(encoded, segment.compression);
+        const raw = decompressBuffer(encoded, segment.compression, this.compressionRuntime);
         const from = Math.max(offset, block.offset) - block.offset;
         const to = Math.min(end, blockEnd) - block.offset;
         parts.push(raw.subarray(from, to));
@@ -776,13 +788,16 @@ function segmentFile(sessionDir, segment) {
   return path.join(sessionDir, `seg-${segment.seg}.log${segment.compression ? `.${segment.compression}` : ""}`);
 }
 
-function decompressSegment(file, compression) {
-  return decompressBuffer(fs.readFileSync(file), compression);
+function decompressSegment(file, compression, runtime = zlib) {
+  return decompressBuffer(fs.readFileSync(file), compression, runtime);
 }
 
-function decompressBuffer(input, compression) {
-  if (compression === "zst" && zlib.zstdDecompressSync) return zlib.zstdDecompressSync(input);
-  if (compression === "gz") return zlib.gunzipSync(input);
+function decompressBuffer(input, compression, runtime = zlib) {
+  if (compression === "zst") {
+    if (runtime.zstdDecompressSync) return runtime.zstdDecompressSync(input);
+    throw new Error("zstd session log decompression is unavailable in this Node.js runtime");
+  }
+  if (compression === "gz") return runtime.gunzipSync(input);
   throw new Error(`unsupported session segment compression: ${compression}`);
 }
 

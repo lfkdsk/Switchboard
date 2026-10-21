@@ -332,7 +332,11 @@ The default output is the original PTY byte stream, ANSI sequences included;
 `--text` removes terminal escapes. `--tail 64KiB` selects bytes and `--tail 200l`
 selects lines. `--json` returns a JSON session list, or base64 NDJSON chunks when
 reading a transcript. Each session keeps at most 1 GiB, all scopes together keep
-at most 5 GiB, and segments older than 30 days are pruned oldest-first. Set
+at most 5 GiB, and segments older than 30 days are pruned oldest-first. Session
+segments use gzip compression by default for Node.js 18 compatibility. Set
+`SWITCHBOARD_LOG_COMPRESSION=zstd` to opt in to zstd when the Node.js runtime
+supports it; reading existing `.zst` segments also requires runtime zstd
+support and otherwise returns a clear session-read error. Set
 `SWITCHBOARD_RECORD=0` on the target to turn recording off.
 
 Detached shells are kept for 24 hours after the last browser or CLI peer leaves.

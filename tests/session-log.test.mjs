@@ -31,13 +31,13 @@ test("session output rolls segments and reads continuously across their boundari
     segmentNames.map((name) => name.match(/^seg-\d+\.log/)[0]).sort(),
     ["seg-0.log", "seg-1.log", "seg-2.log"],
   );
-  assert.ok(segmentNames.every((name) => /\.(?:gz|zst)$/.test(name)),
-    "closed session segments should be compressed");
+  assert.ok(segmentNames.every((name) => /\.gz$/.test(name)),
+    "closed session segments should use gzip by default");
   const meta = JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8"));
   assert.deepEqual(meta.segments.map(({ start, bytes }) => ({ start, bytes })), [
     { start: 0, bytes: 4 }, { start: 4, bytes: 4 }, { start: 8, bytes: 2 },
   ]);
-  assert.ok(meta.segments.every((segment) => ["gz", "zst"].includes(segment.compression)));
+  assert.ok(meta.segments.every((segment) => segment.compression === "gz"));
   const chunk = store.read("session-one", { from: 2, len: 7 });
   assert.equal(chunk.data.toString(), "cdefghi");
   assert.deepEqual({ off: chunk.off, next: chunk.next, eof: chunk.eof }, { off: 2, next: 9, eof: false });
@@ -56,6 +56,77 @@ test("session output rolls segments and reads continuously across their boundari
   const reloaded = new SessionLogStore({ dir, segmentSize: 4, now: () => now }).init();
   assert.equal(reloaded.read("session-one", { from: 0, len: 20 }).data.toString(), "abcdefghij");
   assert.equal(reloaded.stat("session-one").status, "closed");
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("zstd compression is opt-in and requires runtime support", async () => {
+  const runtime = {
+    gzipSync: zlib.gzipSync,
+    gunzipSync: zlib.gunzipSync,
+    zstdCompressSync: zlib.gzipSync,
+    zstdDecompressSync: zlib.gunzipSync,
+  };
+  const { dir, store } = tempStore({
+    env: { SWITCHBOARD_LOG_COMPRESSION: "zstd" },
+    compressionRuntime: runtime,
+  });
+  const log = store.open("session-zstd");
+  log.append("zstd opt in");
+  await log.close();
+
+  const sessionDir = path.join(dir, "session-zstd");
+  assert.ok(fs.existsSync(path.join(sessionDir, "seg-0.log.zst")));
+  assert.equal(store.read("session-zstd", { from: 0, len: 64 }).data.toString(), "zstd opt in");
+  fs.rmSync(dir, { recursive: true });
+
+  const unsupportedDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-sessions-"));
+  assert.throws(
+    () => new SessionLogStore({
+      dir: unsupportedDir,
+      env: { SWITCHBOARD_LOG_COMPRESSION: "zstd" },
+      compressionRuntime: { gzipSync: zlib.gzipSync, gunzipSync: zlib.gunzipSync },
+    }),
+    /zstd session log compression is unavailable/,
+  );
+  fs.rmSync(unsupportedDir, { recursive: true });
+});
+
+test("sess-read reports unavailable zstd decoding without crashing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-sessions-"));
+  const sid = "session-zstd-unsupported";
+  const sessionDir = path.join(dir, sid);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "seg-0.log.zst"), Buffer.from("not decoded"));
+  fs.writeFileSync(path.join(sessionDir, "meta.json"), JSON.stringify({
+    version: 1,
+    sid,
+    segmentSize: 1024,
+    createdAt: 1,
+    startedAt: 1,
+    updatedAt: 1,
+    closedAt: 2,
+    status: "closed",
+    firstOffset: 0,
+    nextOffset: 11,
+    bytesStored: 11,
+    lastSeg: 0,
+    segments: [{
+      seg: 0,
+      start: 0,
+      bytes: 11,
+      compression: "zst",
+      storedBytes: 11,
+      compressionBlocks: [{ offset: 0, bytes: 11, storedOffset: 0, storedBytes: 11 }],
+    }],
+  }));
+
+  const store = new SessionLogStore({
+    dir,
+    compressionRuntime: { gzipSync: zlib.gzipSync, gunzipSync: zlib.gunzipSync },
+  }).init();
+  const response = sessionLogReadResponse(store, { id: "read-zstd", sid, from: 0, len: 11 });
+  assert.equal(response.type, "sess-error");
+  assert.match(response.message, /zstd session log decompression is unavailable/);
   fs.rmSync(dir, { recursive: true });
 });
 
