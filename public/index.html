@@ -909,7 +909,7 @@
         const visibleEnd = Math.max(cursor, Math.min(end, interval.start));
         if (visibleEnd > cursor) parts.push(bytes.slice(cursor - from, visibleEnd - from));
         cursor = Math.max(cursor, Math.min(end, interval.end));
-        if (interval.end <= end && interval.end > from) {
+        if (!interval.active && interval.end <= end && interval.end > from) {
           const label = interval.application || "fullscreen";
           parts.push(new TextEncoder().encode(`\n[${label} ${historyDuration(interval.endedAt - interval.startedAt)}]\n`));
         }

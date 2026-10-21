@@ -114,6 +114,37 @@ test("alternate-screen indexing falls back to fullscreen", async () => {
   fs.rmSync(dir, { recursive: true });
 });
 
+test("an active alternate screen is indexed for observers and closed with the session", async () => {
+  let now = 10;
+  const { dir, store } = tempStore({ now: () => now });
+  const log = store.open("session-active-alternate");
+  log.append("$ top\n\x1b[?1049hsecret live output\n");
+  await log.flush();
+
+  const observer = new SessionLogStore({ dir, now: () => now }).init();
+  const active = observer.read("session-active-alternate", { from: 20, len: 100 });
+  assert.deepEqual(active.alternateScreens, [{
+    start: 6,
+    end: 33,
+    startedAt: 10,
+    application: "top",
+    active: true,
+  }]);
+
+  now = 5_010;
+  await log.close();
+  const closed = new SessionLogStore({ dir, now: () => now }).init()
+    .read("session-active-alternate", { from: 20, len: 100 });
+  assert.deepEqual(closed.alternateScreens, [{
+    start: 6,
+    end: 33,
+    startedAt: 10,
+    endedAt: 5_010,
+    application: "top",
+  }]);
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("zstd compression is opt-in and requires runtime support", async () => {
   const runtime = {
     gzipSync: zlib.gzipSync,

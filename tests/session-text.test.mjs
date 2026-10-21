@@ -74,6 +74,17 @@ test("indexed alternate screens use recorded offsets and duration", () => {
   }], { includeAlt: true }).toString(), input.toString());
 });
 
+test("active indexed alternate screens hide content without emitting a completed label", () => {
+  const input = Buffer.from("secret live output");
+  assert.equal(foldIndexedAlternateScreens(input, 50, [{
+    start: 40,
+    end: 50 + input.length,
+    startedAt: 1_000,
+    application: "top",
+    active: true,
+  }]).toString(), "");
+});
+
 test("history duration formatting is compact", () => {
   assert.equal(formatDuration(192_000), "3m12s");
   assert.equal(formatDuration(3_661_000), "1h1m1s");

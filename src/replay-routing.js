@@ -10,6 +10,13 @@ export function browserMessage(message, clientId) {
   return JSON.stringify({ ...value, relayClientId: clientId });
 }
 
+export function resetReplayRoutes() {
+  // A target is meaningful only for the daemon WebSocket that announced it.
+  // Reusing it after daemon replacement could misroute the new daemon's first
+  // live frame if the predecessor disconnected between metadata and payload.
+  return {};
+}
+
 function binaryFrame(message) {
   const bytes = message instanceof ArrayBuffer
     ? new Uint8Array(message)

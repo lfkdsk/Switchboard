@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { setMachineOffline, updateMachineStats } from "./registry.js";
-import { browserMessage, daemonRoute } from "./replay-routing.js";
+import { browserMessage, daemonRoute, resetReplayRoutes } from "./replay-routing.js";
 
 const WS_OPEN = 1;
 
@@ -40,6 +40,7 @@ export class Circuit extends DurableObject {
     const machineId = url.searchParams.get("machine") || null;
 
     if (role === "daemon") {
+      this._replayTargets = resetReplayRoutes();
       // Last-writer-wins: a newly-arrived daemon always takes over the circuit.
       // We can't trust readyState here — when a daemon dies ungracefully (sleep,
       // crash, kill -9) Cloudflare leaves its socket reading OPEN for minutes

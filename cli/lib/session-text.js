@@ -96,7 +96,7 @@ function foldIndexedAlternateScreens(value, from, intervals = [], options = {}) 
     const visibleEnd = Math.max(cursor, Math.min(end, interval.start));
     if (visibleEnd > cursor) parts.push(input.subarray(cursor - from, visibleEnd - from));
     cursor = Math.max(cursor, Math.min(end, interval.end));
-    if (interval.end <= end && interval.end > from) {
+    if (!interval.active && interval.end <= end && interval.end > from) {
       const duration = formatDuration(interval.endedAt - interval.startedAt);
       parts.push(Buffer.from(`\n[${interval.application || "fullscreen"} ${duration}]\n`));
     }

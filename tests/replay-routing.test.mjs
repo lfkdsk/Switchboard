@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { browserMessage, daemonRoute } from "../src/replay-routing.js";
+import { browserMessage, daemonRoute, resetReplayRoutes } from "../src/replay-routing.js";
 
 const frame = (sid, payload) => new Uint8Array([
   Buffer.byteLength(sid), ...Buffer.from(sid), ...payload,
@@ -60,4 +60,11 @@ test("reset is targeted without consuming the following replay payload", () => {
   assert.deepEqual(JSON.parse(reset.message), {
     type: "reset", sid: "shell-1", offset: 100,
   });
+});
+
+test("daemon replacement clears an incomplete replay target", () => {
+  const stale = { "shell-1": { clientId: "browser-a", bytes: 4 } };
+  const live = daemonRoute(frame("shell-1", [5]), resetReplayRoutes(stale));
+  assert.equal(live.target, null);
+  assert.deepEqual(live.replayTargets, {});
 });

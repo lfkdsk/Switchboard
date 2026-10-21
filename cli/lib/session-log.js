@@ -282,6 +282,17 @@ class SessionLogStore {
     if (state.closePromise) return state.closePromise;
     state.closing = true;
     clearInterval(state.indexTimer);
+    if (state.altScan.active) {
+      const endedAt = this.now();
+      this._writeIndex(state, {
+        type: "alternate-screen-exit",
+        off: state.record.nextOffset,
+        ...state.altScan.active,
+        end: state.record.nextOffset,
+        endedAt,
+      });
+      state.altScan.active = null;
+    }
     this._writeIndex(state, { type: "close" });
     const segmentDone = this._endSegmentWriter(state);
     const indexDone = closeStream(state.indexWriter);
@@ -396,18 +407,36 @@ class SessionLogStore {
     let lines;
     try { lines = fs.readFileSync(file, "utf8").split("\n"); } catch { return []; }
     const intervals = [];
+    let active = null;
     for (const line of lines) {
       if (!line) continue;
       let entry;
       try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.type === "alternate-screen-enter") {
+        active = {
+          start: entry.start,
+          startedAt: entry.startedAt,
+          application: entry.application || "fullscreen",
+        };
+        continue;
+      }
       if (entry.type !== "alternate-screen-exit") continue;
-      if (!(entry.end > from && entry.start < to)) continue;
+      active = null;
+      if (entry.end > from && entry.start < to) {
+        intervals.push({
+          start: entry.start,
+          end: entry.end,
+          startedAt: entry.startedAt,
+          endedAt: entry.endedAt,
+          application: entry.application || "fullscreen",
+        });
+      }
+    }
+    if (active && record.nextOffset > from && active.start < to) {
       intervals.push({
-        start: entry.start,
-        end: entry.end,
-        startedAt: entry.startedAt,
-        endedAt: entry.endedAt,
-        application: entry.application || "fullscreen",
+        ...active,
+        end: record.nextOffset,
+        active: true,
       });
     }
     return intervals;
