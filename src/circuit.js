@@ -17,6 +17,21 @@ export class Circuit extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
+    // Anything thrown past here surfaces to the Worker as a stub error without
+    // saying which circuit or role it was. Name them, then let the Worker's
+    // upgrade guard turn the failure into a 503 the clients know to retry.
+    try {
+      return await this.handle(request, url);
+    } catch (error) {
+      console.error("[circuit] fetch failed", {
+        role: url.searchParams.get("role"), machine: url.searchParams.get("machine"),
+        error: error?.stack || String(error),
+      });
+      throw error;
+    }
+  }
+
+  async handle(request, url) {
     if (url.pathname === "/__revoke" && request.method === "POST") {
       const accountId = request.headers.get("x-switchboard-account");
       if (!accountId) return new Response("missing account\n", { status: 400 });
@@ -76,6 +91,19 @@ export class Circuit extends DurableObject {
   }
 
   webSocketMessage(ws, message) {
+    // One bad frame must not take the whole circuit down with it: log it and
+    // keep forwarding for everyone else on the line.
+    try {
+      this.forward(ws, message);
+    } catch (error) {
+      const att = ws.deserializeAttachment() || {};
+      console.error("[circuit] message handling failed", {
+        role: att.role || null, machine: att.machineId || null, error: error?.stack || String(error),
+      });
+    }
+  }
+
+  forward(ws, message) {
     const att = ws.deserializeAttachment() || {};
     if (att.role === "daemon") {
       // Bound-machine heartbeat → D1 (small JSON stats only; skip binary + big dl-chunks).
@@ -115,7 +143,12 @@ export class Circuit extends DurableObject {
     }
   }
 
-  webSocketError() {}
+  webSocketError(ws, error) {
+    const att = ws.deserializeAttachment() || {};
+    console.error("[circuit] socket error", {
+      role: att.role || null, machine: att.machineId || null, error: error?.message || String(error),
+    });
+  }
 
   notifyDaemonPeer(excluding) {
     const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);

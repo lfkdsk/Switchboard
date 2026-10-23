@@ -15,6 +15,7 @@
  */
 
 import { Circuit } from "./circuit.js";
+import { guardUpgrade } from "./upgrade-guard.js";
 import { handleLogin, handleSession, handleLogout, getSession, json } from "./auth.js";
 import {
   cliStart, cliComplete, cliPoll,
@@ -32,7 +33,11 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname;
 
-    if (p === "/ws") return routeWebSocket(request, env, url);
+    if (p === "/ws") {
+      return guardUpgrade(() => routeWebSocket(request, env, url), {
+        role: url.searchParams.get("role"), machine: url.searchParams.get("machine"),
+      });
+    }
     if (p === "/healthz") return new Response("ok\n", { headers: { "content-type": "text/plain" } });
 
     // ---- auth / session ----
