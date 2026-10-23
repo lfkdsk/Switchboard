@@ -688,13 +688,14 @@
     let daemonFeatures = null, capabilitiesId = null;
     let pingTimer = null, lastPingT = 0;
     const shellState = SwitchboardSessionState;
-    // localStorage is shared by same-origin pages, so another page restores the
-    // same sids and mirrors the same PTYs. Either page may type; clicking ×
+    // The daemon owns the shell list: every page, on any browser or device,
+    // builds its tabs from the daemon's `sessions` broadcast and attaches with a
+    // snapshot, so nothing about a shell is kept in the browser. Pages showing
+    // the same machine mirror the same PTYs. Either page may type; clicking ×
     // explicitly closes that PTY for every page, while reload/Back/page close
     // only detach and leave it available for the grace period.
     const shells = new Map(); // sid -> { term, fit, host, tab, label, opened, offset, rendered, replay }
     let activeSid = null, bootstrapped = false;
-    let shellStorageKey = null, shellNode = null, persistTimer = null;
     const uploads = new Map(), downloads = new Map();
     const historyRequests = new Map();
     const historyView = {
@@ -710,58 +711,28 @@
     function setConn(state, text) { $("connDot").className = "dot " + state; $("connText").textContent = text; }
     function frame(sid, payload) { const s = enc.encode(sid), p = enc.encode(payload); const o = new Uint8Array(1 + s.length + p.length); o[0] = s.length; o.set(s, 1); o.set(p, 1 + s.length); return o.buffer; }
 
-    function persistedShellState() {
-      return {
-        activeSid,
-        shells: [...shells].map(([sid, sh]) => ({
-          sid, node: shellNode, label: sh.label.textContent || "shell",
-          offset: sh.offset, cols: sh.cols || null, rows: sh.rows || null,
-        })),
-      };
-    }
-    function persistShells(now) {
-      if (!shellStorageKey) return;
-      if (now) {
-        if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
-        shellState.save(localStorage, shellStorageKey, persistedShellState());
-      } else if (!persistTimer) {
-        persistTimer = setTimeout(() => {
-          persistTimer = null;
-          shellState.save(localStorage, shellStorageKey, persistedShellState());
-        }, 50);
-      }
-    }
     function disposeShells() {
       for (const sh of shells.values()) { try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); }
       shells.clear(); activeSid = null;
     }
 
     function openTerminal(c) {
-      persistShells(true);
       disposeShells();
       conn = c;
-      shellNode = shellState.connectionNode(c);
-      shellStorageKey = shellState.storageKey(location.origin, c, session);
       const u = new URL(location.href); u.search = ""; u.hash = "";
       u.searchParams.set(c.mode === "machine" ? "machine" : "token", c.mode === "machine" ? c.machineId : c.token);
       history.replaceState(null, "", u);
-      const saved = shellState.load(localStorage, shellStorageKey, shellNode);
-      for (const entry of saved.shells) ensureShell(entry.sid, entry);
-      activeSid = saved.activeSid;
       bootstrapped = false;
       $("rttVal").textContent = "—";
       showView("terminal");
-      if (activeSid) activate(activeSid);
       reconnectDelay = 1000;
       connect();
     }
     function closeTerminal() {
-      persistShells(true);
       manualClose = true; stopPing();
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       dropSocket(ws); ws = null;
       disposeShells();
-      shellStorageKey = null; shellNode = null;
       $("stats").hidden = true;
     }
 
@@ -786,30 +757,27 @@
     // which is what the unicode-range split exists to avoid.
     document.fonts.load(`${TERM_FONT_SIZE}px "Symbols Nerd Font Mono"`, "\ue0b0").catch(() => {});
 
-    function ensureShell(sid, saved) {
+    function ensureShell(sid) {
       if (shells.has(sid)) return shells.get(sid);
       const host = document.createElement("div"); host.className = "shell-host"; host.hidden = true; $("termHost").appendChild(host);
       const term = new Terminal({
         cursorBlink: true, fontSize: TERM_FONT_SIZE, fontFamily: TERM_FONT,
         theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" },
         scrollback: 10000,
-        ...(saved?.cols && saved?.rows ? { cols: saved.cols, rows: saved.rows } : {}),
       });
       const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
       term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(frame(sid, d)); });
       const tab = document.createElement("div"); tab.className = "tab";
-      const lbl = document.createElement("span"); lbl.textContent = saved?.label || "shell";
+      const lbl = document.createElement("span"); lbl.textContent = "shell";
       const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
       tab.append(lbl, x); tab.onclick = (e) => { if (e.target === x) closeShell(sid); else activate(sid); };
       $("tabbar").insertBefore(tab, $("newTab"));
       const sh = {
         term, fit, host, tab, label: lbl, opened: false,
-        cols: saved?.cols || 0, rows: saved?.rows || 0,
-        offset: Number.isSafeInteger(saved?.offset) ? saved.offset : null,
+        cols: 0, rows: 0, offset: null,
         rendered: false, replay: null,
       };
       shells.set(sid, sh);
-      persistShells();
       return sh;
     }
     // Re-measure a shell and tell the daemon, so the PTY and the terminal never
@@ -833,7 +801,6 @@
       const sh = shells.get(sid); if (!sh) return;
       try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); shells.delete(sid);
       if (activeSid === sid) { activeSid = null; const next = shells.keys().next().value; if (next) activate(next); }
-      persistShells();
     }
     function attachShell(sid, sh) {
       if (sh.opened || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -856,7 +823,6 @@
       for (const [id, s] of shells) { s.host.hidden = id !== sid; s.tab.classList.toggle("active", id === sid); }
       fitShell(sid, sh); // it may have been hidden while the window resized
       attachShell(sid, sh);
-      persistShells();
       sh.term.focus();
     }
     function newShell() { const sid = crypto.randomUUID(); ensureShell(sid); activate(sid); }
@@ -1012,7 +978,10 @@
 
     function syncSessions(listArr) {
       const ids = new Set();
-      for (const e of listArr) {
+      // Map order on the daemon is spawn order, but holders recovered after a
+      // daemon restart are adopted in directory order: sort so tabs stay put.
+      const ordered = [...listArr].sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+      for (const e of ordered) {
         ids.add(e.sid);
         const sh = ensureShell(e.sid);
         sh.label.textContent = e.cwd ? e.cwd.split("/").filter(Boolean).pop() || "/" : "shell";
@@ -1022,7 +991,6 @@
       for (const sid of [...shells.keys()]) if (!ids.has(sid)) removeShell(sid);
       if (!activeSid && shells.size) activate(shells.keys().next().value);
       if (!bootstrapped) { bootstrapped = true; if (!shells.size) newShell(); }
-      persistShells();
     }
 
     // Detaching the handlers before closing matters: a socket we are walking away
@@ -1073,7 +1041,6 @@
         sh.offset = replay.to;
         sh.rendered = true;
       }
-      persistShells();
       if (replay.resync && ws && ws.readyState === WebSocket.OPEN) {
         sendJson({
           type: "open", sid, cols: sh.cols || sh.term.cols, rows: sh.rows || sh.term.rows,
@@ -1117,7 +1084,6 @@
         sh.term.write(live);
         sh.offset = shellState.advanceOffset(sh.offset, live.length);
         sh.rendered = true;
-        persistShells();
       }
     }
     function handleJson(str) {
@@ -1205,7 +1171,6 @@
     window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
     window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh) fitShell(activeSid, sh); });
     window.addEventListener("pagehide", () => {
-      persistShells(true);
       // Legacy daemons use client-gone to reap PTYs. Holder-aware daemons own
       // their disconnected-session lease, so notifying them would defeat reload recovery.
       if (shellState.shouldNotifyClientGone(daemonFeatures)) {

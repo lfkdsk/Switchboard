@@ -91,8 +91,9 @@ quick remote help. No sign-in required; the token *is* the key (see
   on one. The agent already running on your laptop can drive the build box.
 - **🗂️ Multiple shells, tmux-style** — open as many tabs as you want on a single
   machine. Shells survive tab reloads and flaky links; in account mode they keep
-  running even after you close the browser, so you can reattach right where you
-  left off.
+  running even after you close the browser. The machine, not the browser, keeps
+  the list of open shells, so any browser on any device reattaches right where
+  you left off.
 - **📁 Drag-and-drop file transfer** — drop a file onto the page to upload it
   into the active shell's working directory, or pull any file off the host with a
   click.

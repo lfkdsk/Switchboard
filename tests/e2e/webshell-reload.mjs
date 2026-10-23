@@ -188,6 +188,14 @@ async function exitedWithin(child, timeout) {
   ]);
 }
 
+// The daemon is the only record of which shells exist; nothing may survive in
+// the page's storage, and a reload must never spawn an extra shell.
+async function assertDaemonOwnedTabs(page, label) {
+  const stored = await page.evaluate(() => localStorage.length + sessionStorage.length);
+  assert.equal(stored, 0, `${label}: browser storage should stay empty`);
+  assert.equal(await page.locator("#tabbar .tab").count(), 1, `${label}: exactly one shell tab`);
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -295,6 +303,30 @@ try {
     "interactive command after reload",
   );
   assert.equal(reloadInteractive.match(/RELOAD_PID=(\d+)/)?.[1], pid);
+  await assertDaemonOwnedTabs(page, "after reload");
+
+  // A brand-new browser profile stands in for another device: it has never
+  // seen this shell, so only the daemon's session list can lead it back.
+  const otherDevice = await browser.newContext();
+  const otherPage = await otherDevice.newPage();
+  await instrument(otherPage);
+  await otherPage.goto(`${origin}/?token=${encodeURIComponent(token)}`);
+  await waitForConnection(otherPage);
+  await waitForTerminal(
+    otherPage,
+    (text) => text.split("\n").some((line) => line.trim() === "12000") &&
+      text.split("\n").some((line) => line.trim() === "20000"),
+    "scrollback in a fresh browser profile",
+  );
+  await sendCommand(otherPage, "echo DEVICE_PID=$$; echo OTHER_DEVICE_OK");
+  const otherDeviceText = await waitForTerminal(
+    otherPage,
+    (text) => text.includes("OTHER_DEVICE_OK") && /DEVICE_PID=\d+/.test(text),
+    "interactive command from a fresh browser profile",
+  );
+  assert.equal(otherDeviceText.match(/DEVICE_PID=(\d+)/)?.[1], pid);
+  await assertDaemonOwnedTabs(otherPage, "fresh browser profile");
+  await otherDevice.close();
 
   const secondPage = await context.newPage();
   await instrument(secondPage);
@@ -366,6 +398,7 @@ try {
     "interactive command after daemon restart and page refresh",
   );
   assert.equal(daemonRefreshInteractive.match(/DAEMON_REFRESH_PID=(\d+)/)?.[1], pid);
+  await assertDaemonOwnedTabs(page, "after daemon restart and refresh");
 
   await terminate(relay);
   await page.waitForFunction(
@@ -404,12 +437,14 @@ try {
     "interactive command after page reopen",
   );
   assert.equal(reopenInteractive.match(/REOPEN_PID=(\d+)/)?.[1], pid);
+  await assertDaemonOwnedTabs(page, "after page reopen");
 
   console.log(`webshell reload E2E passed (relay port ${port})`);
-  console.log(`same shell PID ${pid}: reload, daemon restart, network reconnect, and page reopen`);
+  console.log(`same shell PID ${pid}: reload, fresh browser profile, daemon restart, network reconnect, and page reopen`);
+  console.log("browser storage stayed empty and every restore showed exactly one shell tab");
   console.log("restored terminal buffer lines: 12000 and 20000");
   console.log(
-    "interactive markers: RELOAD_INTERACTIVE_OK, DAEMON_RESTART_INTERACTIVE_OK, " +
+    "interactive markers: RELOAD_INTERACTIVE_OK, OTHER_DEVICE_OK, DAEMON_RESTART_INTERACTIVE_OK, " +
     "DAEMON_REFRESH_INTERACTIVE_OK, " +
     "RECONNECT_INTERACTIVE_OK, REOPEN_INTERACTIVE_OK",
   );
