@@ -94,25 +94,31 @@ class PeerSocket extends EventEmitter {
     this.attempt = 0;
     this.reportedFailure = false;
     this.inner = null;
+    this.closed = false;
+    this.retryTimer = null;
     this.connect();
   }
   connect() {
+    if (this.closed) return;
     this.attempt++;
     const inner = this.dial();
     this.inner = inner;
     for (const event of ["open", "message", "close", "ping", "pong"]) {
-      inner.on(event, (...args) => { if (this.inner === inner) this.emit(event, ...args); });
+      inner.on(event, (...args) => { if (!this.closed && this.inner === inner) this.emit(event, ...args); });
     }
     inner.on("unexpected-response", (_req, res) => {
       let body = "";
       res.on("data", (d) => { body += d; });
       res.on("end", () => {
-        if (this.inner !== inner) return;
+        if (this.closed || this.inner !== inner) return;
         const retriesLeft = this.attempt - 1 < this.delays.length;
         if (res.statusCode >= 500 && retriesLeft) {
           const delay = this.delays[this.attempt - 1];
           this.notify(`relay answered ${res.statusCode} to the handshake; retrying in ${delay / 1000}s…`);
-          setTimeout(() => { if (this.inner === inner) this.connect(); }, delay);
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            if (!this.closed && this.inner === inner) this.connect();
+          }, delay);
           return;
         }
         const tried = this.attempt > 1 ? ` after ${this.attempt} attempts` : "";
@@ -120,7 +126,7 @@ class PeerSocket extends EventEmitter {
       });
     });
     inner.on("error", (e) => {
-      if (this.inner !== inner) return;
+      if (this.closed || this.inner !== inner) return;
       if (this.onFailure) this.failed("Connection failed: " + e.message);
       else if (this.listenerCount("error")) this.emit("error", e);
       else { console.error("\nConnection failed: " + e.message + "\n"); process.exitCode = 255; }
@@ -136,8 +142,18 @@ class PeerSocket extends EventEmitter {
   get bufferedAmount() { return this.inner ? this.inner.bufferedAmount || 0 : 0; }
   get _socket() { return this.inner ? this.inner._socket : undefined; }
   send(...args) { return this.inner.send(...args); }
-  close(...args) { return this.inner.close(...args); }
-  terminate(...args) { return this.inner.terminate(...args); }
+  close(...args) {
+    this.closed = true;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    return this.inner.close(...args);
+  }
+  terminate(...args) {
+    this.closed = true;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    return this.inner.terminate(...args);
+  }
 }
 
 // ---- picking a machine ---------------------------------------------------
