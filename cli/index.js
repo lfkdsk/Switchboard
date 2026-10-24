@@ -45,6 +45,28 @@ const {
 const {
   recoverPtyHolders, spawnPtyHolder, usePtyHolder,
 } = require("./lib/pty-holder");
+const {
+  FEATURE: ACCOUNT_SESSIONS_FEATURE,
+  accountRoute,
+  canAccessJobFor,
+  canAccessSessionFor,
+  clientRoute,
+  daemonResponseRoute,
+  encodeBinary: encodeAccountBinary,
+  findAccessibleSession,
+  grantExpiryForAccount,
+  ownerRoute,
+  ownedSessionEntries,
+  principalAccessExpired,
+  reconcileGrantSnapshot,
+  sameClient,
+  sessionStorageId,
+  unwrapBrowserBinary,
+  unwrapBrowserJson,
+  validPrincipal,
+  wireSessionId,
+  wrapDaemonJson,
+} = require("./lib/account-sessions");
 const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
 const pkg = require("./package.json");
 
@@ -807,6 +829,7 @@ async function confirmSoleDaemon(circuit, { ignoreService = false, intent = "sta
 let cfg = loadConfig();
 let BOUND = false;
 let TOKEN = null, MACHINE = null, AGENT = null, wsUrl, browseUrl;
+const ACCOUNT_PROTOCOL_NONCE = crypto.randomBytes(24).toString("base64url");
 
 // May your *other* machines run things here (`switchboard exec`, `switchboard
 // shell`)? On by default in account mode: they're yours, and anyone who can
@@ -829,7 +852,9 @@ function setupConnection() {
     wsUrl = SERVER.replace(/^http/, "ws") + "/ws?role=daemon&machine=" + encodeURIComponent(MACHINE) +
       "&name=" + encodeURIComponent(os.hostname()) +
       "&platform=" + encodeURIComponent(process.platform) +
-      "&arch=" + encodeURIComponent(process.arch) + (PEER ? "&peer=1" : "");
+      "&arch=" + encodeURIComponent(process.arch) +
+      "&protocol=" + encodeURIComponent(ACCOUNT_SESSIONS_FEATURE) +
+      "&protocol-nonce=" + encodeURIComponent(ACCOUNT_PROTOCOL_NONCE) + (PEER ? "&peer=1" : "");
     browseUrl = SERVER + "/";
   } else {
     // 32 random bytes = 256 bits of entropy (~43 url-safe chars). Infeasible to guess.
@@ -853,7 +878,7 @@ function setupConnection() {
 // explicit `close` from either kills it for both. The browser's + button creates
 // a fresh sid. Merely disconnecting never closes a session; sessions outlive
 // relay reconnects so a flaky link or tab reload doesn't lose work.
-const sessions = new Map(); // sid -> { pty, holder, log, screen, offset, graceTimer, exitPromise }
+const sessions = new Map(); // storage id -> { sid, ownerAccountId, pty, holder, log, ... }
 const openingSessions = new Map();
 const openingSessionAborts = new Map();
 const openingSessionInfo = new Map();
@@ -864,6 +889,98 @@ const RECORD_SESSIONS = recordingEnabled();
 const USE_PTY_HOLDER = usePtyHolder();
 let sessionRoot = null;
 let sessionScope = null;
+let accountProtocolState = "pending"; // active, legacy (token/old relay), or pending negotiation
+let machineOwnerAccountId = null;
+const browserClients = new Map(); // relay client id -> authenticated principal
+const requestRoutes = new Map(); // request id -> initiating relay client route
+const accountAccessExpiries = new Map(); // visitor account id -> finite deadline or null
+const accountExpiryTimers = new Map();
+const MAX_TIMER_DELAY_MS = 0x7fffffff;
+
+function scopedSessions() { return BOUND && accountProtocolState === "active"; }
+function legacySessions() { return !BOUND || accountProtocolState === "legacy"; }
+
+function clearAccountExpiryTimer(accountId) {
+  const timer = accountExpiryTimers.get(accountId);
+  if (timer) clearTimeout(timer);
+  accountExpiryTimers.delete(accountId);
+}
+
+function forgetAccountAccessExpiry(accountId) {
+  clearAccountExpiryTimer(accountId);
+  accountAccessExpiries.delete(accountId);
+}
+
+function armAccountAccessExpiry(accountId) {
+  clearAccountExpiryTimer(accountId);
+  const expiresAt = accountAccessExpiries.get(accountId);
+  if (!Number.isFinite(expiresAt)) return;
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) {
+    terminateAccountSessions(accountId, "access-expired");
+    return;
+  }
+  const timer = setTimeout(() => {
+    if (accountAccessExpiries.get(accountId) !== expiresAt) return;
+    if (expiresAt > Date.now()) armAccountAccessExpiry(accountId);
+    else terminateAccountSessions(accountId, "access-expired");
+  }, Math.min(remaining, MAX_TIMER_DELAY_MS));
+  timer.unref?.();
+  accountExpiryTimers.set(accountId, timer);
+}
+
+function setAccountAccessExpiry(accountId, expiresAt) {
+  if (typeof accountId !== "string" || !accountId || accountId === machineOwnerAccountId) return;
+  const normalized = Number.isFinite(expiresAt) ? expiresAt : null;
+  accountAccessExpiries.set(accountId, normalized);
+  for (const info of openingSessionInfo.values()) {
+    if (info.ownerAccountId === accountId) info.accessExpiresAt = normalized;
+  }
+  for (const s of sessions.values()) {
+    if (s.ownerAccountId !== accountId || s.accessExpiresAt === normalized) continue;
+    s.accessExpiresAt = normalized;
+    s.pty.setAccessExpiry?.(normalized);
+  }
+  armAccountAccessExpiry(accountId);
+}
+
+function rememberPrincipalAccessExpiry(principal) {
+  if (!scopedSessions() || principal?.accessVia !== "grant") return true;
+  if (principalAccessExpired(principal)) {
+    terminateAccountSessions(principal.accountId, "access-expired");
+    return false;
+  }
+  if (!accountAccessExpiries.has(principal.accountId)) {
+    setAccountAccessExpiry(principal.accountId, principal.expiresAt);
+  }
+  return true;
+}
+
+function sessionWireId(s, principal) {
+  return scopedSessions() ? wireSessionId(s, principal, machineOwnerAccountId) : s.sid;
+}
+
+function findSession(principal, wireSid, includeOpening = false, action = "replay") {
+  if (!scopedSessions()) {
+    const s = sessions.get(wireSid);
+    if (s) return { storageId: wireSid, session: s };
+    if (includeOpening && openingSessionInfo.has(wireSid)) {
+      return { storageId: wireSid, session: openingSessionInfo.get(wireSid), opening: true };
+    }
+    return null;
+  }
+  // Prefer the caller's own raw sid. An owner and visitor may independently
+  // choose the same browser sid; storage and supervisor wire ids stay distinct.
+  const live = findAccessibleSession(sessions, principal, machineOwnerAccountId, wireSid, action);
+  if (live) return live;
+  if (includeOpening) {
+    const opening = findAccessibleSession(
+      openingSessionInfo, principal, machineOwnerAccountId, wireSid, action,
+    );
+    if (opening) return { ...opening, opening: true };
+  }
+  return null;
+}
 
 // Binary frame format shared with the relay/browser:
 //   [1 byte sid length][sid utf8 bytes][payload bytes]
@@ -871,9 +988,48 @@ function encodeFrame(sid, payloadBuf) {
   const sidBuf = Buffer.from(sid, "utf8");
   return Buffer.concat([Buffer.from([sidBuf.length]), sidBuf, payloadBuf]);
 }
-function sendSessionData(sid, data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(encodeFrame(sid, Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8")), { binary: true });
+function sendBinary(frame, route = null) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (scopedSessions()) {
+    const wrapped = encodeAccountBinary(frame, route || ownerRoute());
+    if (wrapped) ws.send(wrapped, { binary: true });
+  } else if (legacySessions()) {
+    ws.send(frame, { binary: true });
+  }
+}
+
+function sendSessionDataForRoute(wireSid, data, route) {
+  const payload = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
+  sendBinary(encodeFrame(wireSid, payload), route);
+}
+
+function sendSessionData(storageId, data) {
+  const s = sessions.get(storageId);
+  if (!s) return;
+  if (!scopedSessions()) {
+    sendSessionDataForRoute(s.sid, data, null);
+    return;
+  }
+  sendSessionDataForRoute(s.sid, data, accountRoute(s.ownerAccountId));
+  if (s.ownerAccountId !== machineOwnerAccountId) {
+    const supervisorSid = wireSessionId(s, {
+      accountId: machineOwnerAccountId, accessVia: "owner", clientId: "supervisor",
+    }, machineOwnerAccountId);
+    sendSessionDataForRoute(supervisorSid, data, ownerRoute());
+  }
+}
+
+function sendSessionEvent(s, message) {
+  if (!scopedSessions()) {
+    sendCtl({ ...message, sid: s.sid });
+    return;
+  }
+  sendCtl({ ...message, sid: s.sid }, accountRoute(s.ownerAccountId));
+  if (s.ownerAccountId !== machineOwnerAccountId) {
+    const supervisorSid = wireSessionId(s, {
+      accountId: machineOwnerAccountId, accessVia: "owner", clientId: "supervisor",
+    }, machineOwnerAccountId);
+    sendCtl({ ...message, sid: supervisorSid }, ownerRoute());
   }
 }
 
@@ -889,8 +1045,8 @@ function writeSessionInput(s, input) {
   if (text) s.pty.write(text);
 }
 
-function openInProcessSession(sid, cols, rows) {
-  let s = sessions.get(sid);
+function openInProcessSession(storageId, sid, ownerAccountId, legacy, accessExpiresAt, cols, rows) {
+  let s = sessions.get(storageId);
   if (s) {
     if (s.graceTimer) { clearTimeout(s.graceTimer); s.graceTimer = null; }
     resizeSession(s, cols, rows);
@@ -904,18 +1060,23 @@ function openInProcessSession(sid, cols, rows) {
     env: process.env,
   });
   let sessionRecorder = null;
-  try { sessionRecorder = sessionLog?.open(sid, { cols, rows }) || null; }
+  try {
+    sessionRecorder = sessionLog?.open(storageId, {
+      sid, ownerAccountId, legacy, cols, rows,
+    }) || null;
+  }
   catch (e) { logErr(`[session ${sid}] recording unavailable: ${e.message}`); }
   let settleExit;
   const exitPromise = new Promise((resolve) => { settleExit = resolve; });
   const screen = new SessionScreen(cols, rows);
   s = {
+    storageId, sid, ownerAccountId, legacy: !!legacy, accessExpiresAt,
     pty: p, log: sessionRecorder, screen, inputDecoder: new StringDecoder("utf8"),
     offset: sessionRecorder?.stat().off || 0,
     logPaused: false, replayPaused: false, replayQueue: Promise.resolve(), graceTimer: null,
     startedAt: Date.now(), lastOutputAt: Date.now(), exitPromise, settleExit,
   };
-  sessions.set(sid, s);
+  sessions.set(storageId, s);
   p.onData((d) => {
     const output = Buffer.from(d, "utf8");
     s.lastOutputAt = Date.now();
@@ -929,16 +1090,16 @@ function openInProcessSession(sid, cols, rows) {
         if (!s.replayPaused) { try { p.resume(); } catch {} }
       });
     }
-    sendSessionData(sid, output);
+    sendSessionData(storageId, output);
   });
   p.onExit(({ exitCode }) => {
-    sessions.delete(sid);
+    sessions.delete(storageId);
     const closed = s.log?.close({ exitCode }) || Promise.resolve();
     void Promise.allSettled([closed, s.replayQueue]).finally(() => {
       s.screen.dispose();
       s.settleExit();
     });
-    sendCtl({ type: "exit", sid, code: exitCode });
+    sendSessionEvent(s, { type: "exit", code: exitCode });
     broadcastSessions();
     log(`[session ${sid}] shell exited (${exitCode})`);
   });
@@ -948,44 +1109,83 @@ function openInProcessSession(sid, cols, rows) {
 }
 
 function adoptHolder(client, recovered = false) {
-  const existing = sessions.get(client.sid);
+  const storageId = client.sid;
+  const existing = sessions.get(storageId);
   if (existing) {
     client.disconnect();
     return existing;
   }
   let settleExit;
   const exitPromise = new Promise((resolve) => { settleExit = resolve; });
+  let accessExpiresAt = Number.isFinite(client.accessExpiresAt) ? client.accessExpiresAt : null;
+  if (scopedSessions() && client.ownerAccountId !== machineOwnerAccountId &&
+      accountAccessExpiries.has(client.ownerAccountId)) {
+    accessExpiresAt = accountAccessExpiries.get(client.ownerAccountId);
+  }
   const s = {
+    storageId,
+    sid: client.publicSid || client.sid,
+    ownerAccountId: client.ownerAccountId || null,
+    legacy: !!client.legacy || !client.ownerAccountId,
+    accessExpiresAt,
     pty: client, holder: true, log: null, screen: null, inputDecoder: new StringDecoder("utf8"),
     offset: client.offset, replayQueue: Promise.resolve(), graceTimer: null,
     startedAt: client.startedAt || Date.now(),
     lastOutputAt: client.lastOutputAt || Date.now(),
     exitPromise, settleExit, finished: false,
   };
-  sessions.set(client.sid, s);
+  sessions.set(storageId, s);
+  if (client.accessExpiresAt !== accessExpiresAt) client.setAccessExpiry(accessExpiresAt);
   // The holder owns the writer, but the daemon's observer needs to discover a
   // newly-created record so history listing can include it immediately.
-  sessionLog?.stat(client.sid);
+  sessionLog?.stat(storageId);
 
   const finish = (code, reason) => {
     if (s.finished) return;
     s.finished = true;
     if (s.graceTimer) clearTimeout(s.graceTimer);
-    if (sessions.get(client.sid) === s) sessions.delete(client.sid);
+    if (sessions.get(storageId) === s) sessions.delete(storageId);
     s.settleExit();
-    sendCtl({ type: "exit", sid: client.sid, code });
+    sendSessionEvent(s, { type: "exit", code });
     broadcastSessions();
     log(`[session ${client.sid}] ${reason}${code == null ? "" : ` (${code})`}`);
   };
   client.on("data", (output) => {
     s.offset = client.offset;
     s.lastOutputAt = client.lastOutputAt || Date.now();
-    sendSessionData(client.sid, output);
+    if (s.pendingReplay?.remaining) {
+      const count = Math.min(s.pendingReplay.remaining, output.length);
+      if (count) sendSessionDataForRoute(s.pendingReplay.wireSid, output.subarray(0, count), s.pendingReplay.route);
+      s.pendingReplay.remaining -= count;
+      if (!s.pendingReplay.remaining) s.pendingReplay = null;
+      if (count < output.length) sendSessionData(storageId, output.subarray(count));
+    } else {
+      sendSessionData(storageId, output);
+    }
   });
-  client.on("reset", (message) => sendCtl(message));
+  client.on("reset", (message) => {
+    if (!scopedSessions()) {
+      sendCtl(message);
+      return;
+    }
+    const principal = browserClients.get(message.relayClientId);
+    if (!principal) return;
+    const { relayClientId, ...inner } = message;
+    sendCtl({ ...inner, sid: sessionWireId(s, principal) }, clientRoute(principal));
+  });
   client.on("session-replay", (message) => {
     s.offset = message.to;
-    sendCtl(message);
+    if (!scopedSessions()) {
+      s.pendingReplay = { route: null, wireSid: s.sid, remaining: message.bytes };
+      sendCtl(message);
+      return;
+    }
+    const principal = browserClients.get(message.relayClientId);
+    if (!principal) return;
+    const { relayClientId, ...inner } = message;
+    const wireSid = sessionWireId(s, principal);
+    s.pendingReplay = { route: clientRoute(principal), wireSid, remaining: message.bytes };
+    sendCtl({ ...inner, sid: wireSid }, clientRoute(principal));
   });
   client.on("holder-error", (message) => {
     logErr(`[session ${client.sid}] holder replay failed: ${message.message}`);
@@ -1000,23 +1200,48 @@ function adoptHolder(client, recovered = false) {
   return s;
 }
 
-async function openSession(sid, cols, rows) {
+async function openSession(principal, sid, cols, rows) {
   if (!validId(sid)) throw new Error("invalid session id");
-  let s = sessions.get(sid);
+  if (!rememberPrincipalAccessExpiry(principal)) throw new Error("machine access expired");
+  const found = findSession(principal, sid, true);
+  let storageId = found?.storageId;
+  let s = found?.session;
   if (s) {
+    if (found.opening) return openingSessions.get(storageId);
     if (s.graceTimer) { clearTimeout(s.graceTimer); s.graceTimer = null; }
-    resizeSession(s, cols, rows);
+    // An owner-supervisor may replay and close a visitor session, but viewing
+    // it must not resize or otherwise drive the visitor's PTY.
+    if (!scopedSessions() || canAccessSessionFor(
+      "resize", principal, s, machineOwnerAccountId,
+    )) resizeSession(s, cols, rows);
     return s;
   }
-  if (!USE_PTY_HOLDER) return openInProcessSession(sid, cols, rows);
-  if (openingSessions.has(sid)) return openingSessions.get(sid);
+  const ownerAccountId = scopedSessions() ? principal.accountId : null;
+  const accessExpiresAt = scopedSessions() && ownerAccountId !== machineOwnerAccountId
+    ? (accountAccessExpiries.has(ownerAccountId)
+      ? accountAccessExpiries.get(ownerAccountId)
+      : Number.isFinite(principal.expiresAt) ? principal.expiresAt : null)
+    : null;
+  storageId = scopedSessions() ? sessionStorageId(ownerAccountId, sid) : sid;
+  if (!USE_PTY_HOLDER) {
+    return openInProcessSession(
+      storageId, sid, ownerAccountId, false, accessExpiresAt, cols, rows,
+    );
+  }
+  if (openingSessions.has(storageId)) return openingSessions.get(storageId);
   const controller = new AbortController();
-  openingSessionAborts.set(sid, controller);
-  openingSessionInfo.set(sid, { sid, startedAt: Date.now(), cwd: process.env.HOME || process.cwd() });
+  openingSessionAborts.set(storageId, controller);
+  openingSessionInfo.set(storageId, {
+    storageId, sid, ownerAccountId, legacy: false, accessExpiresAt,
+    startedAt: Date.now(), cwd: process.env.HOME || process.cwd(),
+  });
   const opening = spawnPtyHolder({
     rootDir: sessionRoot,
     scope: sessionScope,
-    sid,
+    sid: storageId,
+    publicSid: sid,
+    ownerAccountId,
+    accessExpiresAt,
     shell: SHELL,
     cwd: process.env.HOME || process.cwd(),
     cols,
@@ -1025,33 +1250,33 @@ async function openSession(sid, cols, rows) {
     signal: controller.signal,
   }).then((client) => {
     const adopted = adoptHolder(client);
-    if (cancelledOpenSessions.delete(sid)) {
-      const exitPromise = killSession(sid);
+    if (cancelledOpenSessions.delete(storageId)) {
+      const exitPromise = killSession(storageId);
       throw Object.assign(new Error("session opening was cancelled"), {
         code: "ECANCELED", exitHandled: true, exitPromise,
       });
     }
-    for (const input of pendingSessionInput.get(sid) || []) writeSessionInput(adopted, input);
-    pendingSessionInput.delete(sid);
+    for (const input of pendingSessionInput.get(storageId) || []) writeSessionInput(adopted, input);
+    pendingSessionInput.delete(storageId);
     return adopted;
   }).finally(() => {
-    openingSessions.delete(sid);
-    openingSessionAborts.delete(sid);
-    openingSessionInfo.delete(sid);
-    cancelledOpenSessions.delete(sid);
-    pendingSessionInput.delete(sid);
+    openingSessions.delete(storageId);
+    openingSessionAborts.delete(storageId);
+    openingSessionInfo.delete(storageId);
+    cancelledOpenSessions.delete(storageId);
+    pendingSessionInput.delete(storageId);
   });
-  openingSessions.set(sid, opening);
+  openingSessions.set(storageId, opening);
   return opening;
 }
 
-function replaySession(sid, s, msg) {
+function replaySession(storageId, s, msg, principal) {
   if (s.holder) {
-    s.pty.replay(msg.since, msg.snapshot, msg.relayClientId);
+    s.pty.replay(msg.since, msg.snapshot, principal?.clientId || msg.relayClientId);
     return;
   }
   s.replayQueue = s.replayQueue.then(async () => {
-    if (!sessions.has(sid)) return;
+    if (!sessions.has(storageId)) return;
     s.replayPaused = true;
     try { s.pty.pause(); } catch {}
     try {
@@ -1062,20 +1287,20 @@ function replaySession(sid, s, msg) {
         currentOffset: s.offset,
         forceSnapshot: !!msg.snapshot,
       });
-      // The relay strips relayClientId and routes this metadata plus its following
-      // binary payload only to the browser that requested replay. Live output
-      // remains broadcast, so already attached terminals never receive duplicates.
+      const route = scopedSessions() ? clientRoute(principal) : null;
+      const wireSid = scopedSessions() ? sessionWireId(s, principal) : s.sid;
+      // Replay metadata and bytes use an exact authenticated client route. Live
+      // output follows the session account/owner audiences.
       if (replay.mode === "snapshot") {
-        sendCtl({ type: "reset", sid, offset: replay.to, relayClientId: msg.relayClientId });
+        sendCtl({ type: "reset", sid: wireSid, offset: replay.to }, route);
       }
       sendCtl({
-        type: "session-replay", sid, mode: replay.mode,
+        type: "session-replay", sid: wireSid, mode: replay.mode,
         from: replay.from, to: replay.to, bytes: replay.payload.length,
-        relayClientId: msg.relayClientId,
-      });
-      if (replay.payload.length) sendSessionData(sid, replay.payload);
+      }, route);
+      if (replay.payload.length) sendSessionDataForRoute(wireSid, replay.payload, route);
     } catch (error) {
-      logErr(`[session ${sid}] replay failed: ${error.message}`);
+      logErr(`[session ${s.sid}] replay failed: ${error.message}`);
     } finally {
       s.replayPaused = false;
       if (!s.logPaused) { try { s.pty.resume(); } catch {} }
@@ -1085,26 +1310,59 @@ function replaySession(sid, s, msg) {
 
 // Report the live session list so a browser can show/attach tabs (tmux-style):
 // sessions persist for the daemon's lifetime in bound mode and are reattachable.
-async function buildSessionList() {
+async function buildSessionList(principal = null) {
   while (true) {
-    const liveEntries = [...sessions.entries()];
+    const liveEntries = [...sessions.entries()].filter(([, session]) =>
+      !scopedSessions() || canAccessSessionFor("sessions", principal, session, machineOwnerAccountId));
     const openingEntries = [...openingSessionInfo.entries()]
-      .filter(([sid]) => !sessions.has(sid));
-    const list = await Promise.all(liveEntries.map(([sid, s]) =>
-      new Promise((res) => getShellCwd(sid, (cwd) => res({ sid, startedAt: s.startedAt, cwd })))));
-    const unchanged = liveEntries.length === sessions.size &&
-      liveEntries.every(([sid, s]) => sessions.get(sid) === s) &&
-      openingEntries.length === [...openingSessionInfo.keys()].filter((sid) => !sessions.has(sid)).length &&
-      openingEntries.every(([sid, info]) => openingSessionInfo.get(sid) === info && !sessions.has(sid));
+      .filter(([storageId, session]) => !sessions.has(storageId) &&
+        (!scopedSessions() || canAccessSessionFor("sessions", principal, session, machineOwnerAccountId)));
+    const list = await Promise.all(liveEntries.map(([storageId, s]) =>
+      new Promise((resolve) => getShellCwd(storageId, (cwd) => resolve({
+        sid: scopedSessions() ? sessionWireId(s, principal) : s.sid,
+        sessionSid: s.sid,
+        ownerAccountId: s.ownerAccountId,
+        mine: !scopedSessions() || s.ownerAccountId === principal.accountId,
+        legacy: !!s.legacy,
+        startedAt: s.startedAt,
+        cwd,
+      })))));
+    const visibleLive = [...sessions.entries()].filter(([, session]) =>
+      !scopedSessions() || canAccessSessionFor("sessions", principal, session, machineOwnerAccountId));
+    const visibleOpening = [...openingSessionInfo.entries()].filter(([storageId, session]) =>
+      !sessions.has(storageId) &&
+        (!scopedSessions() || canAccessSessionFor("sessions", principal, session, machineOwnerAccountId)));
+    const unchanged = liveEntries.length === visibleLive.length &&
+      liveEntries.every(([storageId, s]) => sessions.get(storageId) === s) &&
+      openingEntries.length === visibleOpening.length &&
+      openingEntries.every(([storageId, info]) => openingSessionInfo.get(storageId) === info && !sessions.has(storageId));
     if (!unchanged) continue;
-    for (const [, info] of openingEntries) list.push(info);
+    for (const [, info] of openingEntries) {
+      list.push({
+        sid: scopedSessions() ? sessionWireId(info, principal) : info.sid,
+        sessionSid: info.sid,
+        ownerAccountId: info.ownerAccountId,
+        mine: !scopedSessions() || info.ownerAccountId === principal.accountId,
+        legacy: !!info.legacy,
+        startedAt: info.startedAt,
+        cwd: info.cwd,
+      });
+    }
     return list;
   }
 }
 let sessionBroadcastQueue = Promise.resolve();
 function broadcastSessions() {
   const next = sessionBroadcastQueue.then(async () => {
-    try { sendCtl({ type: "sessions", list: await buildSessionList() }); } catch {}
+    try {
+      if (!scopedSessions()) {
+        sendCtl({ type: "sessions", list: await buildSessionList() });
+        return;
+      }
+      for (const principal of browserClients.values()) {
+        sendCtl({ type: "sessions", list: await buildSessionList(principal) }, clientRoute(principal));
+      }
+    } catch {}
   });
   sessionBroadcastQueue = next.catch(() => {});
   return next;
@@ -1154,6 +1412,7 @@ let stopping = false;
 async function stopDaemon(code) {
   if (stopping) return;
   stopping = true;
+  for (const accountId of accountExpiryTimers.keys()) clearAccountExpiryTimer(accountId);
   if (openingSessions.size) {
     await Promise.race([Promise.allSettled([...openingSessions.values()]), sleep(2000)]);
   }
@@ -1239,13 +1498,305 @@ let jobStore = null;
 let sessionLog = null;
 const PROTOCOL_FEATURES = [
   "cp-sha256-v1", "exec-options-v1", "jobs-v1", "history-v1", "session-replay-v1", "pty-holder-v1",
+  ACCOUNT_SESSIONS_FEATURE,
 ];
 
-function sendCtl(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+const FINAL_REQUEST_MESSAGES = new Set([
+  "capabilities", "dl-end", "dl-error", "ul-done", "ul-error", "exec-exit", "exec-job",
+  "job-list", "job-chunk", "job-status", "job-error", "sess-list", "sess-chunk", "sess-error",
+]);
+
+function beginRequest(principal, id) {
+  if (!scopedSessions() || !id) return true;
+  const route = clientRoute(principal);
+  const existing = requestRoutes.get(String(id));
+  if (existing) return sameClient(existing, principal);
+  requestRoutes.set(String(id), route);
+  return true;
+}
+
+function ownsRequest(principal, id) {
+  if (!scopedSessions()) return true;
+  return !!id && sameClient(requestRoutes.get(String(id)), principal);
+}
+
+function sendRequestCtl(obj, principal, callback = undefined) {
+  if (scopedSessions() && !ownsRequest(principal, obj?.id)) return false;
+  return sendCtl(obj, null, callback);
+}
+
+function encodedCtl(obj, route = null) {
+  if (scopedSessions()) {
+    // An id-bearing response belongs to the exact client that registered the
+    // request. If revocation/disconnect removed that route while async work was
+    // finishing, drop the late frame instead of falling back to the owner.
+    const target = daemonResponseRoute(obj, route, requestRoutes);
+    if (!target) return null;
+    return wrapDaemonJson(obj, target);
+  }
+  return legacySessions() ? JSON.stringify(obj) : null;
+}
+
+function sendCtl(obj, route = null, callback = undefined) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const encoded = encodedCtl(obj, route);
+  if (!encoded) return false;
+  ws.send(encoded, callback);
+  if (obj?.id && FINAL_REQUEST_MESSAGES.has(obj.type)) requestRoutes.delete(String(obj.id));
+  return true;
+}
+
+function adoptLegacyOwnership(ownerAccountId) {
+  let changed = sessionLog?.assignLegacyOwner(ownerAccountId) || 0;
+  const migratedJobs = jobStore?.assignLegacyOwner(ownerAccountId) || 0;
+  for (const s of sessions.values()) {
+    if (s.ownerAccountId) continue;
+    s.ownerAccountId = ownerAccountId;
+    s.legacy = true;
+    s.accessExpiresAt = null;
+    s.pty.setOwner?.(ownerAccountId, true);
+    s.pty.setAccessExpiry?.(null);
+    changed++;
+  }
+  if (changed) log(`[sessions] assigned ${changed} legacy session record(s) to the machine owner`);
+  if (migratedJobs) log(`[jobs] assigned ${migratedJobs} legacy job record(s) to the machine owner`);
+}
+
+function endClientRequests(principal) {
+  for (const [id, route] of requestRoutes) {
+    if (!sameClient(route, principal)) continue;
+    activeDownloads.get(id)?.destroy();
+    activeDownloads.delete(id);
+    const upload = activeUploads.get(id);
+    if (upload) {
+      upload.stream.destroy();
+      try { fs.unlinkSync(upload.finalPath); } catch {}
+      activeUploads.delete(id);
+    }
+    const running = activeExecs.get(id);
+    if (running && !running.detached) {
+      running.abandoned = true;
+      killExec(id, "SIGTERM");
+    }
+    requestRoutes.delete(id);
+  }
+}
+
+function terminateAccountSessions(accountId, reason) {
+  forgetAccountAccessExpiry(accountId);
+  const exits = [];
+  for (const [storageId] of ownedSessionEntries(openingSessionInfo, accountId)) {
+    const result = killSession(storageId);
+    if (result) exits.push(result);
+  }
+  for (const [storageId] of ownedSessionEntries(sessions, accountId)) {
+    const result = killSession(storageId);
+    if (result) exits.push(result);
+  }
+  for (const [clientId, principal] of browserClients) {
+    if (principal.accountId !== accountId) continue;
+    endClientRequests(principal);
+    browserClients.delete(clientId);
+  }
+  if (exits.length) log(`[sessions] terminating ${exits.length} session(s): ${reason}`);
+  void broadcastSessions();
+}
+
+function accountHasBrowser(accountId) {
+  return [...browserClients.values()].some((principal) => principal.accountId === accountId);
+}
+
+function handleRelayControl(message) {
+  switch (message.event) {
+    case "account-sessions":
+      if (message.version !== 1 || message.nonce !== ACCOUNT_PROTOCOL_NONCE ||
+          typeof message.ownerAccountId !== "string" || !message.ownerAccountId) return;
+      {
+        const reconciliation = reconcileGrantSnapshot(
+          [...openingSessionInfo.values(), ...sessions.values()],
+          message.ownerAccountId,
+          message.activeGrants,
+        );
+        if (!reconciliation) {
+          logErr("[relay] rejected malformed active-grant snapshot");
+          try { ws.close(1002, "invalid active-grant snapshot"); } catch {}
+          return;
+        }
+        machineOwnerAccountId = message.ownerAccountId;
+        accountProtocolState = "active";
+        adoptLegacyOwnership(machineOwnerAccountId);
+
+        // Existing deadlines may have come from the previous connection. Move
+        // them to the D1-authoritative value, and forget any account that is no
+        // longer active before accepting new browser frames.
+        for (const accountId of [...accountAccessExpiries.keys()]) {
+          const expiresAt = reconciliation.activeGrants.get(accountId);
+          if (!reconciliation.activeGrants.has(accountId) ||
+              (Number.isFinite(expiresAt) && expiresAt <= Date.now())) {
+            forgetAccountAccessExpiry(accountId);
+          } else {
+            setAccountAccessExpiry(accountId, expiresAt);
+          }
+        }
+        for (const [accountId, expiresAt] of reconciliation.retained) {
+          setAccountAccessExpiry(accountId, expiresAt);
+        }
+        for (const [accountId, reason] of reconciliation.ended) {
+          terminateAccountSessions(accountId, reason);
+        }
+        if (reconciliation.ended.size) {
+          log(`[sessions] reconciled ${reconciliation.ended.size} ended grant account(s)`);
+        }
+      }
+      void broadcastSessions();
+      sendStats();
+      break;
+    case "browser-status": {
+      if (!scopedSessions()) return;
+      const principal = {
+        accountId: message.accountId,
+        accessVia: message.accessVia,
+        clientId: message.clientId,
+        expiresAt: message.expiresAt,
+      };
+      if (!validPrincipal(principal)) return;
+      if (message.online) {
+        if (principalAccessExpired(principal)) {
+          terminateAccountSessions(principal.accountId, "access-expired");
+          return;
+        }
+        browserClients.set(principal.clientId, principal);
+        if (principal.accessVia === "grant") {
+          setAccountAccessExpiry(
+            principal.accountId,
+            grantExpiryForAccount(browserClients.values(), principal.accountId).expiresAt,
+          );
+        }
+        for (const [storageId, session] of sessions) {
+          if (session.ownerAccountId === principal.accountId) cancelSessionCleanup(storageId);
+        }
+        void buildSessionList(principal).then((list) => {
+          sendCtl({ type: "sessions", list }, clientRoute(principal));
+        });
+      } else {
+        browserClients.delete(principal.clientId);
+        endClientRequests(principal);
+        const remainingGrant = grantExpiryForAccount(browserClients.values(), principal.accountId);
+        if (remainingGrant.found) {
+          setAccountAccessExpiry(principal.accountId, remainingGrant.expiresAt);
+        }
+        if (!accountHasBrowser(principal.accountId)) {
+          for (const [storageId, session] of sessions) {
+            if (session.ownerAccountId === principal.accountId) scheduleSessionCleanup(storageId);
+          }
+        }
+      }
+      emitStatus("peer", { online: !!message.online, account: principal.accountId });
+      break;
+    }
+    case "access-revoked":
+    case "access-expired":
+      if (typeof message.accountId === "string" && message.accountId !== machineOwnerAccountId) {
+        terminateAccountSessions(message.accountId, message.event);
+      }
+      break;
+  }
+}
+
+function handleSessionInput(principal, data) {
+  if (!rememberPrincipalAccessExpiry(principal)) return;
+  if (!data?.length) return;
+  const sidLen = data[0];
+  if (!sidLen || data.length < 1 + sidLen) return;
+  const wireSid = data.toString("utf8", 1, 1 + sidLen);
+  const found = findSession(principal, wireSid, true, "input");
+  if (!found) return;
+  const input = data.subarray(1 + sidLen);
+  if (!found.opening) {
+    writeSessionInput(found.session, input);
+  } else {
+    const pending = pendingSessionInput.get(found.storageId) || [];
+    if (pending.reduce((sum, chunk) => sum + chunk.length, 0) + input.length <= 1024 * 1024) {
+      pending.push(Buffer.from(input));
+      pendingSessionInput.set(found.storageId, pending);
+    }
+  }
+}
+
+function handleBrowserControl(principal, msg) {
+  if (!rememberPrincipalAccessExpiry(principal)) return;
+  if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
+  const initialRequest = new Set([
+    "capabilities", "exec", "dl-open", "job-list", "job-read", "job-get",
+    "sess-list", "sess-read", "ul-open",
+  ]);
+  const continuation = new Set([
+    "exec-stdin", "exec-stdin-end", "dl-cancel", "ul-chunk", "ul-end",
+  ]);
+  if (initialRequest.has(msg.type) && !beginRequest(principal, msg.id)) return;
+  if (continuation.has(msg.type) && !ownsRequest(principal, msg.id)) return;
+
+  switch (msg.type) {
+    case "capabilities":
+      sendCtl({ type: "capabilities", id: msg.id, version: pkg.version, features: PROTOCOL_FEATURES });
+      break;
+    case "open": {
+      void openSession(principal, msg.sid, msg.cols, msg.rows).then((session) => {
+        replaySession(session.storageId, session, msg, principal);
+        sendStats();
+      }).catch((error) => {
+        logErr(`[session ${msg.sid}] could not open: ${error.message}`);
+        if (!error.exitHandled) {
+          sendCtl({ type: "exit", sid: msg.sid, code: null }, scopedSessions() ? clientRoute(principal) : null);
+        }
+      });
+      break;
+    }
+    case "resize": {
+      if (!(msg.cols > 0 && msg.rows > 0)) break;
+      const found = findSession(principal, msg.sid, false, "resize");
+      if (found) resizeSession(found.session, msg.cols, msg.rows);
+      break;
+    }
+    case "client-gone": break;
+    case "list-sessions":
+      if (scopedSessions()) {
+        void buildSessionList(principal).then((list) => {
+          sendCtl({ type: "sessions", list }, clientRoute(principal));
+        });
+      } else {
+        void broadcastSessions();
+      }
+      break;
+    case "close": {
+      const found = findSession(principal, msg.sid, true, "close");
+      if (found) { killSession(found.storageId); void broadcastSessions(); }
+      break;
+    }
+    case "ping":
+      sendCtl({ type: "pong", t: msg.t }, scopedSessions() ? clientRoute(principal) : null);
+      break;
+    case "exec": startExec(msg, principal); break;
+    case "exec-stdin": execStdin(msg.id, msg.data); break;
+    case "exec-stdin-end": execStdinEnd(msg.id, msg.sha256); break;
+    case "exec-kill": killExecForPrincipal(msg.id, msg.signal, principal); break;
+    case "dl-open": startDownload(msg.id, msg.path, msg.base === "home", principal); break;
+    case "dl-cancel": cancelDownload(msg.id); requestRoutes.delete(String(msg.id)); break;
+    case "job-list": sendJobList(msg.id, principal); break;
+    case "job-read": sendJobRead(msg, principal); break;
+    case "job-get": sendJobStatus(msg, principal); break;
+    case "sess-list": sendSessionLogList(msg.id, principal); break;
+    case "sess-read": sendSessionLogRead(msg, principal); break;
+    case "ul-open": startUpload(msg.id, msg.sid, msg.name, principal); break;
+    case "ul-chunk": uploadChunk(msg.id, msg.data); break;
+    case "ul-end": endUpload(msg.id); break;
+  }
 }
 
 function connect() {
+  accountProtocolState = BOUND ? "pending" : "legacy";
+  browserClients.clear();
+  requestRoutes.clear();
   ws = new WebSocket(wsUrl, {
     handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
     ...(AGENT ? { headers: { "x-switchboard-agent": AGENT } } : {}),
@@ -1298,18 +1849,11 @@ function connect() {
 
   ws.on("message", (data, isBinary) => {
     if (isBinary) {
-      // Keystrokes from a window: [1-byte sid length][sid][payload].
-      const sidLen = data[0];
-      const sid = data.toString("utf8", 1, 1 + sidLen);
-      const s = sessions.get(sid);
-      const input = data.subarray(1 + sidLen);
-      if (s) writeSessionInput(s, input);
-      else if (openingSessions.has(sid)) {
-        const pending = pendingSessionInput.get(sid) || [];
-        if (pending.reduce((sum, chunk) => sum + chunk.length, 0) + input.length <= 1024 * 1024) {
-          pending.push(Buffer.from(input));
-          pendingSessionInput.set(sid, pending);
-        }
+      if (scopedSessions()) {
+        const wrapped = unwrapBrowserBinary(data, ACCOUNT_PROTOCOL_NONCE);
+        if (wrapped) handleSessionInput(wrapped.principal, wrapped.message);
+      } else if (legacySessions()) {
+        handleSessionInput(null, data);
       }
       return;
     }
@@ -1321,64 +1865,35 @@ function connect() {
     }
     let msg;
     try { msg = JSON.parse(text); } catch { return; }
-    switch (msg.type) {
-      case "capabilities":
-        sendCtl({ type: "capabilities", id: msg.id, version: pkg.version, features: PROTOCOL_FEATURES });
-        break;
-      case "open": {
-        void openSession(msg.sid, msg.cols, msg.rows).then((session) => {
-          replaySession(msg.sid, session, msg);
-          sendStats();
-        }).catch((error) => {
-          logErr(`[session ${msg.sid}] could not open: ${error.message}`);
-          if (!error.exitHandled) sendCtl({ type: "exit", sid: msg.sid, code: null });
-        });
-        break;
-      }
-      case "resize": {
-        if (!(msg.cols > 0 && msg.rows > 0)) break;
-        const s = sessions.get(msg.sid);
-        if (s) resizeSession(s, msg.cols, msg.rows);
-        break;
-      }
-      // Kept for old browser clients. Cleanup is driven by peer-status below,
-      // because one of several attached tabs closing must not age out a shell
-      // that another tab is still using.
-      case "client-gone": break;
-      case "list-sessions": broadcastSessions(); break;
-      case "close": killSession(msg.sid); broadcastSessions(); break;
-      case "ping": sendCtl({ type: "pong", t: msg.t }); break; // browser↔daemon RTT probe
-      case "exec": startExec(msg); break;
-      case "exec-stdin": execStdin(msg.id, msg.data); break;
-      case "exec-stdin-end": execStdinEnd(msg.id, msg.sha256); break;
-      case "exec-kill": killExec(msg.id, msg.signal); break;
-      case "dl-open": startDownload(msg.id, msg.path, msg.base === "home"); break;
-      case "dl-cancel": cancelDownload(msg.id); break;
-      case "job-list": sendJobList(msg.id); break;
-      case "job-read": sendJobRead(msg); break;
-      case "job-get": sendJobStatus(msg); break;
-      case "sess-list": sendSessionLogList(msg.id); break;
-      case "sess-read": sendSessionLogRead(msg); break;
-      case "ul-open": startUpload(msg.id, msg.sid, msg.name); break;
-      case "ul-chunk": uploadChunk(msg.id, msg.data); break;
-      case "ul-end": endUpload(msg.id); break;
-      case "peer-status":
-        log("[relay] browser " + (msg.online ? "connected" : "disconnected"));
-        emitStatus("peer", { online: !!msg.online });
-        for (const sid of sessions.keys()) {
-          if (msg.online) cancelSessionCleanup(sid);
-          else scheduleSessionCleanup(sid);
-        }
-        // Nobody is left on this circuit, so no running command still has a
-        // caller: its output is going nowhere and nothing can stop it any more.
-        // This is the SIGHUP an ssh session would have delivered.
-        if (!msg.online) {
-          for (const [id, running] of activeExecs) {
-            if (!running.detached) killExec(id, "SIGTERM");
-          }
-        }
-        break;
+    if (msg.type === "_relay") {
+      handleRelayControl(msg);
+      return;
     }
+    if (scopedSessions()) {
+      const wrapped = unwrapBrowserJson(msg, ACCOUNT_PROTOCOL_NONCE);
+      if (wrapped) handleBrowserControl(wrapped.principal, wrapped.message);
+      return;
+    }
+    // A relay predating account-sessions-v1 ignores the daemon's protocol query
+    // and forwards browser frames directly. Keep the pre-existing shared mode
+    // for the machine owner, but never infer account ownership from those frames.
+    if (BOUND && accountProtocolState === "pending") {
+      accountProtocolState = "legacy";
+      logErr("[relay] account session scoping was not negotiated; grants require a relay/daemon upgrade");
+    }
+    if (msg.type === "peer-status") {
+      log("[relay] browser " + (msg.online ? "connected" : "disconnected"));
+      emitStatus("peer", { online: !!msg.online });
+      for (const storageId of sessions.keys()) {
+        if (msg.online) cancelSessionCleanup(storageId);
+        else scheduleSessionCleanup(storageId);
+      }
+      if (!msg.online) {
+        for (const [id, running] of activeExecs) if (!running.detached) killExec(id, "SIGTERM");
+      }
+      return;
+    }
+    handleBrowserControl(null, msg);
   });
 
   ws.on("close", (code) => {
@@ -1462,23 +1977,30 @@ function openUniqueFile(dir, name) {
   throw new Error("too many name collisions");
 }
 
-function startUpload(id, sid, name) {
-  getShellCwd(sid, (dir) => {
+function startUpload(id, sid, name, principal) {
+  const found = findSession(principal, sid, false, "upload");
+  if (!found) {
+    sendRequestCtl({ type: "ul-error", id, message: "no accessible shell for upload" }, principal);
+    return;
+  }
+  getShellCwd(found.storageId, (dir) => {
+    if (scopedSessions() && !ownsRequest(principal, id)) return;
     const safe = path.basename(String(name || "")).trim() || "upload";
     let opened;
     try {
       opened = openUniqueFile(dir, safe);
     } catch (e) {
-      sendCtl({ type: "ul-error", id, message: e.message });
+      sendRequestCtl({ type: "ul-error", id, message: e.message }, principal);
       return;
     }
     const stream = fs.createWriteStream(null, { fd: opened.fd });
-    activeUploads.set(id, { stream, finalPath: opened.finalPath });
+    activeUploads.set(id, { stream, finalPath: opened.finalPath, principal });
     stream.on("error", (e) => {
       activeUploads.delete(id);
-      sendCtl({ type: "ul-error", id, message: e.message });
+      try { fs.unlinkSync(opened.finalPath); } catch {}
+      sendRequestCtl({ type: "ul-error", id, message: e.message }, principal);
     });
-    sendCtl({ type: "ul-ready", id });
+    sendRequestCtl({ type: "ul-ready", id }, principal);
   });
 }
 
@@ -1492,15 +2014,18 @@ function endUpload(id) {
   if (!up) return;
   up.stream.end(() => {
     activeUploads.delete(id);
-    sendCtl({ type: "ul-done", id, path: up.finalPath, name: path.basename(up.finalPath) });
+    sendRequestCtl(
+      { type: "ul-done", id, path: up.finalPath, name: path.basename(up.finalPath) },
+      up.principal,
+    );
     log(`[file] received ${up.finalPath}`);
   });
 }
 
 // Stream a host file to the browser as base64 chunks, with backpressure.
-function startDownload(id, rawPath, relativeToHome = false) {
+function startDownload(id, rawPath, relativeToHome = false, principal = null) {
   if (!rawPath) {
-    sendCtl({ type: "dl-error", id, message: "no path given" });
+    sendRequestCtl({ type: "dl-error", id, message: "no path given" }, principal);
     return;
   }
   let filePath = rawPath;
@@ -1513,39 +2038,49 @@ function startDownload(id, rawPath, relativeToHome = false) {
   filePath = relativeToHome ? path.resolve(os.homedir(), filePath) : path.resolve(filePath);
 
   fs.stat(filePath, (err, st) => {
+    if (scopedSessions() && !ownsRequest(principal, id)) return;
     if (err) {
-      sendCtl({ type: "dl-error", id, message: err.code === "ENOENT" ? "no such file" : err.message });
+      sendRequestCtl(
+        { type: "dl-error", id, message: err.code === "ENOENT" ? "no such file" : err.message },
+        principal,
+      );
       return;
     }
     if (st.isDirectory()) {
-      sendCtl({ type: "dl-error", id, message: "path is a directory" });
+      sendRequestCtl({ type: "dl-error", id, message: "path is a directory" }, principal);
       return;
     }
     if (!st.isFile()) {
-      sendCtl({ type: "dl-error", id, message: "path is not a regular file" });
+      sendRequestCtl({ type: "dl-error", id, message: "path is not a regular file" }, principal);
       return;
     }
-    sendCtl({ type: "dl-meta", id, name: path.basename(filePath), size: st.size, mime: "application/octet-stream" });
+    sendRequestCtl({
+      type: "dl-meta", id, name: path.basename(filePath), size: st.size, mime: "application/octet-stream",
+    }, principal);
 
     const hash = crypto.createHash("sha256");
     const stream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
     activeDownloads.set(id, stream);
     stream.on("data", (chunk) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) { stream.destroy(); return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN ||
+          (scopedSessions() && !ownsRequest(principal, id))) {
+        stream.destroy();
+        return;
+      }
       hash.update(chunk);
       stream.pause(); // resume once this chunk has flushed -> backpressure
-      ws.send(JSON.stringify({ type: "dl-chunk", id, data: chunk.toString("base64") }), () => {
+      sendRequestCtl({ type: "dl-chunk", id, data: chunk.toString("base64") }, principal, () => {
         if (ws && ws.readyState === WebSocket.OPEN) stream.resume();
       });
     });
     stream.on("end", () => {
       activeDownloads.delete(id);
-      sendCtl({ type: "dl-end", id, sha256: hash.digest("hex") });
+      sendRequestCtl({ type: "dl-end", id, sha256: hash.digest("hex") }, principal);
       log(`[file] sent ${filePath} (${st.size} bytes)`);
     });
     stream.on("error", (e) => {
       activeDownloads.delete(id);
-      sendCtl({ type: "dl-error", id, message: e.message });
+      sendRequestCtl({ type: "dl-error", id, message: e.message }, principal);
     });
   });
 }
@@ -1569,18 +2104,20 @@ function cancelDownload(id) {
 const activeExecs = new Map();
 const MAX_EXECS = 8;
 
-function execFail(id, message) {
-  sendCtl({ type: "exec-exit", id, code: 126, error: message });
+function execFail(id, message, principal = null) {
+  sendRequestCtl({ type: "exec-exit", id, code: 126, error: message }, principal);
 }
 
-function startExec(msg) {
+function startExec(msg, principal = null) {
   const id = msg.id;
   if (!id || activeExecs.has(id)) return;
   let cmd = typeof msg.cmd === "string" ? msg.cmd.trim() : "";
-  if (!cmd) return execFail(id, "empty command");
+  if (!cmd) return execFail(id, "empty command", principal);
   // A peer is already trusted to run anything here; the cap is against a runaway
   // loop on the other end, not against its author.
-  if (activeExecs.size >= MAX_EXECS) return execFail(id, `too many concurrent commands (max ${MAX_EXECS})`);
+  if (activeExecs.size >= MAX_EXECS) {
+    return execFail(id, `too many concurrent commands (max ${MAX_EXECS})`, principal);
+  }
 
   let cwd = msg.cwd ? String(msg.cwd) : os.homedir();
   if (cwd === "~" || cwd.startsWith("~/")) cwd = path.join(os.homedir(), cwd.slice(1));
@@ -1623,16 +2160,21 @@ function startExec(msg) {
       }
     }
   } catch (e) {
-    return execFail(id, e.code === "ENOENT" ? `target directory does not exist: ${path.dirname(String(msg.upload?.path || ""))}` : e.message);
+    return execFail(id, e.code === "ENOENT"
+      ? `target directory does not exist: ${path.dirname(String(msg.upload?.path || ""))}`
+      : e.message, principal);
   }
 
   let job = null;
   if (detached) {
     try {
-      job = jobStore.create({ id, command: cmd, cwd, shell: selectedShell, login });
+      job = jobStore.create({
+        id, command: cmd, cwd, shell: selectedShell, login,
+        ownerAccountId: scopedSessions() ? principal.accountId : null,
+      });
     } catch (e) {
       if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
-      return execFail(id, e.message);
+      return execFail(id, e.message, principal);
     }
   }
 
@@ -1649,12 +2191,12 @@ function startExec(msg) {
   } catch (e) {
     if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
     if (job) void jobStore.finish(id, { status: "failed", error: e.message });
-    return execFail(id, e.message);
+    return execFail(id, e.message, principal);
   }
-  activeExecs.set(id, { child, detached, upload });
+  activeExecs.set(id, { child, detached, upload, principal });
   log(`[exec ${id.slice(0, 8)}] ${cmd}`);
-  if (detached) sendCtl({ type: "exec-job", id, job: id });
-  else if (upload) sendCtl({ type: "exec-ready", id });
+  if (detached) sendRequestCtl({ type: "exec-job", id, job: id }, principal);
+  else if (upload) sendRequestCtl({ type: "exec-ready", id }, principal);
   if (detached) {
     jobStore.writer(id)?.on("error", (e) => {
       const running = activeExecs.get(id);
@@ -1681,9 +2223,15 @@ function startExec(msg) {
         }
         return;
       }
-      if (!ws || ws.readyState !== WebSocket.OPEN) { killExec(id); return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN ||
+          (scopedSessions() && !ownsRequest(principal, id))) {
+        const running = activeExecs.get(id);
+        if (running) running.abandoned = true;
+        killExec(id);
+        return;
+      }
       stream.pause();
-      ws.send(JSON.stringify({ type, id, data: chunk.toString("base64") }), () => {
+      sendRequestCtl({ type, id, data: chunk.toString("base64") }, principal, () => {
         if (ws && ws.readyState === WebSocket.OPEN) stream.resume();
       });
     });
@@ -1701,7 +2249,7 @@ function startExec(msg) {
     if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
     const message = e.code === "ENOENT" ? `shell or working directory not found (${selectedShell}, ${cwd})` : e.message;
     if (detached) void jobStore.finish(id, { status: "failed", error: message });
-    else execFail(id, message);
+    else execFail(id, message, principal);
   });
   child.on("close", async (code, signal) => {
     const running = activeExecs.get(id);
@@ -1737,7 +2285,10 @@ function startExec(msg) {
         error: outputError ? `could not save job output: ${outputError.message}` : error,
       });
     } else if (!running.abandoned) {
-      sendCtl({ type: "exec-exit", id, code: code == null ? null : code, signal: signal || null, error, sha256 });
+      sendRequestCtl({
+        type: "exec-exit", id, code: code == null ? null : code,
+        signal: signal || null, error, sha256,
+      }, principal);
     }
     log(`[exec ${id.slice(0, 8)}] exited (${signal || code})`);
   });
@@ -1748,7 +2299,7 @@ function execStdin(id, b64) {
   const child = running?.child;
   if (child && child.stdin.writable) {
     child.stdin.write(Buffer.from(String(b64 || ""), "base64"), () => {
-      if (running.upload) sendCtl({ type: "exec-stdin-ready", id });
+      if (running.upload) sendRequestCtl({ type: "exec-stdin-ready", id }, running.principal);
     });
   }
 }
@@ -1779,37 +2330,106 @@ function killExec(id, signal) {
   } catch { try { child.kill(sig); } catch {} }
 }
 
-function sendJobList(id) {
-  if (!id) return;
-  sendCtl({ type: "job-list", id, jobs: jobStore.list() });
-}
-function sendJobRead(msg) {
-  if (!msg.id || !msg.job) return;
-  try {
-    const chunk = jobStore.read(String(msg.job), msg.offset, 64 * 1024);
-    sendCtl({
-      type: "job-chunk", id: msg.id, job: msg.job, data: chunk.data.toString("base64"),
-      offset: chunk.offset, size: chunk.size, record: jobStore.get(String(msg.job)),
-    });
-  } catch (e) {
-    sendCtl({ type: "job-error", id: msg.id, job: msg.job, message: e.message });
+function killExecForPrincipal(id, signal, principal) {
+  const running = activeExecs.get(id);
+  if (!running) return false;
+  if (scopedSessions()) {
+    if (running.detached) {
+      const record = jobStore.get(id);
+      if (!canAccessJobFor("job-kill", principal, record, machineOwnerAccountId)) return false;
+    } else if (!ownsRequest(principal, id)) {
+      return false;
+    }
   }
-}
-function sendJobStatus(msg) {
-  if (!msg.id || !msg.job) return;
-  const record = jobStore.get(String(msg.job));
-  sendCtl(record
-    ? { type: "job-status", id: msg.id, job: msg.job, record }
-    : { type: "job-error", id: msg.id, job: msg.job, message: "no such job" });
+  killExec(id, signal);
+  return true;
 }
 
-function sendSessionLogList(id) {
-  if (!id) return;
-  sendCtl(sessionLogListResponse(sessionLog, id));
+function accessibleJob(principal, id, action) {
+  const record = jobStore.get(String(id));
+  if (!record || (scopedSessions() &&
+      !canAccessJobFor(action, principal, record, machineOwnerAccountId))) return null;
+  return record;
 }
-function sendSessionLogRead(msg) {
+
+function sendJobList(id, principal) {
+  if (!id) return;
+  const jobs = jobStore.list().filter((record) =>
+    !scopedSessions() || canAccessJobFor("job-list", principal, record, machineOwnerAccountId));
+  sendRequestCtl({ type: "job-list", id, jobs }, principal);
+}
+function sendJobRead(msg, principal) {
+  if (!msg.id || !msg.job) return;
+  try {
+    const record = accessibleJob(principal, msg.job, "job-read");
+    if (!record) throw new Error("no such accessible job");
+    const chunk = jobStore.read(String(msg.job), msg.offset, 64 * 1024);
+    sendRequestCtl({
+      type: "job-chunk", id: msg.id, job: msg.job, data: chunk.data.toString("base64"),
+      offset: chunk.offset, size: chunk.size, record,
+    }, principal);
+  } catch (e) {
+    sendRequestCtl({ type: "job-error", id: msg.id, job: msg.job, message: e.message }, principal);
+  }
+}
+function sendJobStatus(msg, principal) {
+  if (!msg.id || !msg.job) return;
+  const record = accessibleJob(principal, msg.job, "job-get");
+  sendRequestCtl(record
+    ? { type: "job-status", id: msg.id, job: msg.job, record }
+    : { type: "job-error", id: msg.id, job: msg.job, message: "no such accessible job" }, principal);
+}
+
+function visibleHistory(principal, action = "history-list") {
+  if (!sessionLog) return [];
+  if (!scopedSessions()) return sessionLog.list();
+  return sessionLog.list().filter((record) =>
+    canAccessSessionFor(action, principal, record, machineOwnerAccountId));
+}
+
+function historyRecord(principal, wireSid) {
+  for (const record of visibleHistory(principal, "history-read")) {
+    const visibleSid = scopedSessions() ? sessionWireId(record, principal) : record.sid;
+    if (visibleSid === wireSid) return { record, visibleSid };
+  }
+  return null;
+}
+
+function sendSessionLogList(id, principal) {
+  if (!id) return;
+  if (!scopedSessions()) {
+    sendCtl(sessionLogListResponse(sessionLog, id));
+    return;
+  }
+  const sessionsForPrincipal = visibleHistory(principal).map((record) => {
+    const { storageId, ...visible } = record;
+    return {
+      ...visible,
+      sid: sessionWireId(record, principal),
+      sessionSid: record.sid,
+      mine: record.ownerAccountId === principal.accountId,
+    };
+  });
+  sendCtl({ type: "sess-list", id, recording: !!sessionLog, sessions: sessionsForPrincipal });
+}
+function sendSessionLogRead(msg, principal) {
   if (!msg.id || !msg.sid) return;
-  sendCtl(sessionLogReadResponse(sessionLog, msg));
+  if (!scopedSessions()) {
+    sendCtl(sessionLogReadResponse(sessionLog, msg));
+    return;
+  }
+  const found = historyRecord(principal, msg.sid);
+  if (!found) {
+    sendCtl({ type: "sess-error", id: msg.id, sid: msg.sid, message: "no accessible session" });
+    return;
+  }
+  const response = sessionLogReadResponse(sessionLog, { ...msg, sid: found.record.storageId });
+  response.sid = found.visibleSid;
+  if (response.stat) {
+    const { storageId, ...stat } = response.stat;
+    response.stat = { ...stat, sid: found.visibleSid };
+  }
+  sendCtl(response);
 }
 
 // ---- host metrics --------------------------------------------------------
@@ -1837,6 +2457,44 @@ function primaryIp() {
     }
   }
   return "127.0.0.1";
+}
+
+function activityForPrincipal(principal) {
+  const visible = scopedSessions()
+    ? new Map([...sessions].filter(([, session]) =>
+      canAccessSessionFor("activity", principal, session, machineOwnerAccountId)))
+    : sessions;
+  const act = activity.snapshot(visible, cwdCache);
+  act.shells = (act.shells || []).map((shell) => {
+    const session = sessions.get(shell.sid);
+    return session ? { ...shell, sid: scopedSessions() ? sessionWireId(session, principal) : session.sid } : shell;
+  });
+  if (scopedSessions() && principal.accessVia === "grant") {
+    // Process/agent summaries are host-wide and can describe an owner's hidden
+    // work even when no terminal frame crosses the account boundary.
+    act.top = [];
+    delete act.agents;
+    delete act.agentsIdle;
+  }
+  act.platform = process.platform;
+  act.arch = process.arch;
+  return act;
+}
+
+function statsMessage(cpu, memUsed, total, cores, act) {
+  return {
+    type: "stats",
+    cpu,
+    memUsed,
+    memTotal: total,
+    cores,
+    ip: primaryIp(),
+    host: os.hostname(),
+    platform: process.platform,
+    arch: process.arch,
+    rtt: lastRtt,
+    act,
+  };
 }
 
 // total - freemem overstates "used" (page cache etc.); track *available* memory.
@@ -1888,25 +2546,27 @@ function sendStats() {
   // What the machine is *doing* — process names, idle times, and (opt-in) live
   // Claude Code sessions. cpu alone can't answer this: an agent blocked on an
   // API call looks exactly like an idle machine.
-  const act = activity.snapshot(sessions, cwdCache);
-  // Activity is already persisted as an opaque blob by old relays, which lets
-  // new CLIs discover OS/arch without a schema migration or relay deployment.
-  act.platform = process.platform;
-  act.arch = process.arch;
+  const ownerPrincipal = scopedSessions() ? {
+    accountId: machineOwnerAccountId, accessVia: "owner", clientId: "daemon-owner-view",
+  } : null;
+  const act = activityForPrincipal(ownerPrincipal);
   try {
-    ws.send(JSON.stringify({
-      type: "stats",
-      cpu,
-      memUsed,
-      memTotal: total,
-      cores,
-      ip: primaryIp(),
-      host: os.hostname(),
-      platform: process.platform,
-      arch: process.arch,
-      rtt: lastRtt, // relay-edge round-trip from the previous tick (ms)
-      act,
-    }));
+    const ownerStats = statsMessage(cpu, memUsed, total, cores, act);
+    if (scopedSessions()) {
+      // The owner copy is both the supervisory live view and the only heartbeat
+      // persisted by the relay. Each grantee receives an account-filtered copy.
+      sendCtl(ownerStats, ownerRoute());
+      const guests = new Map();
+      for (const principal of browserClients.values()) {
+        if (principal.accessVia === "grant") guests.set(principal.accountId, principal);
+      }
+      for (const principal of guests.values()) {
+        sendCtl(statsMessage(cpu, memUsed, total, cores, activityForPrincipal(principal)),
+          accountRoute(principal.accountId));
+      }
+    } else if (legacySessions()) {
+      ws.send(JSON.stringify(ownerStats));
+    }
     emitStatus("stats", { cpu, memUsed, memTotal: total, cores, rtt: lastRtt, act });
     // Probe the relay edge for the next tick's rtt (auto-ponged, no DO wake).
     pingSentAt = Date.now();

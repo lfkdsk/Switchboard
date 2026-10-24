@@ -68,3 +68,45 @@ test("completed records and output survive a daemon restart", async () => {
   assert.equal(reloaded.read("job-done").data.toString(), "done");
   fs.rmSync(dir, { recursive: true });
 });
+
+test("trusted job ownership survives completion and daemon restart", async () => {
+  const { dir, store } = tempStore();
+  const created = store.create({
+    id: "job-owned", command: "printf private", cwd: "/tmp", shell: "/bin/sh", login: false,
+    ownerAccountId: "visitor-1",
+    // Browser-shaped identity fields are not part of the persisted ownership contract.
+    accountId: "forged-owner",
+    principal: { accountId: "forged-owner" },
+  });
+  assert.equal(created.ownerAccountId, "visitor-1");
+  assert.equal("accountId" in created, false);
+  assert.equal("principal" in created, false);
+  store.append("job-owned", "private");
+  await store.finish("job-owned", { exitCode: 0 });
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, "job-owned.json"), "utf8"));
+  assert.equal(persisted.ownerAccountId, "visitor-1");
+  const reloaded = new JobStore({ dir }).init();
+  assert.equal(reloaded.get("job-owned").ownerAccountId, "visitor-1");
+  assert.equal(reloaded.read("job-owned").data.toString(), "private");
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("legacy unowned records migrate once to the trusted machine owner", async () => {
+  const { dir, store } = tempStore();
+  store.create({
+    id: "job-legacy", command: "printf legacy", cwd: "/tmp", shell: "/bin/sh", login: false,
+  });
+  await store.finish("job-legacy", { exitCode: 0 });
+
+  const reloaded = new JobStore({ dir }).init();
+  assert.equal(reloaded.get("job-legacy").ownerAccountId, null);
+  assert.equal(reloaded.get("job-legacy").legacy, true);
+  assert.equal(reloaded.assignLegacyOwner("owner-1"), 1);
+  assert.equal(reloaded.assignLegacyOwner("owner-1"), 0);
+
+  const migrated = new JobStore({ dir }).init().get("job-legacy");
+  assert.equal(migrated.ownerAccountId, "owner-1");
+  assert.equal(migrated.legacy, true);
+  fs.rmSync(dir, { recursive: true });
+});

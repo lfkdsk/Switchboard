@@ -210,6 +210,7 @@ async function routeWebSocket(request, env, url) {
         url.searchParams.get("arch") || null,
       );
       if (!ok) return new Response("machine is owned by another account\n", { status: 403 });
+      request = withBrowserAccess(request, account.id, { via: "owner", expiresAt: null });
     } else {
       // A client is a signed-in browser or an account's agent token. Both may
       // use owned machines and explicit live grants. Software connections still

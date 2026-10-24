@@ -15,6 +15,7 @@ const DATA_PACKET = 1;
 const MAX_PACKET_BYTES = 64 * 1024 * 1024;
 const CONNECT_TIMEOUT_MS = 5000;
 const START_TIMEOUT_MS = 10000;
+const MAX_TIMER_DELAY_MS = 0x7fffffff;
 let lockClaimCounter = 0;
 
 function usePtyHolder(platform = process.platform) {
@@ -95,6 +96,10 @@ class PtyHolderClient extends EventEmitter {
       if (payload.type === "ready") {
         this.ready = true;
         this.sid = payload.sid;
+        this.publicSid = payload.publicSid || payload.sid;
+        this.ownerAccountId = payload.ownerAccountId || null;
+        this.legacy = !!payload.legacy;
+        this.accessExpiresAt = Number.isFinite(payload.accessExpiresAt) ? payload.accessExpiresAt : null;
         this.pid = payload.pid;
         this.holderPid = payload.holderPid;
         this.process = payload.process;
@@ -160,6 +165,19 @@ class PtyHolderClient extends EventEmitter {
 
   replay(since, snapshot, relayClientId) {
     this.sendControl({ type: "replay", since, snapshot: !!snapshot, relayClientId });
+  }
+
+  setOwner(ownerAccountId, legacy = false) {
+    if (typeof ownerAccountId !== "string" || !ownerAccountId) return;
+    this.ownerAccountId = ownerAccountId;
+    this.legacy = !!legacy;
+    this.sendControl({ type: "set-owner", ownerAccountId, legacy: !!legacy });
+  }
+
+  setAccessExpiry(accessExpiresAt) {
+    const value = Number.isFinite(accessExpiresAt) ? accessExpiresAt : null;
+    this.accessExpiresAt = value;
+    this.sendControl({ type: "set-access-expiry", accessExpiresAt: value });
   }
 
   kill() { this.sendControl({ type: "kill" }); }
@@ -231,6 +249,10 @@ async function spawnPtyHolder(options) {
     rootDir: options.rootDir,
     scope: options.scope,
     sid: options.sid,
+    publicSid: options.publicSid || options.sid,
+    ownerAccountId: options.ownerAccountId || null,
+    legacy: !!options.legacy,
+    accessExpiresAt: Number.isFinite(options.accessExpiresAt) ? options.accessExpiresAt : null,
     shell: options.shell,
     cwd: options.cwd,
     cols: dimension(options.cols, 80),
@@ -338,12 +360,34 @@ async function runHolder(config) {
   const cols = dimension(config.cols, 80);
   const rows = dimension(config.rows, 24);
   const startedAt = Date.now();
+  const savedOwnership = readOwnership(sessionDir);
+  // A newly spawned holder receives identity and expiry from the current
+  // authenticated open. Persisted metadata is only a migration fallback; an
+  // old deadline must not override a renewed grant when a closed sid is reused.
+  let publicSid = validId(config.publicSid) ? config.publicSid
+    : validId(savedOwnership?.sid) ? savedOwnership.sid : config.sid;
+  const configuredOwner = typeof config.ownerAccountId === "string" && config.ownerAccountId
+    ? config.ownerAccountId : null;
+  let ownerAccountId = configuredOwner ||
+    (typeof savedOwnership?.ownerAccountId === "string" && savedOwnership.ownerAccountId
+      ? savedOwnership.ownerAccountId : null);
+  let legacy = configuredOwner ? !!config.legacy
+    : savedOwnership ? !!savedOwnership.legacy : !!config.legacy;
+  let accessExpiresAt = configuredOwner
+    ? (Number.isFinite(config.accessExpiresAt) ? config.accessExpiresAt : null)
+    : Number.isFinite(savedOwnership?.accessExpiresAt) ? savedOwnership.accessExpiresAt
+      : Number.isFinite(config.accessExpiresAt) ? config.accessExpiresAt : null;
+  if (ownerAccountId) {
+    writeOwnership(sessionDir, { sid: publicSid, ownerAccountId, legacy, accessExpiresAt });
+  }
   const screen = new SessionScreen(cols, rows);
   let sessionLog = null;
   let log = null;
   if (config.recording !== false) {
     sessionLog = new SessionLogStore({ dir: config.rootDir, scope: config.scope }).init();
-    log = sessionLog.open(config.sid, { cols, rows });
+    log = sessionLog.open(config.sid, {
+      sid: publicSid, ownerAccountId, legacy, cols, rows,
+    });
   }
   let offset = log?.stat().off || 0;
   let lastOutputAt = startedAt;
@@ -353,6 +397,7 @@ async function runHolder(config) {
   let closing = false;
   let killTimer = null;
   let leaseTimer = null;
+  let accessTimer = null;
   const graceMs = Number.isSafeInteger(config.graceMs) && config.graceMs >= 0
     ? config.graceMs : parseSessionGrace(undefined);
   const clients = new Set();
@@ -390,6 +435,20 @@ async function runHolder(config) {
     clearTimeout(leaseTimer);
     leaseTimer = null;
   };
+  const armAccessExpiry = () => {
+    clearTimeout(accessTimer);
+    accessTimer = null;
+    if (closing || !Number.isFinite(accessExpiresAt)) return;
+    const remaining = accessExpiresAt - Date.now();
+    if (remaining <= 0) {
+      terminateShell();
+      return;
+    }
+    // Node clamps larger delays to 1ms. Re-arm in bounded chunks so grants
+    // that last longer than ~24 days do not expire immediately.
+    accessTimer = setTimeout(armAccessExpiry, Math.min(remaining, MAX_TIMER_DELAY_MS));
+    accessTimer.unref?.();
+  };
 
   shell.onData((value) => {
     const output = Buffer.from(value, "utf8");
@@ -413,6 +472,10 @@ async function runHolder(config) {
     send(socket, control({
       type: "ready",
       sid: config.sid,
+      publicSid,
+      ownerAccountId,
+      legacy,
+      accessExpiresAt,
       pid: shell.pid,
       holderPid: process.pid,
       process: shell.process,
@@ -475,6 +538,22 @@ async function runHolder(config) {
             }
           });
           break;
+        case "set-owner":
+          if (!ownerAccountId && typeof message.ownerAccountId === "string" && message.ownerAccountId) {
+            ownerAccountId = message.ownerAccountId;
+            legacy = !!message.legacy;
+            writeOwnership(sessionDir, { sid: publicSid, ownerAccountId, legacy, accessExpiresAt });
+            sessionLog?.assignLegacyOwner(ownerAccountId);
+          }
+          break;
+        case "set-access-expiry":
+          if (ownerAccountId &&
+              (message.accessExpiresAt == null || Number.isFinite(message.accessExpiresAt))) {
+            accessExpiresAt = Number.isFinite(message.accessExpiresAt) ? message.accessExpiresAt : null;
+            writeOwnership(sessionDir, { sid: publicSid, ownerAccountId, legacy, accessExpiresAt });
+            armAccessExpiry();
+          }
+          break;
         case "kill": terminateShell(); break;
       }
     });
@@ -500,12 +579,14 @@ async function runHolder(config) {
       resolve();
     });
   });
+  armAccessExpiry();
 
   const finish = async (result) => {
     if (closing) return;
     closing = true;
     clearTimeout(killTimer);
     clearTimeout(leaseTimer);
+    clearTimeout(accessTimer);
     broadcast(control({ type: "exit", sid: config.sid, code: result.exitCode ?? null }));
     for (const socket of clients) socket.end();
     try { await log?.close(result); } catch {}
@@ -545,6 +626,17 @@ function secureDir(dir) {
 }
 function safeReadDir(dir) {
   try { return fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+}
+function readOwnership(sessionDir) {
+  try { return JSON.parse(fs.readFileSync(path.join(sessionDir, "owner.json"), "utf8")); }
+  catch { return null; }
+}
+function writeOwnership(sessionDir, ownership) {
+  const target = path.join(sessionDir, "owner.json");
+  const temporary = target + `.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, JSON.stringify({ version: 1, ...ownership }, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(temporary, target);
+  try { fs.chmodSync(target, 0o600); } catch {}
 }
 function socketConnectTarget(socketPath) {
   // Linux can resolve a long socket path through an open directory descriptor,
