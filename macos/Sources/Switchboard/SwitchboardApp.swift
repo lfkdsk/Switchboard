@@ -42,20 +42,37 @@ struct SwitchboardApp: App {
     @StateObject private var prefs: Prefs
     @StateObject private var supervisor: DaemonSupervisor
     @StateObject private var updater: DaemonUpdater
+    @StateObject private var accountStore: AccountStore
+    @StateObject private var avatarLoader: AvatarLoader
+    @StateObject private var fullDiskAccess: FullDiskAccessStore
 
     init() {
         let p = Prefs()
         let s = DaemonSupervisor(prefs: p)
         let u = DaemonUpdater()
+        let a = AccountStore(supervisor: s)
+        let avatar = AvatarLoader()
+        let fda = FullDiskAccessStore()
+        avatar.bind(to: a)
         u.supervisor = s
         _prefs = StateObject(wrappedValue: p)
         _supervisor = StateObject(wrappedValue: s)
         _updater = StateObject(wrappedValue: u)
+        _accountStore = StateObject(wrappedValue: a)
+        _avatarLoader = StateObject(wrappedValue: avatar)
+        _fullDiskAccess = StateObject(wrappedValue: fda)
     }
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(supervisor: supervisor, prefs: prefs, updater: updater)
+            MenuContent(
+                supervisor: supervisor,
+                prefs: prefs,
+                updater: updater,
+                accountStore: accountStore,
+                avatarLoader: avatarLoader,
+                fullDiskAccess: fullDiskAccess
+            )
         } label: {
             Image(systemName: iconName)
                 .accessibilityLabel("Switchboard")

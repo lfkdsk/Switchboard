@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Presentation helpers for the connection state.
@@ -27,8 +28,10 @@ struct MenuContent: View {
     @ObservedObject var supervisor: DaemonSupervisor
     @ObservedObject var prefs: Prefs
     @ObservedObject var updater: DaemonUpdater
+    @ObservedObject var accountStore: AccountStore
+    @ObservedObject var avatarLoader: AvatarLoader
+    @ObservedObject var fullDiskAccess: FullDiskAccessStore
 
-    @State private var config = ConfigReader.read()
     @State private var showSettings = false
     @State private var loginItemFailed = false
 
@@ -67,7 +70,9 @@ struct MenuContent: View {
         .padding(12)
         .frame(width: 290)
         .onAppear {
-            config = ConfigReader.read()
+            accountStore.refresh()
+            avatarLoader.retryIfNeeded()
+            fullDiskAccess.refresh()
             prefs.refreshLoginItem()
             updater.refresh()
         }
@@ -87,8 +92,8 @@ struct MenuContent: View {
                         .foregroundStyle(.secondary)
                         .help("A browser is viewing this machine")
                 }
-                if config.signedIn, let login = config.login {
-                    AvatarView(login: login, size: 20)
+                if accountStore.signedIn, let login = accountStore.login {
+                    AvatarView(loader: avatarLoader, size: 20)
                         .help("Signed in as \(login)")
                 }
             }
@@ -157,11 +162,11 @@ struct MenuContent: View {
 
     private var accountSection: some View {
         VStack(spacing: 2) {
-            if config.signedIn {
+            if accountStore.signedIn {
                 HStack(spacing: 8) {
-                    AvatarView(login: config.login ?? "", size: 28)
+                    AvatarView(loader: avatarLoader, size: 28)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(config.login ?? "signed in").font(.system(size: 12, weight: .medium))
+                        Text(accountStore.login ?? "signed in").font(.system(size: 12, weight: .medium))
                         Text("Signed in").font(.system(size: 10)).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -169,7 +174,6 @@ struct MenuContent: View {
                 .padding(.vertical, 2)
                 menuButton("Sign out", systemImage: "rectangle.portrait.and.arrow.right") {
                     supervisor.signOut()
-                    config = ConfigReader.read()
                 }
             } else {
                 menuButton("Sign in…", systemImage: "person.crop.circle.badge.plus") {
@@ -200,6 +204,10 @@ struct MenuContent: View {
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 Text("Relay/Shell/peer changes apply on the next Start.")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
+
+                Divider()
+
+                fullDiskAccessRow
 
                 Divider()
 
@@ -234,6 +242,32 @@ struct MenuContent: View {
         }
     }
 
+    private var fullDiskAccessRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Button {
+                    fullDiskAccess.openSettings()
+                } label: {
+                    Label("Open Full Disk Access settings…", systemImage: "lock.open")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                if fullDiskAccess.isGranted {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .help("Full Disk Access granted")
+                }
+            }
+            if !fullDiskAccess.isGranted {
+                Text("Browser and peer shells are Switchboard child processes. macOS checks privacy access against Switchboard.app; grant it so shells can use Desktop, Documents, and Downloads without an unattended prompt.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     private var footer: some View {
         HStack {
             Text("Switchboard \(appVersion)\(cliVersionSuffix)")
@@ -258,7 +292,7 @@ struct MenuContent: View {
     // MARK: Bits
 
     private var startTitle: String {
-        config.signedIn ? "Start" : "Start (one-off token)"
+        accountStore.signedIn ? "Start" : "Start (one-off token)"
     }
 
     private var memText: String {
@@ -286,18 +320,17 @@ struct MenuContent: View {
     }
 }
 
-/// The signed-in user's GitHub avatar (github.com/<login>.png), circular, with
-/// a person-glyph placeholder while loading or offline.
+/// The shared signed-in avatar, circular, with the existing person-glyph
+/// placeholder while no cached or downloaded image is available.
 struct AvatarView: View {
-    let login: String
+    @ObservedObject var loader: AvatarLoader
     var size: CGFloat = 28
 
     var body: some View {
-        AsyncImage(url: avatarURL) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            default:
+        Group {
+            if let image = loader.image {
+                Image(nsImage: image).resizable().scaledToFill()
+            } else {
                 Image(systemName: "person.crop.circle.fill")
                     .resizable()
                     .foregroundStyle(.secondary)
@@ -306,12 +339,5 @@ struct AvatarView: View {
         .frame(width: size, height: size)
         .clipShape(Circle())
         .overlay(Circle().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
-    }
-
-    private var avatarURL: URL? {
-        let safe = login.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? login
-        // Request 2× for crisp rendering on Retina; github.com/<login>.png
-        // redirects to the avatar CDN, which AsyncImage follows.
-        return URL(string: "https://github.com/\(safe).png?size=\(Int(size * 2))")
     }
 }

@@ -33,6 +33,7 @@ final class DaemonSupervisor: ObservableObject {
     private var statusTimer: Timer?
     private var restartWork: DispatchWorkItem?
     private var backoffMs = 1000
+    private var reconnectToken: String?
 
     // Crash rollback for hot-updated cli code: if a launch that ran a staged
     // update dies twice in a row within seconds, drop the update and let the
@@ -49,7 +50,7 @@ final class DaemonSupervisor: ObservableObject {
 
     // MARK: Lifecycle
 
-    func start(login: Bool = false) {
+    func start(login: Bool = false, oneOffToken: String? = nil) {
         guard process == nil else { return }
         guard let rt = NodeRuntime.resolve() else {
             runtimeMissing = true
@@ -59,6 +60,8 @@ final class DaemonSupervisor: ObservableObject {
         runtimeMissing = false
         intentionalStop = false
         pendingFatal = nil
+        reconnectToken = oneOffToken
+        account = nil
 
         // A fresh status file per launch, so offsets reset cleanly on restart.
         let url = FileManager.default.temporaryDirectory
@@ -70,7 +73,13 @@ final class DaemonSupervisor: ObservableObject {
 
         let p = Process()
         p.executableURL = rt.node
-        p.arguments = login ? [rt.cli.path, "login"] : [rt.cli.path]
+        if login {
+            p.arguments = [rt.cli.path, "login"]
+        } else if let oneOffToken {
+            p.arguments = [rt.cli.path, "--token", oneOffToken]
+        } else {
+            p.arguments = [rt.cli.path]
+        }
 
         var env = ProcessInfo.processInfo.environment
         env["SWITCHBOARD_STATUS_FILE"] = url.path
@@ -209,8 +218,9 @@ final class DaemonSupervisor: ObservableObject {
     private func scheduleRestart() {
         cancelRestart()
         let delayMs = backoffMs
+        let token = reconnectToken
         state = .reconnecting(delayMs)
-        let work = DispatchWorkItem { [weak self] in self?.start() }
+        let work = DispatchWorkItem { [weak self] in self?.start(oneOffToken: token) }
         restartWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: work)
         backoffMs = min(backoffMs * 2, 15000)
@@ -268,7 +278,7 @@ final class DaemonSupervisor: ObservableObject {
             hotUpdateStrikes = 0
             mode = e.mode ?? mode
             machineName = e.machine ?? machineName
-            account = e.account ?? account
+            account = e.account
             dashboardURL = e.dashboardUrl ?? dashboardURL
             shareURL = e.shareUrl
             state = .online

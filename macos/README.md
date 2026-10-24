@@ -18,6 +18,9 @@ Switchboard.app  (LSUIElement — menu bar only, no Dock icon)
   `SWITCHBOARD_PEER`. A GUI app inherits launchd's environment rather than your
   shell's, so the env var isn't reachable here — the toggle is how a Mac declines
   `switchboard exec` from the rest of your account. On by default, like the CLI.
+- **Settings → Open Full Disk Access settings…** grants the app-level privacy
+  permission inherited by browser and peer shells, so unattended commands can
+  reach protected folders such as Desktop, Documents, and Downloads.
 - **Self-contained** — bundles its own Node, so it doesn't depend on the user's
   `nvm`/`brew` Node being on a GUI process's minimal `PATH`.
 - Auto-starts the daemon on login **only when you're signed in** (an anonymous
