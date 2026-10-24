@@ -1,6 +1,6 @@
 {
   "name": "@switch-board/cli",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Switchboard CLI — exposes this machine's shell to a Switchboard relay and reaches your other machines with exec, file copy, jobs, and interactive shells.",
   "license": "MIT",
   "bin": {
@@ -23,7 +23,15 @@
     "directory": "cli"
   },
   "homepage": "https://shell.lfkdsk.org",
-  "keywords": ["terminal", "web-terminal", "ssh", "pty", "remote-shell", "cloudflare", "switchboard"],
+  "keywords": [
+    "terminal",
+    "web-terminal",
+    "ssh",
+    "pty",
+    "remote-shell",
+    "cloudflare",
+    "switchboard"
+  ],
   "publishConfig": {
     "access": "public"
   },
