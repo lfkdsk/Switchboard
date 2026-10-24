@@ -122,6 +122,16 @@
   #newTab { padding: 5px 10px; flex: none; }
   #termHost { flex: 1; min-height: 0; position: relative; }
   .shell-host { position: absolute; inset: 0; padding: 6px 8px; }
+  #historyPanel { position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--bg); }
+  .history-tools { display: flex; gap: 6px; align-items: center; padding: 8px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .history-tools input { flex: 1; min-width: 120px; }
+  #historyStatus { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #historyScroll { flex: 1; overflow: auto; position: relative; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #historyCanvas { position: relative; min-width: max-content; }
+  #historyRows { position: absolute; left: 0; right: 0; }
+  .history-line { height: 19px; padding: 0 10px; white-space: pre; }
+  .history-line mark { color: inherit; background: #6e5b16; }
+  .history-line.current mark { background: #b36b00; outline: 1px solid #f0a020; }
   /* toast + drop */
   #toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
   .toast { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 9px 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
@@ -145,6 +155,7 @@
     </div>
     <span class="spacer"></span>
     <div class="row" id="termTools" hidden>
+      <button id="btnHistory" title="Browse persistent shell history">History</button>
       <button id="btnUpload" title="Upload into the active shell's directory">Upload</button>
       <button id="btnDownload" title="Download a file from the host">Download</button>
     </div>
@@ -202,7 +213,19 @@
   <!-- TERMINAL -->
   <div class="view" id="view-terminal">
     <div id="tabbar"><button id="newTab" title="Open a new shell">+ shell</button></div>
-    <div id="termHost"></div>
+    <div id="termHost">
+      <section id="historyPanel" hidden>
+        <div class="history-tools">
+          <button id="historyClose">Close</button>
+          <button id="historyOlder">Load older</button>
+          <input id="historySearch" type="search" placeholder="Search history" />
+          <button id="historyPrev" title="Previous match">↑</button>
+          <button id="historyNext" title="Next match">↓</button>
+          <span id="historyStatus">History</span>
+        </div>
+        <div id="historyScroll"><div id="historyCanvas"><div id="historyRows"></div></div></div>
+      </section>
+    </div>
   </div>
 
   <!-- CLI AUTHORIZED -->
@@ -218,6 +241,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="/session-state.js"></script>
   <script>
   (function () {
     "use strict";
@@ -660,10 +684,24 @@
 
     // ===================== TERMINAL (multi-shell) ===========================
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
+    let awaitingInitialDaemonState = false;
+    let daemonFeatures = null, capabilitiesId = null;
     let pingTimer = null, lastPingT = 0;
-    const shells = new Map(); // sid -> { term, fit, host, tab, label, opened }
+    const shellState = SwitchboardSessionState;
+    // The daemon owns the shell list: every page, on any browser or device,
+    // builds its tabs from the daemon's `sessions` broadcast and attaches with a
+    // snapshot, so nothing about a shell is kept in the browser. Pages showing
+    // the same machine mirror the same PTYs. Either page may type; clicking ×
+    // explicitly closes that PTY for every page, while reload/Back/page close
+    // only detach and leave it available for the grace period.
+    const shells = new Map(); // sid -> { term, fit, host, tab, label, opened, offset, rendered, replay }
     let activeSid = null, bootstrapped = false;
     const uploads = new Map(), downloads = new Map();
+    const historyRequests = new Map();
+    const historyView = {
+      sid: null, from: 0, end: 0, loading: false, lines: [], matches: [], match: -1,
+      decoder: new TextDecoder(), pending: "",
+    };
 
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -673,14 +711,18 @@
     function setConn(state, text) { $("connDot").className = "dot " + state; $("connText").textContent = text; }
     function frame(sid, payload) { const s = enc.encode(sid), p = enc.encode(payload); const o = new Uint8Array(1 + s.length + p.length); o[0] = s.length; o.set(s, 1); o.set(p, 1 + s.length); return o.buffer; }
 
+    function disposeShells() {
+      for (const sh of shells.values()) { try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); }
+      shells.clear(); activeSid = null;
+    }
+
     function openTerminal(c) {
+      disposeShells();
       conn = c;
       const u = new URL(location.href); u.search = ""; u.hash = "";
       u.searchParams.set(c.mode === "machine" ? "machine" : "token", c.mode === "machine" ? c.machineId : c.token);
       history.replaceState(null, "", u);
-      // reset shells
-      for (const s of shells.values()) { try { s.term.dispose(); } catch {} s.host.remove(); s.tab.remove(); }
-      shells.clear(); activeSid = null; bootstrapped = false;
+      bootstrapped = false;
       $("rttVal").textContent = "—";
       showView("terminal");
       reconnectDelay = 1000;
@@ -690,8 +732,7 @@
       manualClose = true; stopPing();
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       dropSocket(ws); ws = null;
-      for (const s of shells.values()) { try { s.term.dispose(); } catch {} s.host.remove(); s.tab.remove(); }
-      shells.clear(); activeSid = null;
+      disposeShells();
       $("stats").hidden = true;
     }
 
@@ -719,7 +760,11 @@
     function ensureShell(sid) {
       if (shells.has(sid)) return shells.get(sid);
       const host = document.createElement("div"); host.className = "shell-host"; host.hidden = true; $("termHost").appendChild(host);
-      const term = new Terminal({ cursorBlink: true, fontSize: TERM_FONT_SIZE, fontFamily: TERM_FONT, theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" }, scrollback: 10000 });
+      const term = new Terminal({
+        cursorBlink: true, fontSize: TERM_FONT_SIZE, fontFamily: TERM_FONT,
+        theme: { background: "#0b0e14", foreground: "#c9d1d9", cursor: "#2f81f7" },
+        scrollback: 10000,
+      });
       const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
       term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(frame(sid, d)); });
       const tab = document.createElement("div"); tab.className = "tab";
@@ -727,7 +772,11 @@
       const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
       tab.append(lbl, x); tab.onclick = (e) => { if (e.target === x) closeShell(sid); else activate(sid); };
       $("tabbar").insertBefore(tab, $("newTab"));
-      const sh = { term, fit, host, tab, label: lbl, opened: false, cols: 0, rows: 0 };
+      const sh = {
+        term, fit, host, tab, label: lbl, opened: false,
+        cols: 0, rows: 0, offset: null,
+        rendered: false, replay: null,
+      };
       shells.set(sid, sh);
       return sh;
     }
@@ -753,29 +802,191 @@
       try { sh.term.dispose(); } catch {} sh.host.remove(); sh.tab.remove(); shells.delete(sid);
       if (activeSid === sid) { activeSid = null; const next = shells.keys().next().value; if (next) activate(next); }
     }
+    function attachShell(sid, sh) {
+      if (sh.opened || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!sh.host.hidden) {
+        try { sh.fit.fit(); } catch {}
+      }
+      sh.opened = true;
+      sh.cols = sh.term.cols; sh.rows = sh.term.rows;
+      sendJson({
+        type: "open", sid, cols: sh.cols, rows: sh.rows,
+        ...(Number.isSafeInteger(sh.offset) ? { since: sh.offset } : {}),
+        // A page reload restores the offset but not xterm's in-memory cells.
+        // In-page WebSocket reconnects retain the cells and can use a delta.
+        snapshot: !sh.rendered,
+      });
+    }
     function activate(sid) {
       const sh = shells.get(sid); if (!sh) return;
       activeSid = sid;
       for (const [id, s] of shells) { s.host.hidden = id !== sid; s.tab.classList.toggle("active", id === sid); }
       fitShell(sid, sh); // it may have been hidden while the window resized
-      if (!sh.opened && ws && ws.readyState === WebSocket.OPEN) {
-        sh.opened = true;
-        sh.cols = sh.term.cols; sh.rows = sh.term.rows;
-        sendJson({ type: "open", sid, cols: sh.cols, rows: sh.rows });
-      }
+      attachShell(sid, sh);
       sh.term.focus();
     }
     function newShell() { const sid = crypto.randomUUID(); ensureShell(sid); activate(sid); }
-    function closeShell(sid) { sendJson({ type: "close", sid }); } // daemon broadcasts the new list → removeShell
+    function closeShell(sid) {
+      sendJson({ type: "close", sid });
+      removeShell(sid);
+    }
     $("newTab").onclick = newShell;
+
+    // Persistent history is rendered independently of xterm's bounded scrollback.
+    // Only visible rows enter the DOM; sess-read pages retain logical byte offsets.
+    function historyRequest(message) {
+      const id = crypto.randomUUID(); message.id = id;
+      return new Promise((resolve, reject) => {
+        // Old daemons do not answer sess-list/sess-read at all; fail instead of
+        // leaving the history panel on "Loading sessions…" forever.
+        const timer = setTimeout(() => {
+          historyRequests.delete(id);
+          reject(new Error("history request timed out"));
+        }, 5000);
+        historyRequests.set(id, {
+          resolve: (value) => { clearTimeout(timer); resolve(value); },
+          reject: (error) => { clearTimeout(timer); reject(error); },
+        });
+        sendJson(message);
+      });
+    }
+    function failHistoryRequests(reason) {
+      for (const request of historyRequests.values()) request.reject(new Error(reason));
+      historyRequests.clear();
+    }
+    function stripHistoryAnsi(input) {
+      return input
+        .replace(/\x1b\](?:[^\x07\x1b]|\x1b(?!\\))*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+        .replace(/\x1b[@-_]/g, "")
+        .replace(/\r(?!\n)/g, "\n");
+    }
+    function historyDuration(ms) {
+      const seconds = Math.max(0, Math.round(ms / 1000));
+      const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
+      return [h && `${h}h`, (m || h) && `${m}m`, `${s}s`].filter(Boolean).join("");
+    }
+    function foldHistoryAlt(bytes, from, intervals) {
+      if (!intervals?.length) return bytes;
+      const end = from + bytes.length, parts = [];
+      let cursor = from;
+      for (const interval of [...intervals].sort((a, b) => a.start - b.start)) {
+        if (!(interval.end > from && interval.start < end)) continue;
+        const visibleEnd = Math.max(cursor, Math.min(end, interval.start));
+        if (visibleEnd > cursor) parts.push(bytes.slice(cursor - from, visibleEnd - from));
+        cursor = Math.max(cursor, Math.min(end, interval.end));
+        if (!interval.active && interval.end <= end && interval.end > from) {
+          const label = interval.application || "fullscreen";
+          parts.push(new TextEncoder().encode(`\n[${label} ${historyDuration(interval.endedAt - interval.startedAt)}]\n`));
+        }
+      }
+      if (cursor < end) parts.push(bytes.slice(cursor - from));
+      const size = parts.reduce((sum, part) => sum + part.length, 0), output = new Uint8Array(size);
+      let offset = 0;
+      for (const part of parts) { output.set(part, offset); offset += part.length; }
+      return output;
+    }
+    async function openHistory() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return toast("Not connected", "err");
+      $("historyPanel").hidden = false;
+      $("historyStatus").textContent = "Loading sessions…";
+      try {
+        const list = await historyRequest({ type: "sess-list" });
+        const sessions = list.sessions || [];
+        const stat = sessions.find((item) => item.sid === activeSid) || sessions[0];
+        if (!stat) throw new Error("No recorded sessions");
+        historyView.sid = stat.sid;
+        historyView.first = Number(stat.from) || 0;
+        historyView.end = Number(stat.off) || 0;
+        historyView.from = Math.max(historyView.first, historyView.end - 256 * 1024);
+        await loadHistoryRange(historyView.from, historyView.end);
+      } catch (error) { $("historyStatus").textContent = error.message; }
+    }
+    async function loadHistoryRange(from, end) {
+      if (historyView.loading) return;
+      historyView.loading = true; historyView.pending = ""; historyView.lines = [];
+      $("historyStatus").textContent = "Loading history…";
+      let cursor = from;
+      try {
+        while (cursor < end) {
+          const result = await historyRequest({ type: "sess-read", sid: historyView.sid,
+            from: cursor, len: Math.min(64 * 1024, end - cursor) });
+          if (result.type === "sess-error") throw new Error(result.message || "History read failed");
+          const bytes = b64ToBytes(result.data || "");
+          const folded = foldHistoryAlt(bytes, Number(result.off) || cursor, result.alternateScreens);
+          const text = historyView.decoder.decode(folded, { stream: true });
+          historyView.pending += text;
+          const parts = historyView.pending.split("\n");
+          historyView.pending = parts.pop(); historyView.lines.push(...parts);
+          const next = Number(result.next);
+          if (!bytes.length || !Number.isSafeInteger(next) || next <= cursor) break;
+          cursor = next;
+        }
+        historyView.pending += historyView.decoder.decode();
+        const clean = stripHistoryAnsi(historyView.lines.join("\n") + "\n" + historyView.pending);
+        historyView.lines = clean.split("\n"); historyView.from = from;
+        updateHistorySearch(); renderHistoryRows();
+      } catch (error) { $("historyStatus").textContent = error.message; }
+      finally { historyView.loading = false; }
+    }
+    function updateHistorySearch() {
+      const query = $("historySearch").value.toLowerCase();
+      historyView.matches = [];
+      if (query) historyView.lines.forEach((line, index) => {
+        if (line.toLowerCase().includes(query)) historyView.matches.push(index);
+      });
+      historyView.match = historyView.matches.length ? 0 : -1;
+      $("historyStatus").textContent = `${historyView.lines.length.toLocaleString()} lines` +
+        (query ? ` · ${historyView.matches.length} matches` : "");
+    }
+    function renderHistoryRows() {
+      const scroll = $("historyScroll"), rows = $("historyRows"), lineHeight = 19;
+      const start = Math.max(0, Math.floor(scroll.scrollTop / lineHeight) - 20);
+      const count = Math.ceil(scroll.clientHeight / lineHeight) + 40;
+      const end = Math.min(historyView.lines.length, start + count);
+      $("historyCanvas").style.height = `${historyView.lines.length * lineHeight}px`;
+      rows.style.top = `${start * lineHeight}px`; rows.replaceChildren();
+      const query = $("historySearch").value;
+      for (let index = start; index < end; index++) {
+        const row = document.createElement("div"); row.className = "history-line";
+        if (historyView.matches[historyView.match] === index) row.classList.add("current");
+        const line = historyView.lines[index];
+        if (!query) row.textContent = line;
+        else {
+          const at = line.toLowerCase().indexOf(query.toLowerCase());
+          if (at < 0) row.textContent = line;
+          else { row.append(document.createTextNode(line.slice(0, at)));
+            const mark = document.createElement("mark"); mark.textContent = line.slice(at, at + query.length);
+            row.append(mark, document.createTextNode(line.slice(at + query.length))); }
+        }
+        rows.appendChild(row);
+      }
+    }
+    function moveHistoryMatch(delta) {
+      if (!historyView.matches.length) return;
+      historyView.match = (historyView.match + delta + historyView.matches.length) % historyView.matches.length;
+      $("historyScroll").scrollTop = historyView.matches[historyView.match] * 19;
+      renderHistoryRows();
+    }
+    $("btnHistory").onclick = openHistory;
+    $("historyClose").onclick = () => { $("historyPanel").hidden = true; };
+    $("historyOlder").onclick = () => loadHistoryRange(Math.max(historyView.first, historyView.from - 256 * 1024), historyView.end);
+    $("historySearch").oninput = () => { updateHistorySearch(); renderHistoryRows(); };
+    $("historyPrev").onclick = () => moveHistoryMatch(-1);
+    $("historyNext").onclick = () => moveHistoryMatch(1);
+    $("historyScroll").onscroll = renderHistoryRows;
 
     function syncSessions(listArr) {
       const ids = new Set();
-      for (const e of listArr) {
+      // Map order on the daemon is spawn order, but holders recovered after a
+      // daemon restart are adopted in directory order: sort so tabs stay put.
+      const ordered = [...listArr].sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+      for (const e of ordered) {
         ids.add(e.sid);
         const sh = ensureShell(e.sid);
         sh.label.textContent = e.cwd ? e.cwd.split("/").filter(Boolean).pop() || "/" : "shell";
         sh.tab.title = e.cwd || "";
+        attachShell(e.sid, sh);
       }
       for (const sid of [...shells.keys()]) if (!ids.has(sid)) removeShell(sid);
       if (!activeSid && shells.size) activate(shells.keys().next().value);
@@ -787,6 +998,7 @@
     function dropSocket(sock) {
       if (!sock) return;
       sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+      failHistoryRequests("disconnected");
       try { sock.close(); } catch {}
     }
     function connect() {
@@ -802,25 +1014,98 @@
       const current = () => ws === sock; // a superseded socket drives nothing
       sock.onopen = () => {
         if (!current()) return;
+        awaitingInitialDaemonState = true;
+        daemonFeatures = null;
+        capabilitiesId = crypto.randomUUID();
+        sendJson({ type: "capabilities", id: capabilitiesId });
         reconnectDelay = 1000; setConn("wait", "waiting for host…");
         for (const s of shells.values()) s.opened = false; // re-attach after reconnect
+        for (const [sid, sh] of shells) attachShell(sid, sh);
         sendJson({ type: "list-sessions" });
         if (activeSid) activate(activeSid);
         startPing();
       };
       sock.onmessage = (ev) => { if (!current()) return; if (typeof ev.data === "string") handleJson(ev.data); else handleBinary(ev.data); };
-      sock.onclose = () => { if (!current()) return; stopPing(); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
+      sock.onclose = () => { if (!current()) return; stopPing(); failHistoryRequests("disconnected"); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
       sock.onerror = () => { try { sock.close(); } catch {} }; // its own onclose drives the retry
     }
     function sendJson(o) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); }
     function startPing() { stopPing(); const probe = () => { if (ws && ws.readyState === WebSocket.OPEN) { lastPingT = Date.now(); sendJson({ type: "ping", t: lastPingT }); } }; probe(); pingTimer = setInterval(probe, 4000); }
     function stopPing() { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } }
 
-    function handleBinary(buf) { const a = new Uint8Array(buf); const sh = shells.get(dec.decode(a.subarray(1, 1 + a[0]))); if (sh) sh.term.write(a.subarray(1 + a[0])); }
+    function finishReplay(sid, sh) {
+      const replay = sh.replay;
+      if (!replay) return;
+      sh.replay = null;
+      if (replay.apply || sh.offset === replay.to) {
+        sh.offset = replay.to;
+        sh.rendered = true;
+      }
+      if (replay.resync && ws && ws.readyState === WebSocket.OPEN) {
+        sendJson({
+          type: "open", sid, cols: sh.cols || sh.term.cols, rows: sh.rows || sh.term.rows,
+          ...(Number.isSafeInteger(sh.offset) ? { since: sh.offset } : {}),
+          snapshot: true,
+        });
+      }
+    }
+    function beginReplay(m) {
+      const sh = shells.get(m.sid);
+      if (!sh || !Number.isSafeInteger(m.from) || !Number.isSafeInteger(m.to) ||
+          !Number.isSafeInteger(m.bytes) || m.bytes < 0) return;
+      let apply = m.mode === "snapshot" || sh.offset === m.from;
+      const current = sh.offset;
+      const resync = m.mode === "delta" && current !== m.from && current !== m.to;
+      if (m.mode === "delta" && current === m.to) apply = false;
+      sh.replay = { mode: m.mode, from: m.from, to: m.to, remaining: m.bytes, apply, resync };
+      if (m.bytes === 0) finishReplay(m.sid, sh);
+    }
+    function handleBinary(buf) {
+      const frameBytes = new Uint8Array(buf);
+      const sidLength = frameBytes[0];
+      const sid = dec.decode(frameBytes.subarray(1, 1 + sidLength));
+      const sh = shells.get(sid);
+      if (!sh) return;
+      const payload = frameBytes.subarray(1 + sidLength);
+      let cursor = 0;
+      if (sh.replay?.remaining) {
+        const count = Math.min(sh.replay.remaining, payload.length);
+        const part = payload.subarray(0, count);
+        if (sh.replay.apply && count) sh.term.write(part);
+        if (sh.replay.mode === "delta" && sh.replay.apply) {
+          sh.offset = shellState.advanceOffset(sh.offset, count);
+        }
+        sh.replay.remaining -= count;
+        cursor = count;
+        if (!sh.replay.remaining) finishReplay(sid, sh);
+      }
+      if (cursor < payload.length) {
+        const live = payload.subarray(cursor);
+        sh.term.write(live);
+        sh.offset = shellState.advanceOffset(sh.offset, live.length);
+        sh.rendered = true;
+      }
+    }
     function handleJson(str) {
       let m; try { m = JSON.parse(str); } catch { return; }
+      if (m.id && historyRequests.has(m.id)) {
+        const request = historyRequests.get(m.id); historyRequests.delete(m.id);
+        request.resolve(m); return;
+      }
       switch (m.type) {
+        case "capabilities":
+          if (m.id === capabilitiesId) {
+            daemonFeatures = m.features;
+            capabilitiesId = null;
+          }
+          break;
         case "sessions": syncSessions(m.list || []); break;
+        case "reset": {
+          const sh = shells.get(m.sid);
+          if (sh) { sh.term.reset(); sh.rendered = false; }
+          break;
+        }
+        case "session-replay": beginReplay(m); break;
         case "pong": if (m.t === lastPingT) $("rttVal").textContent = (Date.now() - m.t) + "ms"; break;
         case "stats": updateStats(m); break;
         case "exit": { const sh = shells.get(m.sid); if (sh) sh.term.write(`\r\n\x1b[33m[exited ${m.code}]\x1b[0m\r\n`); break; }
@@ -833,6 +1118,13 @@
             dropSocket(ws); ws = null;
             setTimeout(() => { if (session) { closeTerminal(); goDashboard(); } }, 600);
           } else {
+            const initialDaemonState = awaitingInitialDaemonState;
+            awaitingInitialDaemonState = false;
+            if (m.event === "daemon-online" && !initialDaemonState) {
+              for (const sh of shells.values()) sh.opened = false;
+              for (const [sid, sh] of shells) attachShell(sid, sh);
+              sendJson({ type: "list-sessions" });
+            }
             setConn(m.event === "daemon-online" ? "on" : "off", m.event === "daemon-online" ? "connected" : "host offline");
           }
           break;
@@ -878,7 +1170,13 @@
     window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); } });
     window.addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show"); if (!ws) return; for (const f of e.dataTransfer.files) uploadFile(f); });
     window.addEventListener("resize", () => { const sh = shells.get(activeSid); if (sh) fitShell(activeSid, sh); });
-    window.addEventListener("beforeunload", () => { for (const sid of shells.keys()) sendJson({ type: "client-gone", sid }); });
+    window.addEventListener("pagehide", () => {
+      // Legacy daemons use client-gone to reap PTYs. Holder-aware daemons own
+      // their disconnected-session lease, so notifying them would defeat reload recovery.
+      if (shellState.shouldNotifyClientGone(daemonFeatures)) {
+        for (const sid of shells.keys()) sendJson({ type: "client-gone", sid });
+      }
+    });
     function toast(text, kind) { const el = document.createElement("div"); el.className = "toast " + (kind || ""); el.textContent = text; $("toasts").appendChild(el); setTimeout(() => el.remove(), 4000); }
 
     init();

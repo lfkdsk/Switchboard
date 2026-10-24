@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { setMachineOffline, updateMachineStats } from "./registry.js";
+import { browserMessage, daemonRoute, resetReplayRoutes } from "./replay-routing.js";
 
 const WS_OPEN = 1;
 
@@ -54,6 +55,7 @@ export class Circuit extends DurableObject {
     const machineId = url.searchParams.get("machine") || null;
 
     if (role === "daemon") {
+      this._replayTargets = resetReplayRoutes();
       // Last-writer-wins: a newly-arrived daemon always takes over the circuit.
       // We can't trust readyState here — when a daemon dies ungracefully (sleep,
       // crash, kill -9) Cloudflare leaves its socket reading OPEN for minutes
@@ -74,6 +76,7 @@ export class Circuit extends DurableObject {
     server.serializeAttachment({
       role,
       machineId,
+      clientId: role === "browser" ? crypto.randomUUID() : null,
       accountId: request.headers.get("x-switchboard-account") || null,
       accessVia: request.headers.get("x-switchboard-access") || null,
       expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
@@ -112,13 +115,17 @@ export class Circuit extends DurableObject {
       if (att.machineId && typeof message === "string" && message.length < 8000) {
         this.recordHeartbeat(att.machineId, message);
       }
+      const route = daemonRoute(message, this._replayTargets);
+      this._replayTargets = route.replayTargets;
       for (const b of this.ctx.getWebSockets("browser")) {
-        if (!this.closeIfBlocked(b)) this.safeSend(b, message);
+        const browser = b.deserializeAttachment() || {};
+        if (route.target && browser.clientId !== route.target) continue;
+        if (!this.closeIfBlocked(b)) this.safeSend(b, route.message);
       }
     } else {
       if (this.closeIfBlocked(ws)) return;
       const daemon = this.ctx.getWebSockets("daemon").find((s) => s.readyState === WS_OPEN);
-      if (daemon) this.safeSend(daemon, message);
+      if (daemon) this.safeSend(daemon, browserMessage(message, att.clientId));
     }
   }
 
@@ -136,8 +143,15 @@ export class Circuit extends DurableObject {
     const { role, machineId } = ws.deserializeAttachment() || {};
     try { ws.close(code, reason); } catch {}
     if (role === "daemon") {
-      this.broadcastToBrowsers(JSON.stringify({ type: "_relay", event: "daemon-offline" }));
-      if (machineId) { try { await setMachineOffline(this.env, machineId); } catch {} }
+      // A replacement daemon may already be accepted when the incumbent's
+      // delayed close callback runs. Do not announce or persist a false offline
+      // transition over the newer live connection.
+      const replacement = this.ctx.getWebSockets("daemon")
+        .some((candidate) => candidate !== ws && candidate.readyState === WS_OPEN);
+      if (!replacement) {
+        this.broadcastToBrowsers(JSON.stringify({ type: "_relay", event: "daemon-offline" }));
+        if (machineId) { try { await setMachineOffline(this.env, machineId); } catch {} }
+      }
     } else {
       this.notifyDaemonPeer(ws);
     }

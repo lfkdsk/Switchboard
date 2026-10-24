@@ -91,8 +91,9 @@ quick remote help. No sign-in required; the token *is* the key (see
   on one. The agent already running on your laptop can drive the build box.
 - **🗂️ Multiple shells, tmux-style** — open as many tabs as you want on a single
   machine. Shells survive tab reloads and flaky links; in account mode they keep
-  running even after you close the browser, so you can reattach right where you
-  left off.
+  running even after you close the browser. The machine, not the browser, keeps
+  the list of open shells, so any browser on any device reattaches right where
+  you left off.
 - **📁 Drag-and-drop file transfer** — drop a file onto the page to upload it
   into the active shell's working directory, or pull any file off the host with a
   click.
@@ -112,7 +113,7 @@ quick remote help. No sign-in required; the token *is* the key (see
 | Sign-in                  | GitHub, once per machine              | none                                   |
 | Who can open the shell   | you + GitHub users you share with     | anyone holding the token               |
 | Appears in the dashboard | ✅ with live stats                     | —                                      |
-| Shell lifetime           | persists — reattach anytime           | persists across reloads (60s grace)    |
+| Shell lifetime           | reattachable (24h detached grace)     | reattachable (24h detached grace)      |
 | Best for                 | persistent, identity-based access     | pairing · one-offs                     |
 
 Both modes give you the multi-tab terminal and file transfer; they differ only in
@@ -250,6 +251,7 @@ switchboard nodes                         # owned + shared machines, OS/arch, li
 switchboard exec build-box npm test       # run something over there
 switchboard cp ./app.tgz build-box:/tmp/app.tgz  # copy one file in either direction
 switchboard shell build-box               # a shell over there, in this terminal
+switchboard history build-box             # list recorded shell sessions
 ```
 
 `<node>` is a hostname, or any unambiguous prefix of one (or of the machine id).
@@ -317,6 +319,30 @@ switchboard cp ./config.json build-box:'~/app/config.json'
 `shell` is the browser terminal in your terminal, on the same sessions: **Ctrl-]**
 detaches and leaves the shell running (it's still a tab in the dashboard), and
 `switchboard shell <node> --attach` picks the newest one back up.
+
+Shell output is recorded on the target by default, including output produced while
+the relay is disconnected. List transcripts, then read one by its session id:
+
+```bash
+switchboard history build-box
+switchboard history build-box <sid> --tail 200l --text
+switchboard history build-box <sid> --from 1048576 --follow
+```
+
+The default output is the original PTY byte stream, ANSI sequences included;
+`--text` removes terminal escapes. `--tail 64KiB` selects bytes and `--tail 200l`
+selects lines. `--json` returns a JSON session list, or base64 NDJSON chunks when
+reading a transcript. Each session keeps at most 1 GiB, all scopes together keep
+at most 5 GiB, and segments older than 30 days are pruned oldest-first. Session
+segments use gzip compression by default for Node.js 18 compatibility. Set
+`SWITCHBOARD_LOG_COMPRESSION=zstd` to opt in to zstd when the Node.js runtime
+supports it; reading existing `.zst` segments also requires runtime zstd
+support and otherwise returns a clear session-read error. Set
+`SWITCHBOARD_RECORD=0` on the target to turn recording off.
+
+Detached shells are kept for 24 hours after the last browser or CLI peer leaves.
+Set `SWITCHBOARD_SESSION_GRACE` on the target to change that duration (a bare
+number is seconds; `0` keeps shells until they exit or are explicitly closed).
 
 The repo ships a [Claude Code skill](.claude/skills/switchboard/SKILL.md) for
 exactly this: which command to reach for, what the exit codes mean, when `exec`
@@ -470,6 +496,8 @@ switchboard cp <source> <destination>
 switchboard jobs <node>      List detached jobs retained on the target.
 switchboard logs <node> <job> [--follow]
                              Read or follow a detached job's output.
+switchboard history <node> [sid]
+                             List saved shell sessions, or read one transcript.
 switchboard wait <node> <job>
                              Wait for completion and return the job's exit code.
 switchboard shell <node>     Open an interactive shell on a reachable peer
@@ -493,14 +521,23 @@ switchboard shell <node>     Open an interactive shell on a reachable peer
 | `exec --shell <path>` | Override the target shell for this command. |
 | `exec --detach` | Start a target-side durable job and print its id. |
 | `logs --follow` | Keep reading output until the job reaches a terminal state. |
+| `history --from <off>` | Start reading a transcript at a global byte offset. |
+| `history --tail <N>` / `<N>l` | Read the last N bytes (`64KiB` accepted), or N lines with an `l` suffix. |
+| `history --text` | Strip ANSI terminal escape sequences; raw PTY bytes are the default. |
+| `history --follow` | Poll for appended output while the recorded session is live. |
+| `history --json` | JSON session list, or base64 NDJSON chunks when a session id is given. |
 | `shell [sid]`, `shell --attach` | Reattach to that session, or to the newest one. |
 
 Environment variables (overridden by the flags above): `SWITCHBOARD_TOKEN`,
-`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`, `SWITCHBOARD_FORCE`. The `WEBTERM_*`
+`SWITCHBOARD_SERVER`, `SWITCHBOARD_SHELL`, `SWITCHBOARD_FORCE`, `SWITCHBOARD_RECORD`,
+`SWITCHBOARD_SESSION_GRACE`.
+The `WEBTERM_*`
 equivalents are also accepted for drop-in compatibility. Account credentials live
 in `~/.switchboard/config.json` (mode `0600`), and whoever is currently serving
 this machine in `~/.switchboard/daemons.json` (see
-[One daemon at a time](#one-daemon-at-a-time)).
+[One daemon at a time](#one-daemon-at-a-time)). Session transcripts live in
+`~/.switchboard/sessions/<scope>/<sid>/`; directories are `0700` and log/index
+files are `0600`.
 
 `SWITCHBOARD_PEER=0` makes this machine refuse `exec`/`shell` from peer
 machines (see [above](#turning-it-off)). It's on by default in account mode, and

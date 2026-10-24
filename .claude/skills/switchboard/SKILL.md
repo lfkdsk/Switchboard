@@ -5,8 +5,9 @@ description: >-
   machines: `switchboard nodes` lists them, `switchboard exec <node> <cmd>` runs
   something over there with real stdout and a real exit code, `switchboard cp`
   transfers a file, detached jobs survive caller disconnects, `switchboard shell
-  <node>` opens an interactive one, and `switchboard login` / `service` expose a
-  machine. Use this whenever a task belongs on a different machine than the one
+  <node>` opens an interactive one, `switchboard history <node> [sid]` reads saved
+  shell transcripts, and `switchboard login` / `service` expose a machine. Use
+  this whenever a task belongs on a different machine than the one
   you're on — "run the tests on my build box", "what is my desktop doing?", "is
   the mac mini still up?", "get me a shell on the server", "share this box with
   someone" — or when switchboard, a relay or circuit, `~/.switchboard`, or the
@@ -86,6 +87,22 @@ up, and `shell <node> <sid>` reattaches to a specific one.
 switchboard shell mini
 switchboard shell mini --attach
 ```
+
+**`history` reads persistent PTY transcripts from the target.** With no session
+id it lists the retained sessions; with an id it writes the original terminal
+bytes. Use `--text` when you need readable text without ANSI escapes, `--tail
+200l` for the last 200 lines, `--tail 64KiB` for bytes, `--from <offset>` to
+resume a machine read, and `--follow` while the shell is still live.
+
+```bash
+switchboard history mini
+switchboard history mini <sid> --tail 200l --text
+switchboard history mini <sid> --from 1048576 --follow
+```
+
+Recording happens on the target even while its relay link is down. It is bounded
+to 1 GiB per session, 5 GiB globally and 30 days, and can be disabled there with
+`SWITCHBOARD_RECORD=0`. `--json` gives a JSON list or base64 NDJSON chunks.
 
 **Naming a machine:** a hostname, a machine id, or any unambiguous prefix of
 either (`switchboard exec bui npm test`). An ambiguous prefix is an error rather
@@ -178,8 +195,10 @@ to ask (a unit, the app, CI) logs the takeover and proceeds.
 | `SWITCHBOARD_PEER=0` | refuse `exec`/`shell` from peer machines (`--no-peer`) |
 | `SWITCHBOARD_FORCE=1` | start without the duplicate-daemon question (`--force`) |
 | `SWITCHBOARD_ACTIVITY=claude` | also report live Claude Code sessions to the dashboard (off by default: titles summarise what was asked) |
+| `SWITCHBOARD_RECORD=0` | disable persistent shell transcripts (recording is on by default) |
 | `~/.switchboard/config.json` | account credential + machine id (0600) |
 | `~/.switchboard/daemons.json` | who is currently serving this machine (0600) |
+| `~/.switchboard/sessions/` | scoped segmented PTY transcripts (0700 dirs, 0600 files) |
 
 `WEBTERM_*` spellings of the first three are accepted too.
 
