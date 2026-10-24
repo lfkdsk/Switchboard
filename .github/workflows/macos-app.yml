@@ -124,7 +124,17 @@ jobs:
           xcrun notarytool submit "$RUNNER_TEMP/app.zip" \
             --key "$RUNNER_TEMP/private_keys/AuthKey.p8" \
             --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
-          xcrun stapler staple build/Switchboard.app
+          staple() {
+            # Stapling fetches the fresh ticket from Apple's CloudKit, which can
+            # drop the connection right after notarization (error 68). Retry.
+            for i in 1 2 3 4 5 6; do
+              xcrun stapler staple "$1" && return 0
+              echo "staple attempt $i failed; retrying in $((i * 20))s" >&2
+              sleep $((i * 20))
+            done
+            return 1
+          }
+          staple build/Switchboard.app
 
       - name: Verify bundle
         working-directory: macos
@@ -194,7 +204,17 @@ jobs:
           xcrun notarytool submit "$DMG" \
             --key "$RUNNER_TEMP/private_keys/AuthKey.p8" \
             --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
-          xcrun stapler staple "$DMG"
+          staple() {
+            # Stapling fetches the fresh ticket from Apple's CloudKit, which can
+            # drop the connection right after notarization (error 68). Retry.
+            for i in 1 2 3 4 5 6; do
+              xcrun stapler staple "$1" && return 0
+              echo "staple attempt $i failed; retrying in $((i * 20))s" >&2
+              sleep $((i * 20))
+            done
+            return 1
+          }
+          staple "$DMG"
 
       - name: Verify DMG
         if: env.SIGNED == 'true'
