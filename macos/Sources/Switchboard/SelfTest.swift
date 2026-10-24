@@ -25,8 +25,12 @@ enum SelfTest {
                 prefs.server = server
             }
             let sup = DaemonSupervisor(prefs: prefs)
-            log("starting daemon (server=\(prefs.normalizedServer))")
-            sup.start()
+            // A self-test may run beside an installed menu app. Use a distinct
+            // anonymous circuit so validation can never take over that app's
+            // signed-in machine circuit or close its active shells.
+            let token = UUID().uuidString + UUID().uuidString
+            log("starting isolated daemon (server=\(prefs.normalizedServer))")
+            sup.start(oneOffToken: token)
 
             let poll = Timer(timeInterval: 0.2, repeats: true) { _ in
                 let title = sup.state.title

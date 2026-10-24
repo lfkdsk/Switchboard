@@ -12,6 +12,11 @@ let package = Package(
         .executableTarget(
             name: "Switchboard",
             path: "Sources/Switchboard"
+        ),
+        .testTarget(
+            name: "SwitchboardTests",
+            dependencies: ["Switchboard"],
+            path: "Tests/SwitchboardTests"
         )
     ]
 )

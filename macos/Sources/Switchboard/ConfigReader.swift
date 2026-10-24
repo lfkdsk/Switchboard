@@ -2,7 +2,7 @@ import Foundation
 
 /// Reads ~/.switchboard/config.json — the same file the CLI writes on login —
 /// so the menu can show who's signed in without re-running the daemon.
-struct AccountConfig {
+struct AccountConfig: Equatable {
     var signedIn: Bool
     var login: String?
     var machineId: String?
