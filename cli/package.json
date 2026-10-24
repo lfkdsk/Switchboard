@@ -32,6 +32,8 @@
     "postinstall": "node scripts/fix-pty-perms.js"
   },
   "dependencies": {
+    "@xterm/addon-serialize": "^0.13.0",
+    "@xterm/headless": "^5.5.0",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
   }

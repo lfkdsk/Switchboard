@@ -5,13 +5,14 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import peer from "../cli/peer.js";
 import utils from "../cli/lib/peer-utils.js";
 
 const {
   finalizeDownload, parseCopyOperands, remoteOperand, shellCommandArgs, shellQuote, verifyUploadedFile,
 } = utils;
+const { lastLines, parseTailSpec, stripAnsi } = peer;
 
 test("cp operands distinguish node paths from local Windows and POSIX paths", () => {
   assert.deepEqual(remoteOperand("build:/tmp/a:b"), { node: "build", path: "/tmp/a:b" });
@@ -79,6 +80,8 @@ class FakeSocket extends EventEmitter {
   static uploadPath = null;
   static uploadCommand = null;
   static downloadBase = null;
+  static historyContent = Buffer.from("\x1b[31mred\x1b[0m\nblue\n");
+  static historyAlternateScreens = [];
   static features = ["cp-sha256-v1"];
   static ignoreCapabilities = false;
   constructor() {
@@ -122,6 +125,28 @@ class FakeSocket extends EventEmitter {
       this.reply({
         type: "job-list", id: m.id,
         jobs: [{ id: "job-remote", status: "exited", exitCode: 3, createdAt: 123, command: "build" }],
+      });
+    }
+    if (m.type === "sess-list" && FakeSocket.mode === "history") {
+      this.reply({
+        type: "sess-list", id: m.id, recording: true,
+        sessions: [{
+          sid: "session-remote", status: "closed", active: false, startedAt: 123,
+          from: 0, off: FakeSocket.historyContent.length, bytes: FakeSocket.historyContent.length,
+        }],
+      });
+    }
+    if (m.type === "sess-read" && FakeSocket.mode === "history") {
+      const from = Math.max(0, Math.min(Number(m.from) || 0, FakeSocket.historyContent.length));
+      const chunk = FakeSocket.historyContent.subarray(from, from + Math.min(Number(m.len) || 65536, 65536));
+      const next = from + chunk.length;
+      this.reply({
+        type: "sess-chunk", id: m.id, sid: m.sid, data: chunk.toString("base64"),
+        off: from, next, eof: next >= FakeSocket.historyContent.length,
+        alternateScreens: FakeSocket.historyAlternateScreens.filter(
+          (interval) => interval.end > from && interval.start < next,
+        ),
+        stat: { active: false, from: 0, off: FakeSocket.historyContent.length },
       });
     }
   }
@@ -242,4 +267,211 @@ test("jobs queries use a fake transport and return target-side records", async (
   assert.deepEqual(JSON.parse(lines.join("\n")), [
     { id: "job-remote", status: "exited", exitCode: 3, createdAt: 123, command: "build" },
   ]);
+});
+
+test("history reads a line tail and strips terminal escape sequences", async () => {
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const original = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", tail: "1l", text: true,
+      raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = original;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "blue\n");
+});
+
+test("history reports a target without history-v1 before requesting sessions", async () => {
+  FakeSocket.mode = "history";
+  FakeSocket.features = [];
+  try {
+    await assert.rejects(
+      peer.cmdHistory(fakeContext(), {
+        target: "target", sid: null, text: false, raw: false, follow: false, json: false,
+      }),
+      /does not support session history; update it first/,
+    );
+  } finally {
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+});
+
+test("history text mode strips an ANSI sequence split across protocol chunks", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.concat([Buffer.alloc(65535, 0x78), Buffer.from("\x1b[31mred\x1b[0m\n")]);
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true,
+      raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "x".repeat(65535) + "red\n");
+});
+
+test("history text mode streams a long OSC sequence without leaking its payload", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.from(
+    "before\x1b]0;" + "x".repeat(70_000) + "\x1b[31mhidden\x07after\n",
+  );
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true,
+      raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "beforeafter\n");
+});
+
+test("history grep skips alternate-screen contents by default", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.from(
+    "$ vim file.txt\n\x1b[?1049hsecret match\n\x1b[?1049lvisible match\n",
+  );
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true, grep: "match",
+      includeAlt: false, raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "visible match\n");
+});
+
+test("history grep includes alternate-screen contents with include-alt", async () => {
+  const originalContent = FakeSocket.historyContent;
+  FakeSocket.historyContent = Buffer.from(
+    "$ vim file.txt\n\x1b[?1049hsecret match\n\x1b[?1049lvisible match\n",
+  );
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", text: true, grep: "match",
+      includeAlt: true, raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "secret match\nvisible match\n");
+});
+
+test("history line tails use indexed alternate-screen intervals when the enter sequence was trimmed", async () => {
+  const originalContent = FakeSocket.historyContent;
+  const originalIntervals = FakeSocket.historyAlternateScreens;
+  const enter = "$ vim file.txt\n\x1b[?1049h";
+  const hidden = "secret match\nmore secret match\n";
+  const leave = "\x1b[?1049l";
+  FakeSocket.historyContent = Buffer.from(enter + hidden + leave + "visible match\n");
+  FakeSocket.historyAlternateScreens = [{
+    start: Buffer.byteLength("$ vim file.txt\n"),
+    end: Buffer.byteLength(enter + hidden + leave),
+    startedAt: 1_000,
+    endedAt: 193_000,
+    application: "vim",
+  }];
+  FakeSocket.mode = "history";
+  FakeSocket.features = ["history-v1"];
+  let output = "";
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += chunk.toString(); return true; };
+  try {
+    await peer.cmdHistory(fakeContext(), {
+      target: "target", sid: "session-remote", tail: "2l", text: true, grep: "match",
+      includeAlt: false, raw: false, follow: false, json: false,
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+    FakeSocket.historyContent = originalContent;
+    FakeSocket.historyAlternateScreens = originalIntervals;
+    FakeSocket.mode = "download";
+    FakeSocket.features = ["cp-sha256-v1"];
+  }
+  assert.equal(output, "visible match\n");
+});
+
+test("history CLI forwards grep and alternate-screen flags to the peer client", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-history-cli-"));
+  const configDir = path.join(home, ".switchboard");
+  fs.mkdirSync(configDir);
+  fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({
+    agentToken: "test-agent-token",
+    machineId: "test-machine",
+  }));
+  try {
+    const result = spawnSync(process.execPath, [
+      "--require", path.resolve("tests/fixtures/peer-history-stub.cjs"),
+      path.resolve("cli/index.js"),
+      "history", "target", "session-remote", "--grep", "needle", "--include-alt",
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const prefix = "HISTORY_OPTS ";
+    const line = result.stdout.split("\n").find((value) => value.startsWith(prefix));
+    assert.ok(line, `missing history options in output: ${result.stdout}`);
+    assert.deepEqual(JSON.parse(line.slice(prefix.length)), {
+      target: "target",
+      sid: "session-remote",
+      text: true,
+      raw: false,
+      follow: false,
+      json: false,
+      grep: "needle",
+      includeAlt: true,
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("history helpers parse byte and line tails without a dependency", () => {
+  assert.deepEqual(parseTailSpec("64KiB"), { unit: "bytes", value: 65536 });
+  assert.deepEqual(parseTailSpec("200 lines"), { unit: "lines", value: 200 });
+  assert.equal(stripAnsi("\x1b[32mok\x1b[0m"), "ok");
+  assert.equal(stripAnsi("a\x1bPignored\x1b\\b"), "ab");
+  assert.equal(lastLines(Buffer.from("one\ntwo\nthree\n"), 2).toString(), "two\nthree\n");
 });
