@@ -17,6 +17,7 @@
  * index.js is what answers.
  */
 
+const { EventEmitter } = require("node:events");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -71,29 +72,94 @@ function hangUp(ws) {
   setTimeout(() => { try { ws.terminate(); } catch {} }, 500).unref();
 }
 
+// A relay upgrade can fail with a 5xx for a few seconds while the machine's
+// circuit object is being reset — the daemon on the far end rides that out with
+// its own backoff, so a peer that gave up on the first 500 failed commands the
+// host itself would have survived. Retry 5xx handshakes a few times with short
+// backoff; 4xx (no access, bad token, peer disabled) are answered as-is.
+const HANDSHAKE_RETRY_DELAYS_MS = [1000, 2000, 4000];
+
 function peerSocket(ctx, machineId, onFailure) {
   const url = ctx.server.replace(/^http/, "ws") + "/ws?role=browser&machine=" + encodeURIComponent(machineId);
   const Socket = ctx.WebSocket || require("ws");
-  const ws = new Socket(url, { headers: { "x-switchboard-agent": ctx.agentToken } });
-  let reportedFailure = false;
-  const reportFailure = (error) => {
-    if (!onFailure || reportedFailure) return;
-    reportedFailure = true;
-    onFailure(error);
-  };
-  ws.on("unexpected-response", (_req, res) => {
-    let body = "";
-    res.on("data", (d) => { body += d; });
-    res.on("end", () => {
-      const message = `Relay refused the connection (${res.statusCode}): ${body.trim() || "no reason given"}`;
-      if (onFailure) reportFailure(new Error(message)); else fail(message);
+  const delays = ctx.handshakeRetryDelays || HANDSHAKE_RETRY_DELAYS_MS;
+  return new PeerSocket(() => new Socket(url, { headers: { "x-switchboard-agent": ctx.agentToken } }), {
+    delays, onFailure, notify: ctx.notify || ((line) => console.error(line)),
+  });
+}
+
+// Callers wire their handlers once; this stays the same object across handshake
+// attempts and forwards to whichever underlying socket is current.
+class PeerSocket extends EventEmitter {
+  constructor(dial, { delays, onFailure, notify }) {
+    super();
+    this.dial = dial;
+    this.delays = delays;
+    this.onFailure = onFailure;
+    this.notify = notify;
+    this.attempt = 0;
+    this.reportedFailure = false;
+    this.inner = null;
+    this.closed = false;
+    this.retryTimer = null;
+    this.connect();
+  }
+  connect() {
+    if (this.closed) return;
+    this.attempt++;
+    const inner = this.dial();
+    this.inner = inner;
+    for (const event of ["open", "message", "close", "ping", "pong"]) {
+      inner.on(event, (...args) => { if (!this.closed && this.inner === inner) this.emit(event, ...args); });
+    }
+    inner.on("unexpected-response", (_req, res) => {
+      let body = "";
+      res.on("data", (d) => { body += d; });
+      res.on("end", () => {
+        if (this.closed || this.inner !== inner) return;
+        const retriesLeft = this.attempt - 1 < this.delays.length;
+        if (res.statusCode >= 500 && retriesLeft) {
+          const delay = this.delays[this.attempt - 1];
+          this.notify(`relay answered ${res.statusCode} to the handshake; retrying in ${delay / 1000}s…`);
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            if (!this.closed && this.inner === inner) this.connect();
+          }, delay);
+          return;
+        }
+        const tried = this.attempt > 1 ? ` after ${this.attempt} attempts` : "";
+        this.failed(`Relay refused the connection (${res.statusCode}): ${body.trim() || "no reason given"}${tried}`);
+      });
     });
-  });
-  ws.on("error", (e) => {
-    if (onFailure) reportFailure(new Error("Connection failed: " + e.message));
-    else { console.error("\nConnection failed: " + e.message + "\n"); process.exitCode = 255; }
-  });
-  return ws;
+    inner.on("error", (e) => {
+      if (this.closed || this.inner !== inner) return;
+      if (this.onFailure) this.failed("Connection failed: " + e.message);
+      else if (this.listenerCount("error")) this.emit("error", e);
+      else { console.error("\nConnection failed: " + e.message + "\n"); process.exitCode = 255; }
+    });
+  }
+  failed(message) {
+    if (!this.onFailure) return fail(message);
+    if (this.reportedFailure) return;
+    this.reportedFailure = true;
+    this.onFailure(new Error(message));
+  }
+  get readyState() { return this.inner ? this.inner.readyState : 0; }
+  get bufferedAmount() { return this.inner ? this.inner.bufferedAmount || 0 : 0; }
+  get _socket() { return this.inner ? this.inner._socket : undefined; }
+  send(...args) { return this.inner.send(...args); }
+  close(...args) {
+    this.closed = true;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    return this.inner.close(...args);
+  }
+  terminate(...args) {
+    this.closed = true;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    return this.inner.terminate(...args);
+  }
 }
 
 // ---- picking a machine ---------------------------------------------------
@@ -1153,5 +1219,5 @@ function ago(t, skew = 0) {
 
 module.exports = {
   cmdCopy, cmdExec, cmdHistory, cmdJobs, cmdLogs, cmdNodes, cmdShell, cmdWait,
-  lastLines, parseTailSpec, stripAnsi,
+  lastLines, parseTailSpec, peerSocket, stripAnsi,
 };
