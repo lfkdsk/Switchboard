@@ -247,6 +247,61 @@ test("an orphaned holder expires its lease after the daemon disappears", {
   assert.equal(fs.existsSync(socketPath), false, "expired holder must clean up its socket");
 });
 
+test("a connected visitor holder persists and enforces its grant expiry", {
+  skip: process.platform === "win32"
+    ? "Unix sockets are not used on Windows"
+    : !holderRuntimeAvailable ? "CLI runtime dependencies are not installed" : false,
+  timeout: 15000,
+}, async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-holder-access-expiry-"));
+  const scope = "access-expiry-scope";
+  const sid = "expiring-visitor";
+  const initialExpiry = Date.now() + 60_000;
+  let client;
+  t.after(async () => {
+    client?.disconnect();
+    await stopPtyHolders({ rootDir, scope, timeout: 1000 });
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  const sessionDir = path.dirname(holderSocketPath(rootDir, scope, sid));
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "owner.json"), JSON.stringify({
+    version: 1,
+    sid: "stale-browser-sid",
+    ownerAccountId: "stale-visitor",
+    legacy: false,
+    accessExpiresAt: Date.now() - 1000,
+  }), { mode: 0o600 });
+
+  client = await spawnPtyHolder({
+    rootDir, scope, sid, publicSid: "browser-expiry-shell", ownerAccountId: "visitor-1",
+    accessExpiresAt: initialExpiry, shell: "/bin/sh", cwd: rootDir, recording: false,
+  });
+  assert.equal(client.publicSid, "browser-expiry-shell");
+  assert.equal(client.ownerAccountId, "visitor-1");
+  assert.equal(client.accessExpiresAt, initialExpiry);
+  const holderPid = client.holderPid;
+  const shellPid = client.pid;
+  const exited = once(client, "exit");
+  client.activate();
+
+  const accessExpiresAt = Date.now() + 800;
+  client.setAccessExpiry(accessExpiresAt);
+  const ownershipPath = path.join(rootDir, scope, sid, "owner.json");
+  await waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(ownershipPath, "utf8")).accessExpiresAt === accessExpiresAt; }
+    catch { return false; }
+  }, "persisted visitor access expiry");
+  await Promise.race([
+    exited,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("grant expiry did not close the holder")), 5000)),
+  ]);
+  await waitFor(() => !pidAlive(holderPid), "expired visitor holder exit", 5000);
+  await waitFor(() => !pidAlive(shellPid), "expired visitor shell termination", 5000);
+  assert.equal(fs.existsSync(holderSocketPath(rootDir, scope, sid)), false);
+});
+
 test("concurrent launches share one holder and explicit close force-kills a resistant shell", {
   skip: process.platform === "win32"
     ? "Unix sockets are not used on Windows"

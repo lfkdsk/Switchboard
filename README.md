@@ -116,8 +116,11 @@ quick remote help. No sign-in required; the token *is* the key (see
 | Shell lifetime           | reattachable (24h detached grace)     | reattachable (24h detached grace)      |
 | Best for                 | persistent, identity-based access     | pairing · one-offs                     |
 
-Both modes give you the multi-tab terminal and file transfer; they differ only in
-*who* can connect and how long shells stick around.
+Both modes give you the multi-tab terminal and file transfer. In account mode,
+each account has its own terminal namespace: a visitor cannot list, read, type
+into, resize, or close another account's terminals. The machine owner retains a
+supervisory view of visitor terminals and can close them; visitors see that fact
+disclosed persistently in the terminal UI.
 
 ### Share a machine with another account
 
@@ -125,10 +128,13 @@ Open **Share access** on one of your dashboard machines, choose how long access
 should last, and generate a code. Send it to the recipient within ten minutes;
 they sign in, paste it under **Redeem a share code**, and the code becomes
 unusable immediately. The machine then appears in their dashboard. A share is
-full access — terminal input, file transfer, and commands — but it does not
-transfer ownership or let the recipient re-share or delete the machine.
-**Revoke** closes that account's active connections as well as rejecting future
-ones.
+full same-OS-user access — terminal input in their own sessions, file transfer,
+and commands — but it does not transfer ownership or let the recipient re-share
+or delete the machine. The owner can observe visitor sessions and their history
+and can close them. **Revoke** closes that account's active connections,
+terminates its Switchboard-owned PTYs, and rejects future connections. This is a
+session-visibility boundary, not an OS sandbox: visitors still run as the host
+user and may access the same files and processes.
 
 Shared machines also appear in the recipient's `switchboard nodes`. Their CLI
 can use `exec` and `shell` only while the target daemon has peer access enabled;
@@ -304,6 +310,12 @@ omitted. Finished and unknown jobs are kept for 24 hours, with at most 100 job
 records per target daemon. If the daemon restarts, a job that had been running is
 reported as `unknown`; completed records remain queryable.
 
+On account-bound machines, detached jobs are owned by the relay-authenticated
+account that created them; browser-supplied account fields are ignored. Visitors
+can list, read, inspect, and terminate only their own account's jobs. The machine
+owner can supervise and terminate every job. Older unowned records are migrated
+to the machine owner and are never exposed to a visitor.
+
 `cp` currently transfers one regular file. Downloads reuse the dashboard's
 streaming download protocol; uploads stream the local file to a target-side
 stdin sink (`cat` on POSIX) through exec. Both directions verify SHA-256 before replacing the
@@ -385,10 +397,12 @@ row on the dashboard and in `switchboard nodes` says `peers off`.
 - Both ends **dial out** over WebSocket — keystrokes flow one way, terminal
   output the other.
 - `idFromName(token-or-machine)` funnels every daemon and browser on the same
-  circuit into a single Durable Object — the operator that patches them together
-  and broadcasts host output to every open tab.
-- The relay is a **transparent forwarder**: it pairs the two ends and shovels
-  frames between them. It never parses your terminal payload.
+  circuit into a single Durable Object. Token circuits remain a shared stream.
+  Account circuits stamp browser frames with the relay-authenticated principal
+  and enforce daemon-selected owner/account/client delivery audiences.
+- The relay parses the small `account-sessions-v1` routing envelope, but does not
+  interpret terminal bytes. It strips routing metadata before browser delivery;
+  see [the protocol note](docs/account-sessions-v1.md).
 - A small **D1** database holds the account bookkeeping — which machines belong to
   whom, hashed agent tokens, and the heartbeat that powers the live dashboard.
   Terminal traffic never touches it.
@@ -563,7 +577,18 @@ and never include command-line arguments (those routinely carry secrets).
   use numeric GitHub ids, may expire, cannot be delegated onward, and are
   checked on every connection. One-time share codes expire after ten minutes,
   are stored **hashed** (SHA-256), and bind to the redeeming account. Sessions
-  are HMAC-signed cookies, and agent tokens are also stored hashed in D1.
+  are HMAC-signed cookies, and agent tokens are also stored hashed in D1. A
+  grant deadline is carried into the daemon and detached PTY holder, so its
+  visitor shells terminate at expiry even after that browser disconnects or
+  the daemon restarts. Each daemon reconnect also receives a complete active-
+  grant snapshot from D1, so a revoke that happened while the daemon was down
+  still terminates the recovered visitor PTY before it can be used again.
+- **Account-scoped terminals are not OS isolation.** A visitor sees only sessions
+  created by that account, while the machine owner can observe and close all
+  visitor sessions. Every terminal and command still runs as the daemon's OS
+  user, so a malicious visitor may read the same files or processes by other
+  means. Revocation terminates that visitor's Switchboard PTYs but cannot undo
+  files, copied credentials, or detached processes they created.
 - **The agent token is a full account credential**, and since peer mode it's a
   *client* one too: whoever holds `~/.switchboard/config.json` can `exec` on the
   account's owned or shared machines that allow peers. It was always
@@ -576,8 +601,8 @@ and never include command-line arguments (those routinely carry secrets).
 - **The relay sees plaintext.** TLS terminates at the Worker, so the operator
   (you, when self-hosting) can see the stream. Switchboard is **not** end-to-end
   encrypted — self-hosting removes the third party, not the relay's visibility.
-  Because the relay forwards opaque bytes, you can layer E2E (e.g. X25519 + an
-  AEAD between daemon and browser) without changing it.
+  Terminal payloads remain opaque to the routing logic, but any future E2E layer
+  must preserve the relay-owned account-routing envelope.
 - **Gate the relay itself** with Cloudflare Access if you want auth in front of
   the whole Worker.
 - The frontend loads `xterm.js` from jsDelivr; vendor the `@xterm` files into
@@ -591,6 +616,7 @@ and never include command-line arguments (those routinely carry secrets).
 | --- | --- |
 | `src/index.js` | Worker entry + router (WebSocket, auth, CLI-login, dashboard API) |
 | `src/circuit.js` | The `Circuit` Durable Object — the per-token/per-machine relay |
+| `src/account-session-protocol.js` | Trusted account-session envelopes and audience routing |
 | `src/auth.js` | GitHub OAuth sessions (HMAC-signed cookies) |
 | `src/registry.js` | D1 bookkeeping: machines, sharing grants, agent tokens, CLI-login handshake |
 | `public/index.html` | The browser app — terminal, tabs, dashboard, file transfer |

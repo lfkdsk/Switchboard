@@ -120,6 +120,7 @@
   .tab .x { opacity: .55; padding: 0 3px; border-radius: 3px; }
   .tab .x:hover { opacity: 1; background: rgba(248,81,73,.2); color: var(--err); }
   #newTab { padding: 5px 10px; flex: none; }
+  #accessNotice { padding: 7px 12px; border-bottom: 1px solid rgba(210,153,34,.45); background: rgba(210,153,34,.1); color: #e3b341; font-size: 12px; }
   #termHost { flex: 1; min-height: 0; position: relative; }
   .shell-host { position: absolute; inset: 0; padding: 6px 8px; }
   #historyPanel { position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--bg); }
@@ -213,6 +214,7 @@
   <!-- TERMINAL -->
   <div class="view" id="view-terminal">
     <div id="tabbar"><button id="newTab" title="Open a new shell">+ shell</button></div>
+    <div id="accessNotice" role="status" hidden></div>
     <div id="termHost">
       <section id="historyPanel" hidden>
         <div class="history-tools">
@@ -299,7 +301,20 @@
       try { const me = await (await api("/auth/me")).json(); if (me.login) session = me; } catch {}
       const machine = query.get("machine");
       if (machine) {
-        if (session) return openTerminal({ mode: "machine", machineId: machine });
+        if (session) {
+          // A failed WebSocket upgrade does not expose its HTTP 426 body to the
+          // browser. Resolve bookmarked/direct shared-machine URLs up front so
+          // the close path can still give a legacy-daemon upgrade instruction.
+          let shared = false;
+          try {
+            const response = await api("/api/machines/shared");
+            if (response.ok) {
+              const body = await response.json();
+              shared = (body.machines || []).some((item) => item.machine_id === machine);
+            }
+          } catch {}
+          return openTerminal({ mode: "machine", machineId: machine, shared });
+        }
         showView("landing"); $("landingErr").textContent = "Sign in to open this machine."; return;
       }
       return session ? goDashboard() : showView("landing");
@@ -428,7 +443,9 @@
         const badge = el.querySelector(".badge");
         badge.hidden = !m.shared;
         if (m.shared) badge.textContent = `shared by @${m.owner_login} · ${expiryLabel(m.expires_at)}`;
-        el.querySelector(".open-shell").onclick = () => openTerminal({ mode: "machine", machineId: m.machine_id, label: m.name });
+        el.querySelector(".open-shell").onclick = () => openTerminal({
+          mode: "machine", machineId: m.machine_id, label: m.name, shared: !!m.shared,
+        });
         // An offline machine's last-known activity is stale by definition.
         syncActivity(el.querySelector(".m-act"), online ? activityRows(m.activity) : []);
         syncActionMenu(m, online, label, el);
@@ -539,7 +556,7 @@
       box.textContent = "";
       const warning = document.createElement("div");
       warning.className = "muted";
-      warning.textContent = "A share grants full terminal, file-transfer, and command access. Codes expire in 10 minutes and work once.";
+      warning.textContent = "A visitor gets their own terminal sessions plus full file-transfer and command access as your OS user. They cannot see your terminals; you can observe and close theirs. Codes expire in 10 minutes and work once.";
       box.appendChild(warning);
       if (!grants.length) {
         const none = document.createElement("div");
@@ -685,15 +702,13 @@
     // ===================== TERMINAL (multi-shell) ===========================
     let ws = null, conn = null, reconnectDelay = 1000, manualClose = false, reconnectTimer = null;
     let awaitingInitialDaemonState = false;
+    let accessVia = null;
     let daemonFeatures = null, capabilitiesId = null;
     let pingTimer = null, lastPingT = 0;
     const shellState = SwitchboardSessionState;
-    // The daemon owns the shell list: every page, on any browser or device,
-    // builds its tabs from the daemon's `sessions` broadcast and attaches with a
-    // snapshot, so nothing about a shell is kept in the browser. Pages showing
-    // the same machine mirror the same PTYs. Either page may type; clicking ×
-    // explicitly closes that PTY for every page, while reload/Back/page close
-    // only detach and leave it available for the grace period.
+    // The daemon owns the shell list. In account mode the list is scoped to the
+    // authenticated account; the machine owner additionally receives labeled
+    // visitor sessions for supervision. Nothing is persisted in browser storage.
     const shells = new Map(); // sid -> { term, fit, host, tab, label, opened, offset, rendered, replay }
     let activeSid = null, bootstrapped = false;
     const uploads = new Map(), downloads = new Map();
@@ -723,6 +738,8 @@
       u.searchParams.set(c.mode === "machine" ? "machine" : "token", c.mode === "machine" ? c.machineId : c.token);
       history.replaceState(null, "", u);
       bootstrapped = false;
+      accessVia = null;
+      $("accessNotice").hidden = true;
       $("rttVal").textContent = "—";
       showView("terminal");
       reconnectDelay = 1000;
@@ -734,6 +751,7 @@
       dropSocket(ws); ws = null;
       disposeShells();
       $("stats").hidden = true;
+      $("accessNotice").hidden = true;
     }
 
     // Icon font sits after the system faces: text keeps the system metrics and
@@ -766,7 +784,12 @@
         scrollback: 10000,
       });
       const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
-      term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(frame(sid, d)); });
+      term.onData((d) => {
+        // Owner-supervised visitor tabs are deliberately read-only. The daemon
+        // enforces the same rule; this keeps the UI from suggesting otherwise.
+        if (shells.get(sid)?.readOnly) return;
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(frame(sid, d));
+      });
       const tab = document.createElement("div"); tab.className = "tab";
       const lbl = document.createElement("span"); lbl.textContent = "shell";
       const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
@@ -775,7 +798,7 @@
       const sh = {
         term, fit, host, tab, label: lbl, opened: false,
         cols: 0, rows: 0, offset: null,
-        rendered: false, replay: null,
+        rendered: false, replay: null, readOnly: false,
       };
       shells.set(sid, sh);
       return sh;
@@ -791,7 +814,7 @@
     // daemon was told, so switching tabs doesn't send a frame per click.
     function fitShell(sid, sh) {
       try { sh.fit.fit(); } catch {}
-      if (!sh.opened) return; // not attached yet: the `open` frame carries the size
+      if (!sh.opened || sh.readOnly) return; // supervised visitor PTYs are view-only
       if (sh.term.cols === sh.cols && sh.term.rows === sh.rows) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return; // a reconnect re-opens with the current size
       sh.cols = sh.term.cols; sh.rows = sh.term.rows;
@@ -984,8 +1007,12 @@
       for (const e of ordered) {
         ids.add(e.sid);
         const sh = ensureShell(e.sid);
-        sh.label.textContent = e.cwd ? e.cwd.split("/").filter(Boolean).pop() || "/" : "shell";
-        sh.tab.title = e.cwd || "";
+        const cwdLabel = e.cwd ? e.cwd.split("/").filter(Boolean).pop() || "/" : "shell";
+        sh.readOnly = e.mine === false;
+        sh.label.textContent = e.mine === false ? `visitor · ${cwdLabel}` : cwdLabel;
+        sh.tab.title = e.mine === false
+          ? `Read-only visitor ${e.ownerAccountId || "account"}${e.cwd ? " · " + e.cwd : ""}`
+          : e.cwd || "";
         attachShell(e.sid, sh);
       }
       for (const sid of [...shells.keys()]) if (!ids.has(sid)) removeShell(sid);
@@ -1026,7 +1053,14 @@
         startPing();
       };
       sock.onmessage = (ev) => { if (!current()) return; if (typeof ev.data === "string") handleJson(ev.data); else handleBinary(ev.data); };
-      sock.onclose = () => { if (!current()) return; stopPing(); failHistoryRequests("disconnected"); if (manualClose) return; setConn("off", `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`); reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualClose) connect(); }, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 2, 15000); };
+      sock.onclose = () => { if (!current()) return; stopPing(); failHistoryRequests("disconnected"); if (manualClose) return;
+        const legacyHint = conn?.shared && daemonFeatures == null;
+        setConn("off", legacyHint
+          ? "shared host unavailable — ask the owner to upgrade its daemon"
+          : `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`);
+        reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualClose) connect(); }, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+      };
       sock.onerror = () => { try { sock.close(); } catch {} }; // its own onclose drives the retry
     }
     function sendJson(o) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); }
@@ -1110,7 +1144,22 @@
         case "stats": updateStats(m); break;
         case "exit": { const sh = shells.get(m.sid); if (sh) sh.term.write(`\r\n\x1b[33m[exited ${m.code}]\x1b[0m\r\n`); break; }
         case "_relay":
-          if (m.event === "access-revoked" || m.event === "access-expired") {
+          if (m.event === "access-context") {
+            accessVia = m.accessVia;
+            const notice = $("accessNotice");
+            if (accessVia === "grant") {
+              notice.textContent = "Visitor session: the machine owner can observe this terminal and its history, and can close it. Other accounts' terminals stay hidden.";
+              notice.hidden = false;
+            } else {
+              notice.hidden = true;
+            }
+          } else if (m.event === "daemon-upgrade-required") {
+            manualClose = true;
+            stopPing();
+            setConn("off", "owner must upgrade the Switchboard daemon");
+            toast("This shared machine uses an older daemon. Ask its owner to upgrade and restart it.", "err");
+            dropSocket(ws); ws = null;
+          } else if (m.event === "access-revoked" || m.event === "access-expired") {
             manualClose = true;
             stopPing();
             setConn("off", m.event === "access-expired" ? "access expired" : "access revoked");

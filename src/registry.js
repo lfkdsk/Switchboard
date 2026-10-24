@@ -129,7 +129,10 @@ export async function listSharedWithMe(env, accountId) {
         AND (g.expires_at IS NULL OR g.expires_at > ?)
       ORDER BY m.created_at ASC, m.machine_id ASC`,
   ).bind(accountId, Date.now()).all();
-  return withActivity(results).map((m) => ({ ...m, shared: true }));
+  // The persisted heartbeat is the machine owner's supervisory view. It can
+  // contain owner shell cwd/process/agent details, so a grantee must receive
+  // live account-filtered activity from the daemon instead of this global blob.
+  return withActivity(results).map((m) => ({ ...m, activity: null, shared: true }));
 }
 
 export async function listReachableMachines(env, accountId) {
@@ -307,6 +310,47 @@ export async function listGrants(env, machineId, ownerId) {
       ORDER BY created_at ASC`,
   ).bind(machineId).all();
   return results || [];
+}
+
+// The daemon uses this as an authoritative reconnect snapshot, so truncation
+// would be unsafe: an omitted live grantee would be mistaken for a revoked one
+// and its recovered PTYs would be killed. Fetch one sentinel row beyond the
+// wire bound and reject the daemon handshake instead of sending an incomplete
+// snapshot.
+export const MAX_ACTIVE_GRANT_SNAPSHOT = 4096;
+export const MAX_ACCOUNT_ID_LENGTH = 512;
+
+export async function activeGrantSnapshot(env, machineId, ownerId, now = Date.now()) {
+  const owner = await machineOwner(env, machineId);
+  if (!owner || owner.account_id !== ownerId) return null;
+  const { results } = await env.DB.prepare(
+    `SELECT grantee_id, expires_at
+       FROM machine_grants
+      WHERE machine_id=? AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ?)
+      ORDER BY grantee_id ASC
+      LIMIT ?`,
+  ).bind(machineId, now, MAX_ACTIVE_GRANT_SNAPSHOT + 1).all();
+  const rows = results || [];
+  if (rows.length > MAX_ACTIVE_GRANT_SNAPSHOT) {
+    const error = new Error("active grant snapshot exceeds protocol limit");
+    error.code = "ACTIVE_GRANT_SNAPSHOT_TOO_LARGE";
+    throw error;
+  }
+  const seen = new Set();
+  return rows.map((row) => {
+    const accountId = row.grantee_id;
+    const expiresAt = row.expires_at == null ? null : Number(row.expires_at);
+    if (typeof accountId !== "string" || !accountId ||
+        accountId.length > MAX_ACCOUNT_ID_LENGTH || seen.has(accountId) ||
+        (expiresAt != null && (!Number.isFinite(expiresAt) || expiresAt <= now))) {
+      const error = new Error("invalid active grant snapshot row");
+      error.code = "INVALID_ACTIVE_GRANT_SNAPSHOT";
+      throw error;
+    }
+    seen.add(accountId);
+    return { accountId, expiresAt };
+  });
 }
 
 // ---- CLI-login handshake (PKCE-like) -------------------------------------
