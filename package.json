@@ -11,7 +11,8 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "test": "node --experimental-default-type=module --test tests/*.test.mjs",
-    "test:e2e:webshell": "node tests/e2e/webshell-reload.mjs"
+    "test:mutation:account-sessions": "node tests/mutations/account-session-guards.mjs",
+    "test:e2e:webshell": "node tests/e2e/webshell-reload.mjs && node tests/e2e/webshell-account-visibility.mjs"
   },
   "devDependencies": {
     "@xterm/addon-serialize": "^0.13.0",

@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  MAX_ACTIVE_GRANT_SNAPSHOT,
+  activeGrantSnapshot,
   createShareCode,
   deleteMachine,
   listGrants,
+  listSharedWithMe,
   machineAccess,
   redeemShareCode,
   revokeGrant,
@@ -54,6 +57,43 @@ class Statement {
   }
 
   async all() {
+    if (this.sql.includes("FROM machine_grants g JOIN machines m")) {
+      const [granteeId, now] = this.args;
+      const results = [...this.db.grants.values()]
+        .filter((grant) => grant.grantee_id === granteeId && grant.revoked_at == null &&
+          (grant.expires_at == null || grant.expires_at > now))
+        .map((grant) => {
+          const machine = this.db.machines.get(grant.machine_id);
+          return machine ? {
+            machine_id: grant.machine_id,
+            name: machine.name || "",
+            online: machine.online || 0,
+            created_at: machine.created_at || 0,
+            last_seen: machine.last_seen || 0,
+            rtt: machine.rtt ?? null,
+            cpu: machine.cpu ?? null,
+            mem_used: machine.mem_used ?? null,
+            mem_total: machine.mem_total ?? null,
+            platform: machine.platform ?? null,
+            arch: machine.arch ?? null,
+            activity: machine.activity ?? null,
+            peer: machine.peer,
+            owner_login: machine.account_login,
+            expires_at: grant.expires_at,
+          } : null;
+        }).filter(Boolean);
+      return { results };
+    }
+    if (this.sql.startsWith("SELECT grantee_id, expires_at FROM machine_grants")) {
+      const [machineId, now, limit] = this.args;
+      const results = [...this.db.grants.values()]
+        .filter((grant) => grant.machine_id === machineId && grant.revoked_at == null &&
+          (grant.expires_at == null || grant.expires_at > now))
+        .sort((a, b) => a.grantee_id.localeCompare(b.grantee_id))
+        .slice(0, limit)
+        .map(({ grantee_id, expires_at }) => ({ grantee_id, expires_at }));
+      return { results };
+    }
     if (this.sql.includes("FROM machine_grants") && this.sql.includes("ORDER BY created_at")) {
       const results = [...this.db.grants.values()]
         .filter((grant) => grant.machine_id === this.args[0] && grant.revoked_at == null)
@@ -207,6 +247,55 @@ test("expired grants fail closed and revocation is owner-or-self only", async ()
     created_at: Date.now() - 2000, expires_at: Date.now() - 1, revoked_at: null,
   });
   assert.equal(await machineAccess(env, "machine-1", "expired"), null);
+});
+
+test("daemon reconnect snapshot is complete, bounded, and excludes ended grants", async () => {
+  const env = envWithMachine();
+  const now = Date.now();
+  for (const grant of [
+    { grantee_id: "active", expires_at: now + 60_000, revoked_at: null },
+    { grantee_id: "indefinite", expires_at: null, revoked_at: null },
+    { grantee_id: "expired", expires_at: now, revoked_at: null },
+    { grantee_id: "revoked", expires_at: null, revoked_at: now - 1 },
+  ]) {
+    env.DB.grants.set(`machine-1:${grant.grantee_id}`, {
+      machine_id: "machine-1", grantee_login: grant.grantee_id, created_at: now - 1,
+      ...grant,
+    });
+  }
+  assert.deepEqual(await activeGrantSnapshot(env, "machine-1", "owner-1", now), [
+    { accountId: "active", expiresAt: now + 60_000 },
+    { accountId: "indefinite", expiresAt: null },
+  ]);
+  assert.equal(await activeGrantSnapshot(env, "machine-1", "stranger", now), null);
+
+  env.DB.grants.clear();
+  for (let i = 0; i <= MAX_ACTIVE_GRANT_SNAPSHOT; i++) {
+    const grantee_id = `guest-${String(i).padStart(5, "0")}`;
+    env.DB.grants.set(`machine-1:${grantee_id}`, {
+      machine_id: "machine-1", grantee_id, grantee_login: grantee_id,
+      created_at: now, expires_at: null, revoked_at: null,
+    });
+  }
+  await assert.rejects(
+    activeGrantSnapshot(env, "machine-1", "owner-1", now),
+    (error) => error.code === "ACTIVE_GRANT_SNAPSHOT_TOO_LARGE",
+  );
+});
+
+test("shared machine rows never expose the owner's persisted supervisory activity", async () => {
+  const env = envWithMachine({
+    name: "owner-host",
+    activity: JSON.stringify({ shells: [{ sid: "owner-secret", cwd: "/private/project" }] }),
+  });
+  env.DB.grants.set("machine-1:grantee-1", {
+    machine_id: "machine-1", grantee_id: "grantee-1", grantee_login: "guest",
+    created_at: Date.now(), expires_at: null, revoked_at: null,
+  });
+  const [shared] = await listSharedWithMe(env, "grantee-1");
+  assert.equal(shared.shared, true);
+  assert.equal(shared.owner_login, "owner");
+  assert.equal(shared.activity, null);
 });
 
 test("deleting an offline machine also deletes every grant", async () => {

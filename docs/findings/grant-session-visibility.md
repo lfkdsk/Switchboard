@@ -1,13 +1,20 @@
 # Grant session visibility: findings and design options
 
-Status: **NEEDS_USER**. This document is an investigation and design proposal;
-it does not implement a change. The inspected baseline is `a4c23b7`
-(`web: let the daemon own the shell list instead of localStorage`).
+Status: **DECIDED AND IMPLEMENTED**. Option **1/1A** was selected: account-scoped
+visitor sessions with machine-owner supervision, fail-closed legacy-daemon
+grants, immediate visitor PTY termination on revoke/expiry, and legacy unowned
+records assigned to the machine owner. The original investigation inspected
+`a4c23b7`; the implementation was built as Fleet task 5792 from task 5772 commit
+`73bb3a2d695d0e1e6f4eb28403facf09612a594d` on an independent branch.
+
+The implemented wire contract and compatibility rules are specified in
+[`docs/account-sessions-v1.md`](../account-sessions-v1.md). The findings and
+reproduction below are retained as the rationale and before-state evidence.
 
 ## Decision summary
 
-Choose one of the three options below. The recommendation is **Option 1:
-account-scoped sessions**, with these policy choices:
+The recorded decision is **Option 1: account-scoped sessions**, with these policy
+choices:
 
 1. A grantee sees and controls only sessions created by that account.
 2. The machine owner can see and terminate every session, with that fact
@@ -22,7 +29,7 @@ is an application-level privacy and attribution boundary, **not** an OS security
 boundary: a hostile grantee still has arbitrary code execution as the same
 system user.
 
-The decisions needed from the product owner are collected at the end.
+The former decision questions are recorded as resolved at the end.
 
 ## 1. Confirmed current behavior
 
@@ -386,21 +393,24 @@ do not protect an owner who shares while a sensitive terminal is already open.
 | 2. Explicit collaboration | Own only, plus sessions deliberately shared | Option 1 + ACL protocol/UI/state | Same as Option 1 | 8–13 days | Multi-writer sessions and ACL complexity |
 | 3. Disclosure only | Everyone sees and controls everything | Copy/UI/docs only | Fully compatible | 0.5–1.5 days | Current privacy/integrity exposure remains |
 
-## 7. Decision requested
+## 7. Recorded decision
 
-Please decide:
+The product owner selected:
 
-1. **Base behavior:** Option 1, Option 2, or Option 3?
-2. **If Option 1 or 2:** may the machine owner see all visitor sessions
-   (1A, recommended), or should application-level visibility be symmetric
-   (1B)?
+1. **Base behavior:** Option 1, account-scoped sessions.
+2. **Owner policy:** 1A, machine-owner supervision of visitor sessions.
 3. **Legacy daemon policy:** reject grant connections until the daemon supports
-   account scoping (recommended), or retain current shared visibility with a
-   warning during an indefinite compatibility window?
-4. **Revocation:** terminate that grantee's Switchboard-owned PTYs immediately
-   (recommended), or detach and retain them for possible re-grant?
+   account scoping and show an upgrade instruction.
+4. **Revocation/expiry:** immediately terminate that grantee's
+   Switchboard-owned PTYs. The authenticated expiry is persisted with detached
+   holders and enforced locally so a disconnected browser or daemon restart
+   cannot leave a visitor PTY alive past its grant. Each daemon negotiation also
+   carries a bounded, complete D1 snapshot of active grants; recovered visitor
+   PTYs absent from it are terminated, covering a revoke event missed while the
+   daemon was offline. Snapshot failure or overflow rejects the new daemon
+   before it replaces the incumbent rather than reconciling from partial state.
 
-Recommended decision: **Option 1 + owner-supervisor + reject legacy grant
+Implemented decision: **Option 1 + owner-supervisor + reject legacy grant
 connections + terminate grantee PTYs on revoke/expiry.** It is the smallest
 design that removes the surprising cross-account terminal behavior, adds
 attribution, and preserves the existing promise of full same-user machine

@@ -1,0 +1,616 @@
+TAP version 13
+# Subtest: relay stamps its authenticated identity and does not trust browser self-reporting
+ok 1 - relay stamps its authenticated identity and does not trust browser self-reporting
+  ---
+  duration_ms: 1.106784
+  type: 'test'
+  ...
+# Subtest: relay stamps binary input instead of forwarding a browser-selected prefix
+ok 2 - relay stamps binary input instead of forwarding a browser-selected prefix
+  ---
+  duration_ms: 0.331752
+  type: 'test'
+  ...
+# Subtest: daemon JSON routes are stripped and enforced by account, owner, and client
+ok 3 - daemon JSON routes are stripped and enforced by account, owner, and client
+  ---
+  duration_ms: 0.252024
+  type: 'test'
+  ...
+# Subtest: daemon binary routes are stripped before browser delivery
+ok 4 - daemon binary routes are stripped before browser delivery
+  ---
+  duration_ms: 1.384129
+  type: 'test'
+  ...
+# Subtest: an expired socket does not end an account that has another live renewed grant
+ok 5 - an expired socket does not end an account that has another live renewed grant
+  ---
+  duration_ms: 0.28716
+  type: 'test'
+  ...
+# Subtest: unscoped or malformed daemon frames fail closed in account-session mode
+ok 6 - unscoped or malformed daemon frames fail closed in account-session mode
+  ---
+  duration_ms: 0.137076
+  type: 'test'
+  ...
+# Subtest: daemon accepts only the principal in the relay envelope
+ok 7 - daemon accepts only the principal in the relay envelope
+  ---
+  duration_ms: 1.005897
+  type: 'test'
+  ...
+# Subtest: daemon decodes stamped binary input with the authenticated principal
+ok 8 - daemon decodes stamped binary input with the authenticated principal
+  ---
+  duration_ms: 0.662038
+  type: 'test'
+  ...
+# Subtest: only a finite relay-stamped grant deadline expires browser authority
+ok 9 - only a finite relay-stamped grant deadline expires browser authority
+  ---
+  duration_ms: 0.143161
+  type: 'test'
+  ...
+# Subtest: concurrent grant sockets retain the widest still-authenticated deadline
+ok 10 - concurrent grant sockets retain the widest still-authenticated deadline
+  ---
+  duration_ms: 0.164426
+  type: 'test'
+  ...
+# Subtest: daemon reconnect snapshot kills missed revocations and refreshes recovered deadlines
+ok 11 - daemon reconnect snapshot kills missed revocations and refreshes recovered deadlines
+  ---
+  duration_ms: 0.348301
+  type: 'test'
+  ...
+# Subtest: daemon rejects malformed or incomplete active-grant snapshots
+ok 12 - daemon rejects malformed or incomplete active-grant snapshots
+  ---
+  duration_ms: 1.554568
+  type: 'test'
+  ...
+# Subtest: owner supervises every session while grants see only their own
+ok 13 - owner supervises every session while grants see only their own
+  ---
+  duration_ms: 0.265078
+  type: 'test'
+  ...
+# Subtest: the same browser sid is namespaced by account and has a distinct owner-supervisor id
+ok 14 - the same browser sid is namespaced by account and has a distinct owner-supervisor id
+  ---
+  duration_ms: 0.588586
+  type: 'test'
+  ...
+# Subtest: input resolves only an accessible wire session even when the visitor guesses the owner sid
+ok 15 - input resolves only an accessible wire session even when the visitor guesses the owner sid
+  ---
+  duration_ms: 0.413733
+  type: 'test'
+  ...
+# Subtest: session-bearing message classes all use the same ownership guard
+ok 16 - session-bearing message classes all use the same ownership guard
+  ---
+  duration_ms: 0.342916
+  type: 'test'
+  ...
+# Subtest: revoke cleanup selects every opening/live session owned by that account only
+ok 17 - revoke cleanup selects every opening/live session owned by that account only
+  ---
+  duration_ms: 0.177326
+  type: 'test'
+  ...
+# Subtest: adjacent request streams are bound to the initiating relay client
+ok 18 - adjacent request streams are bound to the initiating relay client
+  ---
+  duration_ms: 0.233477
+  type: 'test'
+  ...
+# Subtest: a one-time code binds access to the signed-in recipient
+ok 19 - a one-time code binds access to the signed-in recipient
+  ---
+  duration_ms: 9.293628
+  type: 'test'
+  ...
+# Subtest: an owner cannot redeem their own code or create one for another owner's machine
+ok 20 - an owner cannot redeem their own code or create one for another owner's machine
+  ---
+  duration_ms: 1.300661
+  type: 'test'
+  ...
+# Subtest: expired grants fail closed and revocation is owner-or-self only
+ok 21 - expired grants fail closed and revocation is owner-or-self only
+  ---
+  duration_ms: 0.345673
+  type: 'test'
+  ...
+# Subtest: daemon reconnect snapshot is complete, bounded, and excludes ended grants
+ok 22 - daemon reconnect snapshot is complete, bounded, and excludes ended grants
+  ---
+  duration_ms: 9.842953
+  type: 'test'
+  ...
+# Subtest: shared machine rows never expose the owner's persisted supervisory activity
+ok 23 - shared machine rows never expose the owner's persisted supervisory activity
+  ---
+  duration_ms: 0.389405
+  type: 'test'
+  ...
+# Subtest: deleting an offline machine also deletes every grant
+ok 24 - deleting an offline machine also deletes every grant
+  ---
+  duration_ms: 0.281068
+  type: 'test'
+  ...
+# Subtest: job output is capped and ends with an explicit truncation marker
+ok 25 - job output is capped and ends with an explicit truncation marker
+  ---
+  duration_ms: 5.936895
+  type: 'test'
+  ...
+# Subtest: job cleanup removes expired records and then enforces the record cap
+ok 26 - job cleanup removes expired records and then enforces the record cap
+  ---
+  duration_ms: 4.183585
+  type: 'test'
+  ...
+# Subtest: a running record becomes unknown after daemon restart
+ok 27 - a running record becomes unknown after daemon restart
+  ---
+  duration_ms: 1.047599
+  type: 'test'
+  ...
+# Subtest: completed records and output survive a daemon restart
+ok 28 - completed records and output survive a daemon restart
+  ---
+  duration_ms: 2.239706
+  type: 'test'
+  ...
+# Subtest: cp operands distinguish node paths from local Windows and POSIX paths
+ok 29 - cp operands distinguish node paths from local Windows and POSIX paths
+  ---
+  duration_ms: 2.195878
+  type: 'test'
+  ...
+# Subtest: POSIX shell quoting preserves spaces, quotes, dollars, and newlines
+ok 30 - POSIX shell quoting preserves spaces, quotes, dollars, and newlines
+  ---
+  duration_ms: 9.02438
+  type: 'test'
+  ...
+# Subtest: exec selects login shell arguments only when requested
+ok 31 - exec selects login shell arguments only when requested
+  ---
+  duration_ms: 0.279177
+  type: 'test'
+  ...
+# Subtest: a failed download checksum removes the temporary file and preserves destination
+ok 32 - a failed download checksum removes the temporary file and preserves destination
+  ---
+  duration_ms: 4.945392
+  type: 'test'
+  ...
+# Subtest: a failed upload checksum removes the target-side staged file
+ok 33 - a failed upload checksum removes the target-side staged file
+  ---
+  duration_ms: 2.186066
+  type: 'test'
+  ...
+# Subtest: cp download uses the existing dl protocol through a fake transport
+ok 34 - cp download uses the existing dl protocol through a fake transport
+  ---
+  duration_ms: 4.858735
+  type: 'test'
+  ...
+# Subtest: cp download cleans its staged file when the fake target reports a bad checksum
+ok 35 - cp download cleans its staged file when the fake target reports a bad checksum
+  ---
+  duration_ms: 1.47161
+  type: 'test'
+  ...
+# Subtest: cp upload streams stdin over a fake transport and keeps the path out of the shell command
+ok 36 - cp upload streams stdin over a fake transport and keeps the path out of the shell command
+  ---
+  duration_ms: 4.002228
+  type: 'test'
+  ...
+# Subtest: new cp client reports an old target clearly before starting a transfer
+ok 37 - new cp client reports an old target clearly before starting a transfer
+  ---
+  duration_ms: 1.055829
+  type: 'test'
+  ...
+# Subtest: an old target that ignores capability messages fails after the short compatibility timeout
+ok 38 - an old target that ignores capability messages fails after the short compatibility timeout
+  ---
+  duration_ms: 2002.611499
+  type: 'test'
+  ...
+# Subtest: cp reports a remote directory explicitly
+ok 39 - cp reports a remote directory explicitly
+  ---
+  duration_ms: 1.053384
+  type: 'test'
+  ...
+# Subtest: jobs queries use a fake transport and return target-side records
+ok 40 - jobs queries use a fake transport and return target-side records
+  ---
+  duration_ms: 0.645909
+  type: 'test'
+  ...
+# Subtest: history reads a line tail and strips terminal escape sequences
+ok 41 - history reads a line tail and strips terminal escape sequences
+  ---
+  duration_ms: 1.404395
+  type: 'test'
+  ...
+# Subtest: history reports a target without history-v1 before requesting sessions
+ok 42 - history reports a target without history-v1 before requesting sessions
+  ---
+  duration_ms: 0.381701
+  type: 'test'
+  ...
+# Subtest: history text mode strips an ANSI sequence split across protocol chunks
+ok 43 - history text mode strips an ANSI sequence split across protocol chunks
+  ---
+  duration_ms: 1.132546
+  type: 'test'
+  ...
+# Subtest: history text mode streams a long OSC sequence without leaking its payload
+ok 44 - history text mode streams a long OSC sequence without leaking its payload
+  ---
+  duration_ms: 3.183729
+  type: 'test'
+  ...
+# Subtest: history grep skips alternate-screen contents by default
+ok 45 - history grep skips alternate-screen contents by default
+  ---
+  duration_ms: 0.643266
+  type: 'test'
+  ...
+# Subtest: history grep includes alternate-screen contents with include-alt
+ok 46 - history grep includes alternate-screen contents with include-alt
+  ---
+  duration_ms: 0.424118
+  type: 'test'
+  ...
+# Subtest: history line tails use indexed alternate-screen intervals when the enter sequence was trimmed
+ok 47 - history line tails use indexed alternate-screen intervals when the enter sequence was trimmed
+  ---
+  duration_ms: 1.057089
+  type: 'test'
+  ...
+# Subtest: history CLI forwards grep and alternate-screen flags to the peer client
+ok 48 - history CLI forwards grep and alternate-screen flags to the peer client
+  ---
+  duration_ms: 57.770638
+  type: 'test'
+  ...
+# Subtest: history helpers parse byte and line tails without a dependency
+ok 49 - history helpers parse byte and line tails without a dependency
+  ---
+  duration_ms: 0.48638
+  type: 'test'
+  ...
+# Subtest: machine registration and heartbeats persist platform and architecture
+ok 50 - machine registration and heartbeats persist platform and architecture
+  ---
+  duration_ms: 1.232844
+  type: 'test'
+  ...
+# Subtest: holder selection keeps Windows on the in-process PTY path
+ok 51 - holder selection keeps Windows on the in-process PTY path
+  ---
+  duration_ms: 0.751883
+  type: 'test'
+  ...
+# Subtest: completed holder cleanup cannot unlink a replacement holder socket
+ok 52 - completed holder cleanup cannot unlink a replacement holder socket
+  ---
+  duration_ms: 57.95572
+  type: 'test'
+  ...
+# Subtest: a detached PTY holder survives daemon replacement and replays missed output
+ok 53 - a detached PTY holder survives daemon replacement and replays missed output
+  ---
+  duration_ms: 924.62772
+  type: 'test'
+  ...
+# Subtest: holder preserves UTF-8 input split across data packets
+ok 54 - holder preserves UTF-8 input split across data packets
+  ---
+  duration_ms: 117.108201
+  type: 'test'
+  ...
+# Subtest: an orphaned holder expires its lease after the daemon disappears
+ok 55 - an orphaned holder expires its lease after the daemon disappears
+  ---
+  duration_ms: 1215.247703
+  type: 'test'
+  ...
+# Subtest: a connected visitor holder persists and enforces its grant expiry
+ok 56 - a connected visitor holder persists and enforces its grant expiry
+  ---
+  duration_ms: 1885.134621
+  type: 'test'
+  ...
+# Subtest: concurrent launches share one holder and explicit close force-kills a resistant shell
+ok 57 - concurrent launches share one holder and explicit close force-kills a resistant shell
+  ---
+  duration_ms: 1086.227258
+  type: 'test'
+  ...
+# Subtest: only browser open requests carry a relay-only client target
+ok 58 - only browser open requests carry a relay-only client target
+  ---
+  duration_ms: 1.665025
+  type: 'test'
+  ...
+# Subtest: replay metadata and payload target only the requesting browser
+ok 59 - replay metadata and payload target only the requesting browser
+  ---
+  duration_ms: 0.470576
+  type: 'test'
+  ...
+# Subtest: live output for another session does not consume a replay target
+ok 60 - live output for another session does not consume a replay target
+  ---
+  duration_ms: 0.298291
+  type: 'test'
+  ...
+# Subtest: reset is targeted without consuming the following replay payload
+ok 61 - reset is targeted without consuming the following replay payload
+  ---
+  duration_ms: 0.84414
+  type: 'test'
+  ...
+# Subtest: daemon replacement clears an incomplete replay target
+ok 62 - daemon replacement clears an incomplete replay target
+  ---
+  duration_ms: 0.363439
+  type: 'test'
+  ...
+# Subtest: session output rolls segments and reads continuously across their boundaries
+ok 63 - session output rolls segments and reads continuously across their boundaries
+  ---
+  duration_ms: 17.121875
+  type: 'test'
+  ...
+# Subtest: alternate-screen intervals are indexed with offsets, timestamps, and application
+ok 64 - alternate-screen intervals are indexed with offsets, timestamps, and application
+  ---
+  duration_ms: 3.629126
+  type: 'test'
+  ...
+# Subtest: alternate-screen indexing falls back to fullscreen
+ok 65 - alternate-screen indexing falls back to fullscreen
+  ---
+  duration_ms: 2.265385
+  type: 'test'
+  ...
+# Subtest: an active alternate screen is indexed for observers and closed with the session
+ok 66 - an active alternate screen is indexed for observers and closed with the session
+  ---
+  duration_ms: 3.43503
+  type: 'test'
+  ...
+# Subtest: zstd compression is opt-in and requires runtime support
+ok 67 - zstd compression is opt-in and requires runtime support
+  ---
+  duration_ms: 2.278999
+  type: 'test'
+  ...
+# Subtest: sess-read reports unavailable zstd decoding without crashing
+ok 68 - sess-read reports unavailable zstd decoding without crashing
+  ---
+  duration_ms: 1.086901
+  type: 'test'
+  ...
+# Subtest: compressed segments use independently readable blocks
+ok 69 - compressed segments use independently readable blocks
+  ---
+  duration_ms: 2.773943
+  type: 'test'
+  ...
+# Subtest: legacy whole-segment compression is decompressed once for sequential reads
+ok 70 - legacy whole-segment compression is decompressed once for sequential reads
+  ---
+  duration_ms: 2.576709
+  type: 'test'
+  ...
+# Subtest: close flushes a burst of queued writes before the record becomes closed
+ok 71 - close flushes a burst of queued writes before the record becomes closed
+  ---
+  duration_ms: 114.646666
+  type: 'test'
+  ...
+# Subtest: pruning never removes the current or still-flushing segment
+ok 72 - pruning never removes the current or still-flushing segment
+  ---
+  duration_ms: 3.616373
+  type: 'test'
+  ...
+# Subtest: active reads wait at a flushing segment gap instead of skipping bytes
+ok 73 - active reads wait at a flushing segment gap instead of skipping bytes
+  ---
+  duration_ms: 2.233398
+  type: 'test'
+  ...
+# Subtest: initializing another store does not prune a live writer's segment
+ok 74 - initializing another store does not prune a live writer's segment
+  ---
+  duration_ms: 2.293686
+  type: 'test'
+  ...
+# Subtest: a replacement store reloads the previous writer before appending
+ok 75 - a replacement store reloads the previous writer before appending
+  ---
+  duration_ms: 2.80394
+  type: 'test'
+  ...
+# Subtest: reopening after a short failed write preserves the global offset gap
+ok 76 - reopening after a short failed write preserves the global offset gap
+  ---
+  duration_ms: 2.32774
+  type: 'test'
+  ...
+# Subtest: pruning old segments preserves monotonically increasing offsets
+ok 77 - pruning old segments preserves monotonically increasing offsets
+  ---
+  duration_ms: 3.372129
+  type: 'test'
+  ...
+# Subtest: the global cap prunes the oldest segments across scope directories
+ok 78 - the global cap prunes the oldest segments across scope directories
+  ---
+  duration_ms: 3.826738
+  type: 'test'
+  ...
+# Subtest: SWITCHBOARD_RECORD=0 disables recording while recording defaults on
+ok 79 - SWITCHBOARD_RECORD=0 disables recording while recording defaults on
+  ---
+  duration_ms: 0.146688
+  type: 'test'
+  ...
+# Subtest: sess-list and sess-read protocol responses use the persisted store
+ok 80 - sess-list and sess-read protocol responses use the persisted store
+  ---
+  duration_ms: 2.559464
+  type: 'test'
+  ...
+# Subtest: session records persist account ownership and legacy records migrate to the machine owner
+ok 81 - session records persist account ownership and legacy records migrate to the machine owner
+  ---
+  duration_ms: 2.781358
+  type: 'test'
+  ...
+# Subtest: an interrupted segment roll keeps one logical segment and does not double-count bytes
+ok 82 - an interrupted segment roll keeps one logical segment and does not double-count bytes
+  ---
+  duration_ms: 1.324001
+  type: 'test'
+  ...
+# Subtest: a stale compression marker never makes an uncompressed segment unreadable
+ok 83 - a stale compression marker never makes an uncompressed segment unreadable
+  ---
+  duration_ms: 0.637353
+  type: 'test'
+  ...
+# Subtest: one unreadable session record cannot stop the store from loading the rest
+ok 84 - one unreadable session record cannot stop the store from loading the rest
+  ---
+  duration_ms: 0.994816
+  type: 'test'
+  ...
+# Subtest: replay planning chooses an exact delta only for a readable gap up to 1 MiB
+ok 85 - replay planning chooses an exact delta only for a readable gap up to 1 MiB
+  ---
+  duration_ms: 1.161506
+  type: 'test'
+  ...
+# Subtest: incremental replay flushes the session log and preserves UTF-8 bytes
+ok 86 - incremental replay flushes the session log and preserves UTF-8 bytes
+  ---
+  duration_ms: 13.742083
+  type: 'test'
+  ...
+# Subtest: snapshot replay serializes the screen and anchors future output at the raw offset
+ok 87 - snapshot replay serializes the screen and anchors future output at the raw offset
+  ---
+  duration_ms: 3.840559
+  type: 'test'
+  ...
+# Subtest: session grace defaults to 24h, accepts units, and treats zero as forever
+ok 88 - session grace defaults to 24h, accepts units, and treats zero as forever
+  ---
+  duration_ms: 0.35515
+  type: 'test'
+  ...
+# Subtest: daemon session retention requires both replay and PTY holder features
+ok 89 - daemon session retention requires both replay and PTY holder features
+  ---
+  duration_ms: 0.979292
+  type: 'test'
+  ...
+# Subtest: client-gone stays enabled until holder-aware retention is confirmed
+ok 90 - client-gone stays enabled until holder-aware retention is confirmed
+  ---
+  duration_ms: 0.183655
+  type: 'test'
+  ...
+# Subtest: byte offsets accumulate safely
+ok 91 - byte offsets accumulate safely
+  ---
+  duration_ms: 0.176889
+  type: 'test'
+  ...
+# Subtest: the webshell keeps no shell state in browser storage
+ok 92 - the webshell keeps no shell state in browser storage
+  ---
+  duration_ms: 1.71576
+  type: 'test'
+  ...
+# Subtest: history text strips ANSI across chunks
+ok 93 - history text strips ANSI across chunks
+  ---
+  duration_ms: 2.311685
+  type: 'test'
+  ...
+# Subtest: history text strips split terminal control strings without losing later output
+ok 94 - history text strips split terminal control strings without losing later output
+  ---
+  duration_ms: 0.436335
+  type: 'test'
+  ...
+# Subtest: history text folds alternate screens with the application name
+ok 95 - history text folds alternate screens with the application name
+  ---
+  duration_ms: 0.49458
+  type: 'test'
+  ...
+# Subtest: history text uses a generic alternate-screen label when unknown
+ok 96 - history text uses a generic alternate-screen label when unknown
+  ---
+  duration_ms: 0.33475
+  type: 'test'
+  ...
+# Subtest: history text includes alternate-screen content when requested
+ok 97 - history text includes alternate-screen content when requested
+  ---
+  duration_ms: 0.286323
+  type: 'test'
+  ...
+# Subtest: history text supports split alternate-screen controls
+ok 98 - history text supports split alternate-screen controls
+  ---
+  duration_ms: 0.206781
+  type: 'test'
+  ...
+# Subtest: indexed alternate screens use recorded offsets and duration
+ok 99 - indexed alternate screens use recorded offsets and duration
+  ---
+  duration_ms: 0.463703
+  type: 'test'
+  ...
+# Subtest: active indexed alternate screens hide content without emitting a completed label
+ok 100 - active indexed alternate screens hide content without emitting a completed label
+  ---
+  duration_ms: 0.169227
+  type: 'test'
+  ...
+# Subtest: history duration formatting is compact
+ok 101 - history duration formatting is compact
+  ---
+  duration_ms: 0.339459
+  type: 'test'
+  ...
+1..101
+# tests 101
+# suites 0
+# pass 101
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 8339.754502

@@ -510,6 +510,31 @@ test("sess-list and sess-read protocol responses use the persisted store", async
   fs.rmSync(dir, { recursive: true });
 });
 
+test("session records persist account ownership and legacy records migrate to the machine owner", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "switchboard-session-owner-"));
+  const store = new SessionLogStore({ dir }).init();
+  const owned = store.open("storage-owned", {
+    sid: "browser-owned", ownerAccountId: "guest-1", cols: 80, rows: 24,
+  });
+  owned.append("guest output");
+  await owned.close();
+
+  const legacy = store.open("legacy-browser-sid");
+  legacy.append("owner output");
+  await legacy.close();
+  assert.equal(store.assignLegacyOwner("owner-1"), 1);
+
+  const reloaded = new SessionLogStore({ dir }).init();
+  assert.deepEqual(
+    reloaded.list().map(({ sid, ownerAccountId, legacy: isLegacy }) => ({ sid, ownerAccountId, legacy: isLegacy })),
+    [
+      { sid: "legacy-browser-sid", ownerAccountId: "owner-1", legacy: true },
+      { sid: "browser-owned", ownerAccountId: "guest-1", legacy: false },
+    ],
+  );
+  fs.rmSync(dir, { recursive: true });
+});
+
 function compressBytes(value) {
   return zlib.zstdCompressSync ? zlib.zstdCompressSync(value) : zlib.gzipSync(value);
 }

@@ -147,6 +147,10 @@ class SessionLogStore {
       record = {
         version: 1,
         sid,
+        publicSid: validId(info.sid) ? info.sid : sid,
+        ownerAccountId: typeof info.ownerAccountId === "string" && info.ownerAccountId
+          ? info.ownerAccountId : null,
+        legacy: !!info.legacy,
         scope: this.scope,
         segmentSize: this.segmentSize,
         createdAt: now,
@@ -174,6 +178,11 @@ class SessionLogStore {
       record.updatedAt = now;
       if (info.cols > 0) record.cols = Math.floor(info.cols);
       if (info.rows > 0) record.rows = Math.floor(info.rows);
+      if (!record.publicSid && validId(info.sid)) record.publicSid = info.sid;
+      if (!record.ownerAccountId && typeof info.ownerAccountId === "string" && info.ownerAccountId) {
+        record.ownerAccountId = info.ownerAccountId;
+        record.legacy = !!info.legacy;
+      }
     }
     this.records.set(sid, record);
 
@@ -458,12 +467,28 @@ class SessionLogStore {
     return this._publicStat(record);
   }
 
-  list() {
+  list(predicate = null) {
     return [...this.records.values()]
       .filter((record) => this.active.has(record.sid) || record.segments.length ||
         this.now() - (record.closedAt || record.updatedAt || record.createdAt) <= this.retentionMs)
+      .filter((record) => !predicate || predicate(this._publicStat(record)))
       .sort((a, b) => b.startedAt - a.startedAt)
       .map((record) => this._publicStat(record));
+  }
+
+  assignLegacyOwner(ownerAccountId) {
+    if (typeof ownerAccountId !== "string" || !ownerAccountId) return 0;
+    let changed = 0;
+    for (const record of this.records.values()) {
+      if (record.ownerAccountId) continue;
+      record.ownerAccountId = ownerAccountId;
+      record.publicSid ||= record.sid;
+      record.legacy = true;
+      record.updatedAt = this.now();
+      this._persist(record);
+      changed++;
+    }
+    return changed;
   }
 
   prune() {
@@ -663,7 +688,10 @@ class SessionLogStore {
     const active = !!state && !state.failed;
     const first = readable[0]?.start ?? record.nextOffset;
     return {
-      sid: record.sid,
+      sid: record.publicSid || record.sid,
+      storageId: record.sid,
+      ownerAccountId: record.ownerAccountId || null,
+      legacy: !!record.legacy,
       status: active ? "running" : state?.failed ? "recording-error" : record.status,
       active,
       createdAt: record.createdAt,
@@ -876,6 +904,10 @@ function loadRecordAt(sessionDir, sid, scope, segmentSize, now) {
     ...meta,
     version: 1,
     sid,
+    publicSid: validId(meta.publicSid) ? meta.publicSid : sid,
+    ownerAccountId: typeof meta.ownerAccountId === "string" && meta.ownerAccountId
+      ? meta.ownerAccountId : null,
+    legacy: !!meta.legacy,
     scope,
     segmentSize: positiveInt(meta.segmentSize, segmentSize),
     createdAt,
@@ -979,7 +1011,7 @@ function sessionLogListResponse(store, id) {
     type: "sess-list",
     id,
     recording: !!store,
-    sessions: store ? store.list() : [],
+    sessions: store ? store.list().map(({ storageId, ...session }) => session) : [],
   };
 }
 
@@ -993,6 +1025,7 @@ function sessionLogReadResponse(store, msg) {
       ? Math.min(DEFAULT_READ_LENGTH, requested)
       : DEFAULT_READ_LENGTH;
     const chunk = store.read(String(msg.sid), { from: msg.from, len });
+    const { storageId, ...stat } = chunk.stat;
     return {
       type: "sess-chunk",
       id: msg.id,
@@ -1002,7 +1035,7 @@ function sessionLogReadResponse(store, msg) {
       next: chunk.next,
       eof: chunk.eof,
       alternateScreens: chunk.alternateScreens,
-      stat: chunk.stat,
+      stat,
     };
   } catch (error) {
     return { type: "sess-error", id: msg.id, sid: msg.sid, message: error.message };
