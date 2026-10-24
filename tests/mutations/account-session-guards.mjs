@@ -89,6 +89,8 @@ const ownerSession = { sid: "owner-shell", ownerAccountId: "owner-1" };
 const visitorSession = { sid: "visitor-shell", ownerAccountId: "visitor-1" };
 const actionGuard =
   "  if (!SESSION_ACTION_SET.has(action) || !validPrincipal(principal) || !session?.ownerAccountId) return false;";
+const jobActionGuard =
+  "  if (!JOB_ACTION_SET.has(action) || !validPrincipal(principal) || !job?.ownerAccountId) return false;";
 
 for (const action of daemon.SESSION_ACTIONS) {
   await expectKilled(
@@ -101,6 +103,23 @@ for (const action of daemon.SESSION_ACTIONS) {
     ))),
     (mutant) => assert.equal(
       mutant.canAccessSessionFor(action, visitor, ownerSession, "owner-1"),
+      false,
+      `${action} must not cross accounts`,
+    ),
+  );
+}
+
+for (const action of daemon.JOB_ACTIONS) {
+  await expectKilled(
+    `daemon ${action} ownership filter`,
+    () => Promise.resolve(loadDaemon(replaceExactlyOnce(
+      daemonSource,
+      jobActionGuard,
+      `  if (action === ${JSON.stringify(action)}) return true;\n${jobActionGuard}`,
+      `${action} ownership filter`,
+    ))),
+    (mutant) => assert.equal(
+      mutant.canAccessJobFor(action, visitor, { id: "owner-job", ownerAccountId: "owner-1" }, "owner-1"),
       false,
       `${action} must not cross accounts`,
     ),
@@ -184,4 +203,4 @@ await expectKilled(
 
 assert.equal(killed, total);
 console.log(`mutation summary: ${killed}/${total} killed, 0 survived`);
-console.log("covered: relay stamp/output route, every daemon session message class, input lookup, revoke/expiry cleanup, deadline, and reconnect snapshot");
+console.log("covered: relay stamp/output route, every daemon session and detached-job ownership class, input lookup, revoke/expiry cleanup, deadline, and reconnect snapshot");

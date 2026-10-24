@@ -16,6 +16,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const rootRequire = createRequire(import.meta.url);
 const cliRequire = createRequire(path.join(root, "cli", "index.js"));
 const WebSocket = cliRequire("ws");
+const { JobStore } = cliRequire("./lib/job-store.js");
 const { stopPtyHolders } = cliRequire("./lib/pty-holder.js");
 const { SessionLogStore } = cliRequire("./lib/session-log.js");
 const wrangler = rootRequire.resolve("wrangler");
@@ -147,6 +148,21 @@ async function createLegacyRecord() {
   await handle.close({ exitCode: 0 });
 }
 
+async function createLegacyJobRecord() {
+  const store = new JobStore({
+    dir: path.join(home, ".switchboard", "jobs", machineId),
+  }).init();
+  store.create({
+    id: "legacy-job-0001",
+    command: "printf LEGACY_OWNER_ONLY_JOB",
+    cwd: home,
+    shell: "/bin/sh",
+    login: false,
+  });
+  store.append("legacy-job-0001", "LEGACY_OWNER_ONLY_JOB\n");
+  await store.finish("legacy-job-0001", { exitCode: 0 });
+}
+
 function cookieHeader(token) { return `sb_session=${encodeURIComponent(token)}`; }
 
 class BrowserSocket {
@@ -241,6 +257,22 @@ class BrowserSocket {
 
   close() {
     try { this.ws?.close(); } catch {}
+  }
+
+  async disconnect(closeEchoMs = 250) {
+    const ws = this.ws;
+    if (!ws || ws.readyState === WebSocket.CLOSED) return true;
+    const closed = once(ws, "close").then(() => true, () => false);
+    try { ws.close(); } catch {}
+    const echoed = await Promise.race([closed, delay(closeEchoMs).then(() => false)]);
+    if (!echoed && ws.readyState !== WebSocket.CLOSED) {
+      // Workerd can accept the peer FIN without echoing a WebSocket close frame,
+      // leaving ws in CLOSING indefinitely. The transport teardown is local test
+      // cleanup; the server-side expiry/PTY/history assertions below remain the gate.
+      try { ws.terminate(); } catch {}
+      sockets.delete(ws);
+    }
+    return echoed;
   }
 }
 
@@ -349,6 +381,7 @@ try {
   fs.mkdirSync(path.join(home, ".switchboard"), { recursive: true });
   await seedDatabase();
   await createLegacyRecord();
+  await createLegacyJobRecord();
 
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -406,6 +439,128 @@ try {
     (message) => message.type === "_relay" && message.event === "access-context" && message.accessVia === "grant",
     "grant access context",
   );
+
+  const ownerJobSecret = `F1_OWNER_JOB_SECRET_${runId}`;
+  const ownerJobCwd = path.join(home, `owner-job-cwd-${runId}`);
+  fs.mkdirSync(ownerJobCwd, { recursive: true });
+  const ownerJobStarted = await ownerClient.request({
+    type: "exec",
+    cmd: `printf '${ownerJobSecret}\\n'; sleep 120`,
+    detach: true,
+    login: false,
+    cwd: ownerJobCwd,
+    // All of these are browser-controlled lies. Only the relay envelope may own the job.
+    accountId: visitor.id,
+    ownerAccountId: visitor.id,
+    principal: { accountId: visitor.id, accessVia: "grant", clientId: "forged" },
+  });
+  assert.equal(ownerJobStarted.type, "exec-job");
+  const ownerJobId = ownerJobStarted.job;
+
+  const visitorJobMarker = `VISITOR_JOB_OUTPUT_${runId}`;
+  const visitorJobStarted = await visitorClient.request({
+    type: "exec",
+    cmd: `printf '${visitorJobMarker}\\n'; sleep 120`,
+    detach: true,
+    login: false,
+    accountId: owner.id,
+    ownerAccountId: owner.id,
+    principal: { accountId: owner.id, accessVia: "owner", clientId: "forged" },
+  });
+  assert.equal(visitorJobStarted.type, "exec-job");
+  const visitorJobId = visitorJobStarted.job;
+
+  await waitUntil(async () => {
+    const chunk = await ownerClient.request({ type: "job-read", job: ownerJobId, offset: 0 });
+    return chunk.type === "job-chunk" &&
+      Buffer.from(chunk.data, "base64").toString("utf8").includes(ownerJobSecret) && chunk;
+  }, "owner detached job output", 15000);
+  await waitUntil(async () => {
+    const chunk = await visitorClient.request({ type: "job-read", job: visitorJobId, offset: 0 });
+    return chunk.type === "job-chunk" &&
+      Buffer.from(chunk.data, "base64").toString("utf8").includes(visitorJobMarker) && chunk;
+  }, "visitor detached job output", 15000);
+
+  const forgedVisitorJobs = await visitorClient.request({
+    type: "job-list",
+    accountId: owner.id,
+    ownerAccountId: owner.id,
+    principal: { accountId: owner.id, accessVia: "owner", clientId: "forged" },
+  });
+  assert.equal(forgedVisitorJobs.type, "job-list");
+  assert.ok(forgedVisitorJobs.jobs.some(
+    (job) => job.id === visitorJobId && job.ownerAccountId === visitor.id,
+  ));
+  assert.ok(!forgedVisitorJobs.jobs.some((job) => job.id === ownerJobId));
+  assert.ok(!forgedVisitorJobs.jobs.some((job) => job.id === "legacy-job-0001"));
+  assert.doesNotMatch(JSON.stringify(forgedVisitorJobs), new RegExp(ownerJobSecret));
+  assert.doesNotMatch(
+    JSON.stringify(forgedVisitorJobs),
+    new RegExp(ownerJobCwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+
+  for (const type of ["job-read", "job-get"]) {
+    const denied = await visitorClient.request({
+      type,
+      job: ownerJobId,
+      offset: 0,
+      accountId: owner.id,
+      ownerAccountId: owner.id,
+    });
+    assert.equal(denied.type, "job-error");
+    assert.match(denied.message, /no such accessible job/);
+    assert.equal("record" in denied, false);
+    assert.equal("data" in denied, false);
+  }
+
+  visitorClient.sendJson({
+    type: "exec-kill",
+    id: ownerJobId,
+    signal: "SIGTERM",
+    accountId: owner.id,
+    ownerAccountId: owner.id,
+  });
+  await delay(400);
+  const ownerJobAfterDeniedKill = await ownerClient.request({ type: "job-get", job: ownerJobId });
+  assert.equal(ownerJobAfterDeniedKill.type, "job-status");
+  assert.equal(ownerJobAfterDeniedKill.record.status, "running");
+
+  const sameAccountJobs = await visitorObserver.request({ type: "job-list" });
+  assert.ok(sameAccountJobs.jobs.some((job) => job.id === visitorJobId));
+  assert.ok(!sameAccountJobs.jobs.some((job) => job.id === ownerJobId));
+  const sameAccountRead = await visitorObserver.request({
+    type: "job-read", job: visitorJobId, offset: 0,
+  });
+  assert.equal(sameAccountRead.type, "job-chunk");
+  assert.match(Buffer.from(sameAccountRead.data, "base64").toString("utf8"), new RegExp(visitorJobMarker));
+
+  const ownerJobs = await ownerClient.request({ type: "job-list" });
+  assert.ok(ownerJobs.jobs.some(
+    (job) => job.id === ownerJobId && job.ownerAccountId === owner.id &&
+      job.command.includes(ownerJobSecret) && job.cwd === ownerJobCwd,
+  ));
+  assert.ok(ownerJobs.jobs.some(
+    (job) => job.id === visitorJobId && job.ownerAccountId === visitor.id,
+  ));
+  assert.ok(ownerJobs.jobs.some(
+    (job) => job.id === "legacy-job-0001" && job.ownerAccountId === owner.id && job.legacy === true,
+  ));
+  const supervisedJobRead = await ownerClient.request({
+    type: "job-read", job: visitorJobId, offset: 0,
+  });
+  assert.equal(supervisedJobRead.type, "job-chunk");
+  assert.match(Buffer.from(supervisedJobRead.data, "base64").toString("utf8"), new RegExp(visitorJobMarker));
+
+  ownerClient.sendJson({ type: "exec-kill", id: visitorJobId, signal: "SIGTERM" });
+  await waitUntil(async () => {
+    const status = await ownerClient.request({ type: "job-get", job: visitorJobId });
+    return status.type === "job-status" && status.record.status !== "running" && status;
+  }, "machine owner terminates visitor detached job", 15000);
+  ownerClient.sendJson({ type: "exec-kill", id: ownerJobId, signal: "SIGTERM" });
+  await waitUntil(async () => {
+    const status = await ownerClient.request({ type: "job-get", job: ownerJobId });
+    return status.type === "job-status" && status.record.status !== "running" && status;
+  }, "owner terminates own detached job", 15000);
 
   const ownerSid = "owner-shell";
   const visitorSid = "visitor-shell";
@@ -640,6 +795,16 @@ try {
     return record && record.active === false && record.closedAt;
   }, "offline-revoked visitor PTY history closes", 15000);
 
+  const ownerJobsAfterRestart = await ownerClient.request({ type: "job-list" });
+  const visitorJobsAfterRestart = await visitorClient.request({ type: "job-list" });
+  assert.ok(ownerJobsAfterRestart.jobs.some((job) => job.id === ownerJobId));
+  assert.ok(ownerJobsAfterRestart.jobs.some((job) => job.id === visitorJobId));
+  assert.ok(visitorJobsAfterRestart.jobs.some((job) => job.id === visitorJobId));
+  assert.ok(!visitorJobsAfterRestart.jobs.some((job) => job.id === ownerJobId));
+  const persistedVisitorJob = await visitorObserver.request({ type: "job-get", job: visitorJobId });
+  assert.equal(persistedVisitorJob.type, "job-status");
+  assert.equal(persistedVisitorJob.record.ownerAccountId, visitor.id);
+
   const revokeSid = "visitor-revoke-shell";
   visitorClient.sendJson({ type: "open", sid: revokeSid, cols: 80, rows: 24, snapshot: true });
   const revokeSupervision = await ownerClient.sessions(
@@ -690,8 +855,8 @@ try {
     "expiring shell visible to owner",
   );
   const expiryWireSid = expirySupervision.list.find((session) => session.sessionSid === expiringSid).sid;
-  expiringClient.close();
-  await waitUntil(() => expiringClient.closed, "expiring visitor disconnect");
+  await expiringClient.disconnect();
+  assert.notEqual(expiringClient.ws.readyState, WebSocket.OPEN);
   await ownerClient.sessions(
     (list) => list.some((session) => session.sessionSid === expiringSid),
     "disconnected expiring visitor PTY remains before its grant deadline",
@@ -711,13 +876,18 @@ try {
     fs.readFileSync(path.join(home, ".switchboard", "sessions", machineId, "legacy-unowned", "meta.json"), "utf8"),
     new RegExp(`"ownerAccountId"\\s*:\\s*"${owner.id}"`),
   );
+  assert.match(
+    fs.readFileSync(path.join(home, ".switchboard", "jobs", machineId, "legacy-job-0001.json"), "utf8"),
+    new RegExp(`"ownerAccountId"\\s*:\\s*"${owner.id}"`),
+  );
 
   ownerClient.close();
   console.log(`account visibility E2E passed (relay port ${port})`);
   console.log("relay-authenticated identity defeated forged owner fields; owner and visitor lists/output/input stayed scoped");
   console.log("owner supervised and closed visitor PTYs; live revoke, offline revoke reconciliation, and disconnected-client expiry terminated visitor PTYs");
   console.log("history, replay inputs, activity, and adjacent exec streams stayed scoped to their authenticated audience");
-  console.log("legacy daemon grants failed with HTTP 426; unowned legacy history migrated to the machine owner only");
+  console.log("detached jobs rejected forged/cross-account list, read, get, and kill; same-account access, owner supervision, and restart persistence passed");
+  console.log("legacy daemon grants failed with HTTP 426; unowned legacy history and jobs migrated to the machine owner only");
   console.log("visitor disclosure and owner visitor-tab labels were rendered by the production frontend");
 } catch (error) {
   failure = error;

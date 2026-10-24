@@ -25,6 +25,18 @@ class JobStore {
       try {
         const record = JSON.parse(fs.readFileSync(path.join(this.dir, name), "utf8"));
         if (!validId(record.id)) continue;
+        let changed = false;
+        if (!validOwnerAccountId(record.ownerAccountId)) {
+          if (record.ownerAccountId !== null) changed = true;
+          record.ownerAccountId = null;
+        }
+        if (record.ownerAccountId == null && record.legacy !== true) {
+          record.legacy = true;
+          changed = true;
+        } else if (record.ownerAccountId != null && typeof record.legacy !== "boolean") {
+          record.legacy = false;
+          changed = true;
+        }
         const logSize = statSize(this.logPath(record.id));
         record.bytesStored = logSize;
         if (record.status === "running") {
@@ -32,6 +44,8 @@ class JobStore {
           record.endedAt = this.now();
           record.error = "daemon restarted while this job was running";
           record.exitCode = null;
+          this.persist(record);
+        } else if (changed) {
           this.persist(record);
         }
         this.records.set(record.id, record);
@@ -62,10 +76,15 @@ class JobStore {
       throw new Error(`too many retained or running jobs (max ${this.maxRecords})`);
     }
     if (this.records.has(input.id)) throw new Error("job id already exists");
+    if (input.ownerAccountId != null && !validOwnerAccountId(input.ownerAccountId)) {
+      throw new Error("invalid job owner account id");
+    }
     const now = this.now();
     const command = String(input.command);
     const record = {
       id: input.id,
+      ownerAccountId: input.ownerAccountId || null,
+      legacy: !!input.legacy,
       command: command.length > 4096 ? command.slice(0, 4095) + "…" : command,
       cwd: input.cwd,
       shell: input.shell,
@@ -178,6 +197,19 @@ class JobStore {
       .map((record) => ({ ...record }));
   }
 
+  assignLegacyOwner(ownerAccountId) {
+    if (!validOwnerAccountId(ownerAccountId)) throw new Error("invalid legacy job owner account id");
+    let changed = 0;
+    for (const record of this.records.values()) {
+      if (record.ownerAccountId) continue;
+      record.ownerAccountId = ownerAccountId;
+      record.legacy = true;
+      this.persist(record);
+      changed++;
+    }
+    return changed;
+  }
+
   read(id, offset = 0, length = 64 * 1024) {
     if (!this.records.has(id)) throw Object.assign(new Error("no such job"), { code: "ENOENT" });
     const fd = fs.openSync(this.logPath(id), "r");
@@ -228,6 +260,9 @@ class JobStore {
 function validId(id) {
   return typeof id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(id);
 }
+function validOwnerAccountId(accountId) {
+  return typeof accountId === "string" && accountId.length > 0 && accountId.length <= 512;
+}
 function statSize(file) {
   try { return fs.statSync(file).size; } catch { return 0; }
 }
@@ -238,4 +273,5 @@ module.exports = {
   DEFAULT_RETENTION_MS,
   JobStore,
   validId,
+  validOwnerAccountId,
 };

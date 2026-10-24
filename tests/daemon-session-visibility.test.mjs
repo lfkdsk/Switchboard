@@ -118,6 +118,22 @@ test("owner supervises every session while grants see only their own", () => {
   assert.deepEqual(visibility.visibleSessions([ownerSession, guestSession], owner, "owner-1"), [ownerSession, guestSession]);
 });
 
+test("detached jobs are same-account resources with an owner supervisor", () => {
+  const ownerJob = { id: "owner-job", ownerAccountId: "owner-1" };
+  const guestJob = { id: "guest-job", ownerAccountId: "guest-1" };
+  const legacyUnownedJob = { id: "legacy-job", ownerAccountId: null };
+
+  for (const action of visibility.JOB_ACTIONS) {
+    assert.equal(visibility.canAccessJobFor(action, owner, ownerJob, "owner-1"), true);
+    assert.equal(visibility.canAccessJobFor(action, owner, guestJob, "owner-1"), true);
+    assert.equal(visibility.canAccessJobFor(action, guest, guestJob, "owner-1"), true);
+    assert.equal(visibility.canAccessJobFor(action, guest, ownerJob, "owner-1"), false);
+    assert.equal(visibility.canAccessJobFor(action, otherGuest, guestJob, "owner-1"), false);
+    assert.equal(visibility.canAccessJobFor(action, owner, legacyUnownedJob, "owner-1"), false);
+  }
+  assert.equal(visibility.canAccessJobFor("job-delete", owner, ownerJob, "owner-1"), false);
+});
+
 test("the same browser sid is namespaced by account and has a distinct owner-supervisor id", () => {
   assert.notEqual(
     visibility.sessionStorageId(ownerSession.ownerAccountId, ownerSession.sid),

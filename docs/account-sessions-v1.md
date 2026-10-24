@@ -19,14 +19,19 @@ user.
   input, resize, or session-relative upload authority.
 - Other visitor accounts cannot see one another.
 - Live output, lifecycle events, history, and activity follow the same policy.
+- The relay-authenticated account also owns every detached job. Visitors can
+  list, read, inspect, and terminate only jobs owned by their account; the
+  machine owner may supervise and terminate all jobs. Browser `accountId`,
+  `ownerAccountId`, and `principal` fields never participate in attribution.
 - Download, upload, job, and exec request streams return to the exact relay
   client that initiated the request, even when another tab uses the same account.
 - Grant revocation or expiry closes the visitor sockets and terminates every
   opening or live PTY owned by that visitor account. The trusted deadline is
   also persisted with detached holders, so expiry does not depend on a visitor
   socket remaining connected or on relay traffic arriving at the deadline.
-- Recovered holder/log records without an owner are assigned to the machine
-  owner and marked `legacy`; they are never exposed to a visitor.
+- Recovered holder/log records and detached-job records without an owner are
+  assigned to the machine owner and marked `legacy`; they are never exposed to
+  a visitor.
 
 The browser UI tells a visitor that the machine owner can observe the terminal
 and its history and can close it. Owner tabs for visitor sessions are labeled
@@ -207,8 +212,9 @@ not use these envelopes.
 
 The unit tests validate relay stamping and route stripping, nonce and malformed
 frame rejection, owner/visitor policy, account-derived session ids, every
-session-bearing message class, exact-client request routes, and legacy record
-migration. The real account-mode webshell E2E uses isolated Wrangler/D1 and
-daemon state to validate two-account positive and negative behavior, frontend
+session- and detached-job-bearing message class, exact-client request routes,
+and legacy record migration. The real account-mode webshell E2E uses isolated
+Wrangler/D1 and daemon state to validate two-account positive and negative
+behavior (including forged and cross-account detached-job operations), frontend
 disclosure, live and daemon-offline revocation, restart reconciliation, expiry,
 and old-daemon rejection.

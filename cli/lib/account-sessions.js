@@ -34,6 +34,13 @@ const OWNER_SUPERVISOR_ACTIONS = Object.freeze([
   "reset",
 ]);
 const OWNER_SUPERVISOR_ACTION_SET = new Set(OWNER_SUPERVISOR_ACTIONS);
+const JOB_ACTIONS = Object.freeze([
+  "job-list",
+  "job-read",
+  "job-get",
+  "job-kill",
+]);
+const JOB_ACTION_SET = new Set(JOB_ACTIONS);
 
 function validPrincipal(principal) {
   return principal && typeof principal.accountId === "string" && !!principal.accountId &&
@@ -196,6 +203,12 @@ function canAccessSessionFor(action, principal, session, machineOwnerAccountId) 
     principal.accessVia === "owner" && principal.accountId === machineOwnerAccountId;
 }
 
+function canAccessJobFor(action, principal, job, machineOwnerAccountId) {
+  if (!JOB_ACTION_SET.has(action) || !validPrincipal(principal) || !job?.ownerAccountId) return false;
+  if (principal.accountId === job.ownerAccountId) return true;
+  return principal.accessVia === "owner" && principal.accountId === machineOwnerAccountId;
+}
+
 function ownedSessionEntries(entries, accountId) {
   if (typeof accountId !== "string" || !accountId) return [];
   return [...entries].filter(([, session]) => session?.ownerAccountId === accountId);
@@ -228,10 +241,12 @@ function visibleSessions(entries, principal, machineOwnerAccountId) {
 module.exports = {
   FEATURE,
   INPUT_MAGIC,
+  JOB_ACTIONS,
   OUTPUT_MAGIC,
   OWNER_SUPERVISOR_ACTIONS,
   SESSION_ACTIONS,
   accountRoute,
+  canAccessJobFor,
   canAccessSession,
   canAccessSessionFor,
   clientRoute,

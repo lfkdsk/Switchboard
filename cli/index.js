@@ -48,6 +48,7 @@ const {
 const {
   FEATURE: ACCOUNT_SESSIONS_FEATURE,
   accountRoute,
+  canAccessJobFor,
   canAccessSessionFor,
   clientRoute,
   daemonResponseRoute,
@@ -1547,6 +1548,7 @@ function sendCtl(obj, route = null, callback = undefined) {
 
 function adoptLegacyOwnership(ownerAccountId) {
   let changed = sessionLog?.assignLegacyOwner(ownerAccountId) || 0;
+  const migratedJobs = jobStore?.assignLegacyOwner(ownerAccountId) || 0;
   for (const s of sessions.values()) {
     if (s.ownerAccountId) continue;
     s.ownerAccountId = ownerAccountId;
@@ -1557,6 +1559,7 @@ function adoptLegacyOwnership(ownerAccountId) {
     changed++;
   }
   if (changed) log(`[sessions] assigned ${changed} legacy session record(s) to the machine owner`);
+  if (migratedJobs) log(`[jobs] assigned ${migratedJobs} legacy job record(s) to the machine owner`);
 }
 
 function endClientRequests(principal) {
@@ -1728,7 +1731,7 @@ function handleBrowserControl(principal, msg) {
     "sess-list", "sess-read", "ul-open",
   ]);
   const continuation = new Set([
-    "exec-stdin", "exec-stdin-end", "exec-kill", "dl-cancel", "ul-chunk", "ul-end",
+    "exec-stdin", "exec-stdin-end", "dl-cancel", "ul-chunk", "ul-end",
   ]);
   if (initialRequest.has(msg.type) && !beginRequest(principal, msg.id)) return;
   if (continuation.has(msg.type) && !ownsRequest(principal, msg.id)) return;
@@ -1776,12 +1779,12 @@ function handleBrowserControl(principal, msg) {
     case "exec": startExec(msg, principal); break;
     case "exec-stdin": execStdin(msg.id, msg.data); break;
     case "exec-stdin-end": execStdinEnd(msg.id, msg.sha256); break;
-    case "exec-kill": killExec(msg.id, msg.signal); break;
+    case "exec-kill": killExecForPrincipal(msg.id, msg.signal, principal); break;
     case "dl-open": startDownload(msg.id, msg.path, msg.base === "home", principal); break;
     case "dl-cancel": cancelDownload(msg.id); requestRoutes.delete(String(msg.id)); break;
-    case "job-list": sendJobList(msg.id); break;
-    case "job-read": sendJobRead(msg); break;
-    case "job-get": sendJobStatus(msg); break;
+    case "job-list": sendJobList(msg.id, principal); break;
+    case "job-read": sendJobRead(msg, principal); break;
+    case "job-get": sendJobStatus(msg, principal); break;
     case "sess-list": sendSessionLogList(msg.id, principal); break;
     case "sess-read": sendSessionLogRead(msg, principal); break;
     case "ul-open": startUpload(msg.id, msg.sid, msg.name, principal); break;
@@ -2165,7 +2168,10 @@ function startExec(msg, principal = null) {
   let job = null;
   if (detached) {
     try {
-      job = jobStore.create({ id, command: cmd, cwd, shell: selectedShell, login });
+      job = jobStore.create({
+        id, command: cmd, cwd, shell: selectedShell, login,
+        ownerAccountId: scopedSessions() ? principal.accountId : null,
+      });
     } catch (e) {
       if (upload) try { fs.unlinkSync(upload.tempPath); } catch {}
       return execFail(id, e.message, principal);
@@ -2324,28 +2330,54 @@ function killExec(id, signal) {
   } catch { try { child.kill(sig); } catch {} }
 }
 
-function sendJobList(id) {
-  if (!id) return;
-  sendCtl({ type: "job-list", id, jobs: jobStore.list() });
+function killExecForPrincipal(id, signal, principal) {
+  const running = activeExecs.get(id);
+  if (!running) return false;
+  if (scopedSessions()) {
+    if (running.detached) {
+      const record = jobStore.get(id);
+      if (!canAccessJobFor("job-kill", principal, record, machineOwnerAccountId)) return false;
+    } else if (!ownsRequest(principal, id)) {
+      return false;
+    }
+  }
+  killExec(id, signal);
+  return true;
 }
-function sendJobRead(msg) {
+
+function accessibleJob(principal, id, action) {
+  const record = jobStore.get(String(id));
+  if (!record || (scopedSessions() &&
+      !canAccessJobFor(action, principal, record, machineOwnerAccountId))) return null;
+  return record;
+}
+
+function sendJobList(id, principal) {
+  if (!id) return;
+  const jobs = jobStore.list().filter((record) =>
+    !scopedSessions() || canAccessJobFor("job-list", principal, record, machineOwnerAccountId));
+  sendRequestCtl({ type: "job-list", id, jobs }, principal);
+}
+function sendJobRead(msg, principal) {
   if (!msg.id || !msg.job) return;
   try {
+    const record = accessibleJob(principal, msg.job, "job-read");
+    if (!record) throw new Error("no such accessible job");
     const chunk = jobStore.read(String(msg.job), msg.offset, 64 * 1024);
-    sendCtl({
+    sendRequestCtl({
       type: "job-chunk", id: msg.id, job: msg.job, data: chunk.data.toString("base64"),
-      offset: chunk.offset, size: chunk.size, record: jobStore.get(String(msg.job)),
-    });
+      offset: chunk.offset, size: chunk.size, record,
+    }, principal);
   } catch (e) {
-    sendCtl({ type: "job-error", id: msg.id, job: msg.job, message: e.message });
+    sendRequestCtl({ type: "job-error", id: msg.id, job: msg.job, message: e.message }, principal);
   }
 }
-function sendJobStatus(msg) {
+function sendJobStatus(msg, principal) {
   if (!msg.id || !msg.job) return;
-  const record = jobStore.get(String(msg.job));
-  sendCtl(record
+  const record = accessibleJob(principal, msg.job, "job-get");
+  sendRequestCtl(record
     ? { type: "job-status", id: msg.id, job: msg.job, record }
-    : { type: "job-error", id: msg.id, job: msg.job, message: "no such job" });
+    : { type: "job-error", id: msg.id, job: msg.job, message: "no such accessible job" }, principal);
 }
 
 function visibleHistory(principal, action = "history-list") {

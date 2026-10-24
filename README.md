@@ -310,6 +310,12 @@ omitted. Finished and unknown jobs are kept for 24 hours, with at most 100 job
 records per target daemon. If the daemon restarts, a job that had been running is
 reported as `unknown`; completed records remain queryable.
 
+On account-bound machines, detached jobs are owned by the relay-authenticated
+account that created them; browser-supplied account fields are ignored. Visitors
+can list, read, inspect, and terminate only their own account's jobs. The machine
+owner can supervise and terminate every job. Older unowned records are migrated
+to the machine owner and are never exposed to a visitor.
+
 `cp` currently transfers one regular file. Downloads reuse the dashboard's
 streaming download protocol; uploads stream the local file to a target-side
 stdin sink (`cat` on POSIX) through exec. Both directions verify SHA-256 before replacing the
