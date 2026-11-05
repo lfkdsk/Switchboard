@@ -1,5 +1,7 @@
 import Foundation
 import AppKit
+import Darwin
+import UpdatePolicy
 
 /// Owns the Node daemon child process and the live state the menu renders.
 /// One instance, on the main actor; the only observable the UI binds to.
@@ -35,6 +37,12 @@ final class DaemonSupervisor: ObservableObject {
     private var backoffMs = 1000
     private var reconnectToken: String?
 
+    // Sparkle may only terminate this app after an atomic, fail-closed idle
+    // check. The completion is held until the supervised daemon has exited.
+    private let updateActivityProbe = UpdateActivityProbe()
+    private var updateStopCompletion: ((UpdateInstallDecision) -> Void)?
+    private var updateStopTimeout: DispatchWorkItem?
+
     // Crash rollback for hot-updated cli code: if a launch that ran a staged
     // update dies twice in a row within seconds, drop the update and let the
     // bundled cli take the next restart.
@@ -51,7 +59,7 @@ final class DaemonSupervisor: ObservableObject {
     // MARK: Lifecycle
 
     func start(login: Bool = false, oneOffToken: String? = nil) {
-        guard process == nil else { return }
+        guard process == nil, updateStopCompletion == nil else { return }
         guard let rt = NodeRuntime.resolve() else {
             runtimeMissing = true
             state = .fatal(.crashed)
@@ -143,6 +151,118 @@ final class DaemonSupervisor: ObservableObject {
         }
     }
 
+    /// Atomically transitions an idle daemon to stopped for a silent app update.
+    ///
+    /// A read-only preflight avoids pausing active work. If it looks idle, stop
+    /// the daemon, repeat the same probe while it cannot accept a new request,
+    /// and only then terminate it. Any missing or malformed signal postpones.
+    func prepareForAutomaticAppUpdate(
+        completion: @escaping (UpdateInstallDecision) -> Void
+    ) {
+        guard updateStopCompletion == nil else {
+            completion(.unavailable("Another app-update activity check is already in progress."))
+            return
+        }
+
+        guard let daemon = process else {
+            completion(UpdateInstallPolicy.evaluate(updateActivityProbe.snapshot(daemonPID: nil)))
+            return
+        }
+        guard daemon.isRunning else {
+            completion(.unavailable("The daemon is still finishing its shutdown."))
+            return
+        }
+
+        let pid = daemon.processIdentifier
+        let preflight = UpdateInstallPolicy.evaluate(updateActivityProbe.snapshot(daemonPID: pid))
+        guard preflight.canInstallAutomatically else {
+            completion(preflight)
+            return
+        }
+
+        guard Darwin.kill(pid, SIGSTOP) == 0 else {
+            completion(.unavailable("The daemon could not be paused for the final activity check."))
+            return
+        }
+
+        guard process === daemon, daemon.isRunning else {
+            _ = Darwin.kill(pid, SIGCONT)
+            completion(.unavailable("The daemon changed during the final activity check."))
+            return
+        }
+
+        let frozenDecision = UpdateInstallPolicy.evaluate(updateActivityProbe.snapshot(daemonPID: pid))
+        guard frozenDecision.canInstallAutomatically else {
+            _ = Darwin.kill(pid, SIGCONT)
+            completion(frozenDecision)
+            return
+        }
+
+        // SIGKILL is intentional here: the process is frozen and proven to have
+        // no child task, shell-holder socket, or running JobStore record. Keeping
+        // it frozen until death closes the check→stop race completely.
+        intentionalStop = true
+        cancelRestart()
+        stopStatusPolling()
+        updateStopCompletion = completion
+        guard Darwin.kill(pid, SIGKILL) == 0 else {
+            updateStopCompletion = nil
+            intentionalStop = false
+            _ = Darwin.kill(pid, SIGCONT)
+            startStatusPolling()
+            completion(.unavailable("The idle daemon could not be stopped for the app update."))
+            return
+        }
+        armUpdateStopWatchdog(for: daemon, forceOnTimeout: false)
+    }
+
+    /// Explicit menu action. The confirmation is owned by AppUpdater; unlike the
+    /// automatic path this may stop work because the user chose to restart now.
+    func prepareForUserRequestedAppUpdate(
+        completion: @escaping (UpdateInstallDecision) -> Void
+    ) {
+        guard updateStopCompletion == nil else {
+            completion(.unavailable("Another app-update stop is already in progress."))
+            return
+        }
+        guard let daemon = process else {
+            completion(.ready)
+            return
+        }
+
+        intentionalStop = true
+        cancelRestart()
+        stopStatusPolling()
+        updateStopCompletion = completion
+        if daemon.isRunning {
+            daemon.interrupt()
+            armUpdateStopWatchdog(for: daemon, forceOnTimeout: true)
+        } else {
+            armUpdateStopWatchdog(for: daemon, forceOnTimeout: true)
+        }
+    }
+
+    private func armUpdateStopWatchdog(for daemon: Process, forceOnTimeout: Bool) {
+        updateStopTimeout?.cancel()
+        let pid = daemon.processIdentifier
+        let work = DispatchWorkItem { [weak self, weak daemon] in
+            guard let self, let daemon, self.process === daemon,
+                  self.updateStopCompletion != nil else { return }
+            if forceOnTimeout, daemon.isRunning {
+                _ = Darwin.kill(pid, SIGKILL)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak daemon] in
+                guard let self, let daemon, self.process === daemon,
+                      let completion = self.updateStopCompletion else { return }
+                self.updateStopCompletion = nil
+                self.updateStopTimeout = nil
+                completion(.unavailable("The daemon did not stop in time for the app update."))
+            }
+        }
+        updateStopTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
+
     func signIn() {
         stop()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -186,9 +306,19 @@ final class DaemonSupervisor: ObservableObject {
 
     private func handleTermination(code: Int32) {
         process = nil
+        let appUpdateCompletion = updateStopCompletion
+        updateStopCompletion = nil
+        updateStopTimeout?.cancel()
+        updateStopTimeout = nil
         // Drain any final status lines the daemon wrote on its way out.
         drainStatus()
         stopStatusPolling()
+
+        if let appUpdateCompletion {
+            state = .stopped
+            appUpdateCompletion(.ready)
+            return
+        }
 
         if intentionalStop {
             state = .stopped

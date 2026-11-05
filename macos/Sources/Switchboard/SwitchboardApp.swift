@@ -42,6 +42,7 @@ struct SwitchboardApp: App {
     @StateObject private var prefs: Prefs
     @StateObject private var supervisor: DaemonSupervisor
     @StateObject private var updater: DaemonUpdater
+    @StateObject private var appUpdater: AppUpdater
     @StateObject private var accountStore: AccountStore
     @StateObject private var avatarLoader: AvatarLoader
     @StateObject private var fullDiskAccess: FullDiskAccessStore
@@ -50,14 +51,17 @@ struct SwitchboardApp: App {
         let p = Prefs()
         let s = DaemonSupervisor(prefs: p)
         let u = DaemonUpdater()
+        let appUpdate = AppUpdater()
         let a = AccountStore(supervisor: s)
         let avatar = AvatarLoader()
         let fda = FullDiskAccessStore()
         avatar.bind(to: a)
         u.supervisor = s
+        appUpdate.supervisor = s
         _prefs = StateObject(wrappedValue: p)
         _supervisor = StateObject(wrappedValue: s)
         _updater = StateObject(wrappedValue: u)
+        _appUpdater = StateObject(wrappedValue: appUpdate)
         _accountStore = StateObject(wrappedValue: a)
         _avatarLoader = StateObject(wrappedValue: avatar)
         _fullDiskAccess = StateObject(wrappedValue: fda)
@@ -69,6 +73,7 @@ struct SwitchboardApp: App {
                 supervisor: supervisor,
                 prefs: prefs,
                 updater: updater,
+                appUpdater: appUpdater,
                 accountStore: accountStore,
                 avatarLoader: avatarLoader,
                 fullDiskAccess: fullDiskAccess
@@ -82,6 +87,7 @@ struct SwitchboardApp: App {
                 // auto-start would never see a supervisor.
                 .onAppear {
                     appDelegate.supervisor = supervisor
+                    appDelegate.appUpdater = appUpdater
                     updater.startAutoChecks()
                 }
         }
@@ -89,6 +95,7 @@ struct SwitchboardApp: App {
     }
 
     private var iconName: String {
+        if appUpdater.status.hasUpdate { return "arrow.down.circle.fill" }
         switch supervisor.state {
         case .online: return "powerplug.fill"
         case .fatal: return "exclamationmark.triangle.fill"
@@ -106,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var supervisor: DaemonSupervisor? {
         didSet { autoStartIfNeeded() }
     }
+    weak var appUpdater: AppUpdater?
     private var didAutoStart = false
     private var didFinishLaunching = false
 
@@ -125,6 +133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ConfigReader.read().signedIn {
             supervisor.start()
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        appUpdater?.shouldAllowApplicationTermination() == false ? .terminateCancel : .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {

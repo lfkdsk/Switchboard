@@ -29,6 +29,8 @@ jobs:
         run: |
           node --check cli/index.js
           node --check cli/scripts/fix-pty-perms.js
+      - name: Test fail-closed app-update policy
+        run: swift test --package-path macos
 
   app:
     name: Build & package (${{ matrix.arch }})
@@ -57,12 +59,28 @@ jobs:
       # bundle's CFBundleVersion stays a valid period-separated number.
       - name: Resolve version
         id: ver
+        working-directory: macos
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            bash scripts/version-info.sh "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
           else
-            echo "version=0.1.0" >> "$GITHUB_OUTPUT"
+            bash scripts/version-info.sh 0.1.0 >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Require Sparkle release keys
+        if: env.SIGNED == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_ED_PUBLIC_KEY }}
+        run: |
+          test -n "$SPARKLE_ED_PRIVATE_KEY" || {
+            echo "SPARKLE_ED_PRIVATE_KEY secret is required for tag builds" >&2
+            exit 1
+          }
+          test -n "$SPARKLE_PUBLIC_ED_KEY" || {
+            echo "SPARKLE_ED_PUBLIC_KEY repository variable is required for tag builds" >&2
+            exit 1
+          }
 
       # Only tag builds are signed for real: branch and PR runs have no reason to
       # burn a notarization round-trip, and forked PRs cannot read the secrets.
@@ -104,7 +122,11 @@ jobs:
       - name: Build .app (embeds Node ${{ matrix.arch }} + cli deps)
         working-directory: macos
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ steps.ver.outputs.marketing_version }}
+          BUILD_VERSION: ${{ steps.ver.outputs.build_version }}
+          APPCAST_ARCH: ${{ matrix.arch }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ env.SIGNED == 'true' && vars.SPARKLE_ED_PUBLIC_KEY || '' }}
+          REQUIRE_SPARKLE: ${{ env.SIGNED == 'true' && '1' || '' }}
           # make-app.sh treats "-" as ad-hoc and signs inside-out for anything else.
           SIGN_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_SIGNING_IDENTITY || '-' }}
         run: |
@@ -142,8 +164,23 @@ jobs:
           codesign --verify --strict --deep --verbose=2 build/Switchboard.app
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' build/Switchboard.app/Contents/Info.plist)" = "true"
           file build/Switchboard.app/Contents/Resources/runtime/bin/node
+          SPARKLE=build/Switchboard.app/Contents/Frameworks/Sparkle.framework/Versions/B
+          test -x "$SPARKLE/Autoupdate"
+          test -x "$SPARKLE/Updater.app/Contents/MacOS/Updater"
+          test -x "$SPARKLE/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+          test -x "$SPARKLE/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+          otool -L build/Switchboard.app/Contents/MacOS/Switchboard \
+            | grep -F '@rpath/Sparkle.framework/'
+          otool -l build/Switchboard.app/Contents/MacOS/Switchboard \
+            | grep -F 'path @executable_path/../Frameworks '
 
           if [ "$SIGNED" = true ]; then
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' build/Switchboard.app/Contents/Info.plist)" \
+              = "${{ steps.ver.outputs.build_version }}"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' build/Switchboard.app/Contents/Info.plist)" \
+              = "https://github.com/lfkdsk/Switchboard/releases/latest/download/appcast-${{ matrix.arch }}.xml"
+            test -n "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' build/Switchboard.app/Contents/Info.plist)"
+
             # Every nested Mach-O must be hardened, not just the outer bundle —
             # an unsigned pty.node is exactly what --deep used to leave behind.
             # Feed the loop by process substitution: behind a pipe it would run in
@@ -157,7 +194,7 @@ jobs:
               checked=$((checked + 1))
             done < <(find build/Switchboard.app -type f -print0)
             echo "hardened Mach-O binaries: $checked"
-            [ "$checked" -ge 4 ] || { echo "too few Mach-O found; layout changed?" >&2; exit 1; }
+            [ "$checked" -ge 8 ] || { echo "too few Mach-O found; layout changed?" >&2; exit 1; }
 
             codesign -d --entitlements - --xml \
               build/Switchboard.app/Contents/Resources/runtime/bin/node \
@@ -224,11 +261,38 @@ jobs:
           xcrun stapler validate "$DMG"
           spctl --assess --type open --context context:primary-signature --verbose "$DMG"
 
+      - name: Generate signed architecture appcast
+        if: env.SIGNED == 'true'
+        working-directory: macos
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          GENERATE_APPCAST="$(find .build/artifacts -type f \
+            -path '*/Sparkle/bin/generate_appcast' -print -quit)"
+          test -x "$GENERATE_APPCAST" || {
+            echo "Sparkle generate_appcast tool not found" >&2
+            exit 1
+          }
+          FEED_DIR="$RUNNER_TEMP/appcast-${{ matrix.arch }}"
+          install -d "$FEED_DIR"
+          cp "$DMG" "$FEED_DIR/"
+          printf '%s\n' "$SPARKLE_ED_PRIVATE_KEY" \
+            | "$GENERATE_APPCAST" --ed-key-file - --maximum-deltas 0 \
+                --download-url-prefix \
+                "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/" \
+                -o "$PWD/appcast-${{ matrix.arch }}.xml" "$FEED_DIR"
+          xmllint --noout "appcast-${{ matrix.arch }}.xml"
+          grep -Fq 'sparkle:edSignature=' "appcast-${{ matrix.arch }}.xml"
+          grep -Fq "Switchboard-${{ steps.ver.outputs.version }}-${{ matrix.arch }}.dmg" \
+            "appcast-${{ matrix.arch }}.xml"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Switchboard-${{ matrix.arch }}
-          path: macos/${{ env.DMG }}
+          path: |
+            macos/${{ env.DMG }}
+            macos/appcast-${{ matrix.arch }}.xml
           if-no-files-found: error
 
   # Single release job so the two matrix builds don't race on upserting the
@@ -248,7 +312,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*.dmg
+          files: |
+            dist/**/*.dmg
+            dist/**/appcast-*.xml
           generate_release_notes: true
           fail_on_unmatched_files: true
           # An -rc tag (v0.2.1-rc1) is where the signing path first runs on CI,

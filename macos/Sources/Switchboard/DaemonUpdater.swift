@@ -32,7 +32,7 @@ final class DaemonUpdater: ObservableObject {
             case .checking: return "Checking npm…"
             case .upToDate(let v): return "cli \(v) is up to date."
             case .updated(let v): return "Updated to cli \(v) — daemon restarted."
-            case .blocked(let v): return "cli \(v) needs a new app build (deps changed)."
+            case .blocked(let v): return "cli \(v) needs an App update (dependencies changed). Use Check for App Updates above."
             case .failed(let msg): return "Update failed: \(msg)"
             }
         }
