@@ -256,7 +256,7 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate, SPUStand
         }
     }
 
-    func standardUserDriverDidReceiveUserAttentionForUpdate(_ update: SUAppcastItem) {
+    func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
         // Keep a scheduled reminder visible until the user actually opens or
         // acts on it; a background session may finish without user attention.
         if pendingInstallHandler == nil {
