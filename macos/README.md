@@ -54,7 +54,8 @@ the installed `switchboard` executable may be a symlink to that file.
 Guardrails:
 
 - An update whose `dependencies` differ from the bundled package's is refused
-  (`needs a new app build`) — dep changes ride the DMG train.
+  and points to **Check for App Updates** — dependency changes ride the signed
+  app/DMG release train.
 - If a hot-updated daemon dies twice within 20 s of starting, the update is
   dropped and the bundled cli takes the next restart (`updater.log` records it).
 - After a DMG upgrade whose bundled cli is ≥ the staged version, the stale
@@ -67,6 +68,40 @@ build/Switchboard.app/Contents/MacOS/Switchboard --update-check
 ```
 
 Logs: `~/Library/Logs/Switchboard/updater.log`.
+
+## App updates (Sparkle)
+
+Signed release builds use Sparkle 2 to check for a new `Switchboard.app` every
+six hours, download it in the background, verify its Ed25519 signature, and
+install it only after Switchboard is idle. This is separate from the cli hot
+updater above: the main menu says **Check for App Updates…**, while the Settings
+action says **Check for cli hot updates**.
+
+An automatic restart is allowed only when all three read-only activity signals
+are available and zero:
+
+1. descendants of the supervised daemon process;
+2. PTY holder sockets under `~/.switchboard/sessions/`; and
+3. JobStore records under `~/.switchboard/jobs/` whose status is `running`.
+
+The check fails closed: an unreadable directory, malformed job record, missing
+`ps` result, or any other unknown signal postpones installation. After an idle
+preflight, the app briefly pauses the daemon, repeats the complete check, and
+only stops it if the frozen recheck is still idle. This closes the race where a
+new shell or detached job could start between checking and restarting. A stale
+holder socket or stale `running` record can therefore delay an automatic update
+even when no work remains; use **Restart and Update…** after confirming that it
+is safe. That explicit action warns that running detached jobs may be stopped.
+
+Sparkle also installs a downloaded update when the app quits. That path is left
+ungated on purpose: quitting stops the daemon regardless, and blocking it would
+also block macOS restart and logout. The idle gate protects against Sparkle's
+own background install, not against an explicit Quit.
+
+Development/ad-hoc builds without `SUFeedURL` and `SUPublicEDKey` keep app
+updates disabled. Existing installations at **0.6.1 or older do not contain
+Sparkle** and must install one new DMG manually from the GitHub Releases page;
+all later signed releases can update themselves.
 
 ## Develop
 
@@ -97,6 +132,11 @@ open build/Switchboard.app
 SKIP_RUNTIME=1 scripts/make-app.sh  # skip embedding Node (dev; uses env/PATH)
 NODE_UNIVERSAL=1 scripts/make-app.sh # universal Node binary (see caveat below)
 SIGN_ID="Developer ID Application: …" scripts/make-app.sh  # real signing
+
+# A release-style local build also injects its architecture feed and public key.
+VERSION=0.7.0 BUILD_VERSION=0.7.0 APPCAST_ARCH=arm64 \
+SPARKLE_PUBLIC_ED_KEY='<base64 public key>' REQUIRE_SPARKLE=1 \
+SIGN_ID="Developer ID Application: …" scripts/make-app.sh
 ```
 
 Move `build/Switchboard.app` to `/Applications` for a permanent install; the
@@ -119,22 +159,98 @@ app on every push/PR and packages it:
   embedding the matching-arch Node + node-pty, so every DMG is self-contained for
   its architecture (sidesteps the universal node-pty problem above).
 - Each build verifies the bundle (codesign, `LSUIElement`, embedded Node), runs a
-  best-effort `--selftest` smoke (non-gating), and uploads
-  `Switchboard-<version>-<arch>.dmg` as a workflow artifact.
-- Pushing a **`v*` tag** (e.g. `git tag v0.1.0 && git push --tags`) additionally
-  publishes a GitHub Release with both DMGs attached and auto-generated notes.
+  best-effort `--selftest` smoke (non-gating), and uploads an architecture-specific
+  `Switchboard-<version>-<arch>.dmg` workflow artifact. Non-tag builds remain
+  ad-hoc signed and have app updates disabled.
+- A stable **`vMAJOR.MINOR.PATCH` tag** signs and notarizes the app and DMG,
+  generates Ed25519-signed `appcast-arm64.xml` and `appcast-x64.xml`, then
+  publishes all four files in one GitHub Release. Sparkle compares the
+  monotonic `CFBundleVersion`; `scripts/version-info.sh` maps prereleases such
+  as `v1.2.3-rc2` to Apple's ordered `1.2.3fc2` form.
+- Suffixed tags are never production feeds. `-rcN` releases remain drafts and
+  all `-alphaN`, `-betaN`, and `-rcN` tags are marked prerelease. GitHub's
+  anonymous `releases/latest/download/` URL therefore continues to resolve to
+  the latest stable appcasts.
 
-The DMGs are **ad-hoc signed**, so on first launch users must right-click →
-**Open** (or `xattr -dr com.apple.quarantine Switchboard.app`) to get past
-Gatekeeper. Notarize (below) to remove that step.
+Release feeds are split by architecture:
+
+- `https://github.com/lfkdsk/Switchboard/releases/latest/download/appcast-arm64.xml`
+- `https://github.com/lfkdsk/Switchboard/releases/latest/download/appcast-x64.xml`
+
+### Sparkle signing key setup
+
+Do this once on a trusted Mac. Sparkle's `generate_keys` stores the private key
+in the login Keychain; use a dedicated account label so the key is easy to
+identify. Never commit the exported private key or place it inside this repo.
+
+```bash
+cd macos
+swift package resolve
+GENERATE_KEYS="$(find .build/artifacts -type f \
+  -path '*/Sparkle/bin/generate_keys' -print -quit)"
+test -x "$GENERATE_KEYS"
+
+# Generate once (or print the existing key for this account).
+"$GENERATE_KEYS" --account org.lfkdsk.switchboard
+PUBLIC_KEY="$("$GENERATE_KEYS" --account org.lfkdsk.switchboard -p)"
+
+# Export to a protected file only long enough to store/back up the secret.
+umask 077
+"$GENERATE_KEYS" --account org.lfkdsk.switchboard \
+  -x "$TMPDIR/switchboard-sparkle-private-key"
+```
+
+The repository administrator must then configure:
+
+- GitHub Actions secret **`SPARKLE_ED_PRIVATE_KEY`** with the exact contents of
+  `switchboard-sparkle-private-key`;
+- GitHub Actions repository variable **`SPARKLE_ED_PUBLIC_KEY`** with
+  `$PUBLIC_KEY`.
+
+For an authenticated repository administrator using GitHub CLI:
+
+```bash
+gh secret set SPARKLE_ED_PRIVATE_KEY \
+  < "$TMPDIR/switchboard-sparkle-private-key"
+gh variable set SPARKLE_ED_PUBLIC_KEY --body "$PUBLIC_KEY"
+```
+
+Keep an offline backup of the private key, remove the temporary export after
+the secret and backup are verified, and retain the same key for future releases:
+already-installed apps pin its public half. The workflow fails a tag build
+before packaging if either value is missing; branch and pull-request builds do
+not require either value.
+
+### Release checklist
+
+1. Confirm the tag is exactly `vMAJOR.MINOR.PATCH` for production (or one of
+   `-alphaN`, `-betaN`, `-rcN` for prerelease validation).
+2. Push the tag and wait for both architecture jobs, Developer ID signing,
+   notarization/stapling, appcast signing, and the single Release job to pass.
+3. For a stable release, confirm the Release is neither draft nor prerelease and
+   that both DMGs and both appcasts are present.
+4. Verify each feed anonymously, for example:
+
+   ```bash
+   curl -fL -o /tmp/appcast-arm64.xml \
+     https://github.com/lfkdsk/Switchboard/releases/latest/download/appcast-arm64.xml
+   xmllint --noout /tmp/appcast-arm64.xml
+   grep -F 'sparkle:edSignature=' /tmp/appcast-arm64.xml
+   ```
+
+The tag job requires the existing Apple Developer ID/notarization secrets as
+well as the two Sparkle values. It signs nested Node binaries and Sparkle's
+Autoupdate, Updater app, and XPC services from the inside out before sealing the
+outer app; the Node JIT entitlements remain scoped to the embedded Node binary.
 
 ### Distribution (notarization)
 
-Ad-hoc signing (`-`) is fine for personal use. To distribute: sign with a
-Developer ID, enable the hardened runtime, and notarize. Node's JIT needs the
-`com.apple.security.cs.allow-jit` /
+Ad-hoc signing (`-`) is fine for local development. Tag builds use a Developer
+ID, the hardened runtime, and Apple notarization for both the app and DMG.
+Node's JIT needs the `com.apple.security.cs.allow-jit` /
 `com.apple.security.cs.allow-unsigned-executable-memory` entitlements under the
-hardened runtime.
+hardened runtime; do not apply those entitlements to Sparkle helpers or the
+outer app.
 
 ## Layout
 
@@ -143,16 +259,19 @@ hardened runtime.
 | `Package.swift` | SwiftPM executable (macOS 13+, Swift 5 language mode) |
 | `Sources/Switchboard/SwitchboardApp.swift` | `@main`, MenuBarExtra scene, accessory policy, auto-start |
 | `Sources/Switchboard/DaemonSupervisor.swift` | spawn/restart the daemon, parse NDJSON, exit-code handling |
+| `Sources/Switchboard/AppUpdater.swift` | Sparkle app updates, gentle reminders, idle-gated installation |
 | `Sources/Switchboard/MenuContent.swift` | the menu UI |
 | `Sources/Switchboard/StatusEvent.swift` | NDJSON event model + connection state |
 | `Sources/Switchboard/NodeRuntime.swift` | locate bundled vs dev Node + cli (hot update aware) |
 | `Sources/Switchboard/DaemonUpdater.swift` | hot-update the cli from npm (verify, stage, rollback) |
+| `Sources/UpdatePolicy/UpdateInstallPolicy.swift` | portable fail-closed activity policy and probes |
 | `Sources/Switchboard/Prefs.swift` | server/shell prefs + launch-at-login |
 | `Sources/Switchboard/ConfigReader.swift` | read `~/.switchboard/config.json` |
 | `Sources/Switchboard/SelfTest.swift` | headless `--selftest` verification |
 | `Resources/AppIcon.svg` | the logo on Apple's icon grid (margin + shadow) |
 | `Resources/AppIcon.icns` | app icon, generated from `AppIcon.svg` (committed) |
 | `scripts/make-app.sh` | assemble + sign `Switchboard.app` |
+| `scripts/version-info.sh` | map release tags to monotonic Apple bundle versions |
 | `scripts/fetch-runtime.sh` | stage the embedded Node runtime |
 | `scripts/make-icon.sh` | regenerate `AppIcon.icns` from `AppIcon.svg` (needs `librsvg`) |
 | `run-dev.sh` | run from source against the repo cli |

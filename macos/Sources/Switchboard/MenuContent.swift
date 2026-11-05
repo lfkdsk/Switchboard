@@ -28,6 +28,7 @@ struct MenuContent: View {
     @ObservedObject var supervisor: DaemonSupervisor
     @ObservedObject var prefs: Prefs
     @ObservedObject var updater: DaemonUpdater
+    @ObservedObject var appUpdater: AppUpdater
     @ObservedObject var accountStore: AccountStore
     @ObservedObject var avatarLoader: AvatarLoader
     @ObservedObject var fullDiskAccess: FullDiskAccessStore
@@ -52,6 +53,10 @@ struct MenuContent: View {
             Divider()
 
             actionsSection
+
+            Divider()
+
+            appUpdateSection
 
             Divider()
 
@@ -160,6 +165,34 @@ struct MenuContent: View {
         }
     }
 
+    /// Sparkle updates the signed .app bundle. This is intentionally outside
+    /// Settings so a gentle background reminder is visible when the menu opens.
+    private var appUpdateSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                menuButton(
+                    appUpdater.status.hasUpdate ? "Show App Update…" : "Check for App Updates…",
+                    systemImage: "arrow.down.app"
+                ) {
+                    appUpdater.checkForUpdates()
+                }
+                .disabled(!appUpdater.canCheckForUpdates)
+                if appUpdater.status == .checking {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            Text(appUpdater.status.line)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if appUpdater.canRestartAndInstall {
+                menuButton("Restart and Update…", systemImage: "arrow.triangle.2.circlepath") {
+                    appUpdater.confirmRestartAndInstall()
+                }
+            }
+        }
+    }
+
     private var accountSection: some View {
         VStack(spacing: 2) {
             if accountStore.signedIn {
@@ -220,14 +253,15 @@ struct MenuContent: View {
         .font(.system(size: 11))
     }
 
-    /// npm hot-update controls for the bundled cli, inside the settings group.
+    /// npm hot-update controls for bundled cli JavaScript, distinct from the
+    /// Sparkle application update shown in the main menu.
     private var updateRow: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Button {
                     Task { await updater.checkAndApply() }
                 } label: {
-                    Label("Check for cli updates", systemImage: "arrow.down.circle")
+                    Label("Check for cli hot updates", systemImage: "arrow.down.circle")
                         .font(.system(size: 11))
                 }
                 .buttonStyle(.plain)
@@ -277,7 +311,6 @@ struct MenuContent: View {
                     : "cli bundled with the app")
             Spacer()
             Button("Quit") {
-                supervisor.stop()
                 NSApplication.shared.terminate(nil)
             }
             .font(.system(size: 11))
