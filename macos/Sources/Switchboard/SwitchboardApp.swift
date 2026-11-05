@@ -87,7 +87,6 @@ struct SwitchboardApp: App {
                 // auto-start would never see a supervisor.
                 .onAppear {
                     appDelegate.supervisor = supervisor
-                    appDelegate.appUpdater = appUpdater
                     updater.startAutoChecks()
                 }
         }
@@ -113,7 +112,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var supervisor: DaemonSupervisor? {
         didSet { autoStartIfNeeded() }
     }
-    weak var appUpdater: AppUpdater?
     private var didAutoStart = false
     private var didFinishLaunching = false
 
@@ -133,10 +131,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ConfigReader.read().signedIn {
             supervisor.start()
         }
-    }
-
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        appUpdater?.shouldAllowApplicationTermination() == false ? .terminateCancel : .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {

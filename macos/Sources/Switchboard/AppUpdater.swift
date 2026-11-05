@@ -125,21 +125,6 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate, SPUStand
         }
     }
 
-    /// Sparkle installs an automatically downloaded update whenever the host
-    /// app exits, even if its immediate-install callback is being held. Refuse
-    /// ordinary/system termination until our idle gate has prepared the daemon;
-    /// the explicit Restart and Update action is the only user override.
-    func shouldAllowApplicationTermination() -> Bool {
-        guard pendingInstallHandler != nil, !preparedForInstall else { return true }
-        let version = pendingVersion ?? ""
-        status = .waitingForIdle(
-            version,
-            "App update downloaded; quit is postponed until Switchboard is idle."
-        )
-        startRetryTimer()
-        return false
-    }
-
     private static var hasReleaseConfiguration: Bool {
         let info = Bundle.main.infoDictionary ?? [:]
         let feed = (info["SUFeedURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)

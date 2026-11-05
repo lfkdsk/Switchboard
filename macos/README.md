@@ -93,10 +93,10 @@ holder socket or stale `running` record can therefore delay an automatic update
 even when no work remains; use **Restart and Update…** after confirming that it
 is safe. That explicit action warns that running detached jobs may be stopped.
 
-Sparkle normally installs a downloaded update whenever its host app quits.
-Switchboard also gates that path: an ordinary Quit is postponed while a pending
-update has not passed the idle check. The app exits only after the automatic
-gate succeeds or the user explicitly confirms **Restart and Update…**.
+Sparkle also installs a downloaded update when the app quits. That path is left
+ungated on purpose: quitting stops the daemon regardless, and blocking it would
+also block macOS restart and logout. The idle gate protects against Sparkle's
+own background install, not against an explicit Quit.
 
 Development/ad-hoc builds without `SUFeedURL` and `SUPublicEDKey` keep app
 updates disabled. Existing installations at **0.6.1 or older do not contain
