@@ -6,7 +6,8 @@ description: >-
   something over there with real stdout and a real exit code, `switchboard cp`
   transfers a file, detached jobs survive caller disconnects, `switchboard shell
   <node>` opens an interactive one, `switchboard history <node> [sid]` reads saved
-  shell transcripts, and `switchboard login` / `service` expose a machine. Use
+  shell transcripts, and `switchboard up` / `login` / `service` expose a
+  machine. Use
   this whenever a task belongs on a different machine than the one
   you're on — "run the tests on my build box", "what is my desktop doing?", "is
   the mac mini still up?", "get me a shell on the server", "share this box with
@@ -29,7 +30,7 @@ Two credentials, and they behave differently:
   single-use code redeemed by another GitHub account. Owned and shared machines
   both appear in `nodes`; peer commands
   additionally require the target's peer opt-in.
-- **Token** (`switchboard`, no login) — a one-off share. Anyone holding the token
+- **Token** (`switchboard up`, no login) — a one-off share. Anyone holding the token
   gets a shell there. No dashboard, no peer access. Good for pairing; not a
   thing to leave running.
 
@@ -141,9 +142,15 @@ reaches the remote process group, so a pipeline dies the way it would locally.
 
 ## Exposing a machine
 
+**Never run bare `switchboard`.** It is intentionally an inert command guide,
+exits nonzero, and exposes nothing. Do not put daemon flags on a bare command
+either: `switchboard --token ...` and `switchboard --server ...` also start
+nothing. Exposing this machine is an explicit action spelled `switchboard up`.
+
 ```bash
 switchboard login     # sign in via browser, then serve this machine's shell
-switchboard           # no account: print a one-off token + URL, serve that
+switchboard up        # serve with saved credentials, or print a one-off token + URL
+switchboard up --token <token>
 switchboard logout    # drop the stored credential (machine id is kept)
 ```
 
@@ -151,10 +158,11 @@ switchboard logout    # drop the stored credential (machine id is kept)
 `~/.switchboard/config.json` (mode 0600) and then *keeps running* — signing in
 and exposing the shell are one step. It stays in the foreground; Ctrl-C stops it.
 
-That's the part to be careful with: leaving `switchboard` running exposes a real
-shell on that machine. In token mode the token *is* the credential — anyone who
-has it gets that shell — so don't paste one into a shared log, an issue, or a
-commit, and don't leave an anonymous daemon up as a convenience.
+That's the part to be careful with: leaving `switchboard up` or `switchboard
+login` running exposes a real shell on that machine. In token mode the token
+*is* the credential — anyone who has it gets that shell — so don't paste one
+into a shared log, an issue, or a commit, and don't leave an anonymous daemon up
+as a convenience.
 
 **Keeping it up** rather than living in a terminal window:
 
@@ -169,21 +177,18 @@ status menu and launch-at-login.
 
 **One daemon at a time.** Circuits are last-writer-wins: a new daemon takes the
 line and the one already serving that machine is dropped, closing the shells open
-in it. So a hand-started daemon asks first when something is already up:
+in it. So a hand-started `up` refuses when something is already running:
 
 ```
-! Switchboard is already running on this machine.
-
-    Started   2h 11m ago by the menu-bar app (pid 4821)
-    Serving   lfkdsk at https://shell.lfkdsk.org
+! Switchboard is already running on this machine (the menu-bar app, pid 4821).
 ...
-Take over? [y/N]
+  switchboard up --force
 ```
 
-Answer that honestly rather than reflexively — someone may be working in those
-shells. `--force` (or `SWITCHBOARD_FORCE=1`) skips the question when you know
-it's yours to take, and is the right flag for a script; a launch with no terminal
-to ask (a unit, the app, CI) logs the takeover and proceeds.
+Do not reflexively add `--force` — someone may be working in those shells. It is
+the explicit override only when the takeover is intended; the refusal is the
+same in a script or a terminal. App and systemd supervisor restarts preserve
+their intentional takeover behaviour.
 
 ## Environment and files
 
@@ -193,7 +198,7 @@ to ask (a unit, the app, CI) logs the takeover and proceeds.
 | `SWITCHBOARD_TOKEN` | force token mode with a fixed token (`-t/--token`, min 24 chars) |
 | `SWITCHBOARD_SHELL` | shell to spawn (`--shell`). Default `$SHELL` |
 | `SWITCHBOARD_PEER=0` | refuse `exec`/`shell` from peer machines (`--no-peer`) |
-| `SWITCHBOARD_FORCE=1` | start without the duplicate-daemon question (`--force`) |
+| `SWITCHBOARD_FORCE=1` | let `up` override duplicate-daemon refusal (`--force`) |
 | `SWITCHBOARD_ACTIVITY=claude` | also report live Claude Code sessions to the dashboard (off by default: titles summarise what was asked) |
 | `SWITCHBOARD_RECORD=0` | disable persistent shell transcripts (recording is on by default) |
 | `~/.switchboard/config.json` | account credential + machine id (0600) |

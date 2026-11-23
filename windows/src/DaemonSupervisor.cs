@@ -122,7 +122,7 @@ namespace Switchboard
             var psi = new ProcessStartInfo
             {
                 FileName = rt.Node,
-                Arguments = Quote(rt.Cli) + (login ? " login" : ""),
+                Arguments = Quote(rt.Cli) + (login ? " login" : " up"),
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
@@ -168,7 +168,7 @@ namespace Switchboard
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
             process = p;
-            WriteLog($"[app] started daemon pid {p.Id}: {rt.Cli}{(login ? " login" : "")}");
+            WriteLog($"[app] started daemon pid {p.Id}: {rt.Cli}{(login ? " login" : " up")}");
             SetState(ConnState.Starting);
             statusTimer.Start();
         }

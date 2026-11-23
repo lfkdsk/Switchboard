@@ -36,7 +36,7 @@
     "access": "public"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node index.js up",
     "postinstall": "node scripts/fix-pty-perms.js"
   },
   "dependencies": {

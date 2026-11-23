@@ -9,7 +9,7 @@ child process and reflects its live status in the menu bar.
 Switchboard.app  (LSUIElement — menu bar only, no Dock icon)
   └─ MenuBarExtra UI ── status dot · RTT/CPU/Mem · Open dashboard · Start/Stop
         │ spawns + supervises, reads NDJSON status
-  └─ embedded Node runtime ── cli/index.js  ── wss ─▶ relay
+  └─ embedded Node runtime ── cli/index.js up ── wss ─▶ relay
 ```
 
 - **No Dock icon, no ⌘-Tab entry** — it lives only in the menu bar (`LSUIElement`).
@@ -36,6 +36,12 @@ set — `connecting`, `connected`, `ready`, `stats`, `peer`, `disconnected`,
 and drives the menu state machine. Human-readable logs still go to
 `~/Library/Logs/Switchboard/daemon.log`. This is opt-in and inert for normal CLI
 use.
+
+The supervisor invokes the daemon as `index.js up` (or `index.js up --token …`;
+`login` remains its one-step sign-in-and-start command). Older installed Apps
+may hot-update to a newer JS CLI before their Swift code changes; the CLI
+recognizes their pre-created `SWITCHBOARD_STATUS_FILE` as a direct supervised
+launch and preserves the old bare-start behaviour for that compatibility case.
 
 ## Hot updates (cli)
 
