@@ -10,7 +10,7 @@ daemon as a child process and reflects its live status in the tray.
 Switchboard.exe  (WinForms, tray only — no main window)
   └─ NotifyIcon menu ── status dot · RTT/CPU/Mem · Open dashboard · Start/Stop
         │ spawns + supervises, reads NDJSON status
-  └─ runtime\node.exe ── runtime\cli\index.js ── wss ─▶ relay
+  └─ runtime\node.exe ── runtime\cli\index.js up ── wss ─▶ relay
 ```
 
 - **Tray only.** Left or right click the icon for the menu; the icon carries a
@@ -47,6 +47,12 @@ under emulation.
 Status flows the same way — the app passes a temp `SWITCHBOARD_STATUS_FILE` and
 tails the NDJSON the daemon appends (`connecting`, `connected`, `ready`,
 `stats`, `peer`, `disconnected`, `fatal`, `stopping`).
+
+The tray supervisor invokes the daemon as `index.js up` (`login` remains the
+one-step sign-in-and-start command). An older installed tray app can receive a
+new JS CLI through hot update before its C# code changes; the CLI recognizes the
+app's pre-created status file as a direct supervised launch and preserves that
+old bare-start compatibility path.
 
 **Stopping** is the one real difference. A windowless child on Windows can't be
 sent SIGINT/SIGTERM (`kill()` there is `TerminateProcess`, which would orphan

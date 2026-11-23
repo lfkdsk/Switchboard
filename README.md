@@ -54,7 +54,7 @@ click **Open shell** and you're in.
 Just want to hand someone temporary access instead?
 
 ```bash
-npx @switch-board/cli           # prints a one-off token + URL
+npx @switch-board/cli up        # prints a one-off token + URL
 ```
 
 Anyone you give that URL to gets a shell on the machine — handy for pairing or
@@ -108,7 +108,7 @@ quick remote help. No sign-in required; the token *is* the key (see
 
 ## Two ways to connect
 
-|                          | **Account** — `switchboard login`     | **Token** — `switchboard`              |
+|                          | **Account** — `switchboard login`     | **Token** — `switchboard up`           |
 | ------------------------ | ------------------------------------- | -------------------------------------- |
 | Sign-in                  | GitHub, once per machine              | none                                   |
 | Who can open the shell   | you + GitHub users you share with     | anyone holding the token               |
@@ -202,7 +202,7 @@ token you already hold, use `switchboard service install --token <token>`.
 > waking the machine over Wi-Fi, and the `bash -lc` PATH trap.
 
 > **No systemd?** On Alpine/Devuan (OpenRC) or WSL without systemd, `service
-> install` will tell you so — run `switchboard` under your own supervisor
+> install` will tell you so — run `switchboard up` under your own supervisor
 > instead. It handles `SIGTERM` cleanly and exits 0 when the relay hands its
 > circuit to a newer daemon, so `Restart=on-failure` semantics work anywhere.
 
@@ -211,35 +211,31 @@ token you already hold, use `switchboard service install --token <token>`.
 Circuits are last-writer-wins: whoever dials in last gets the line, and the
 daemon that was serving this machine is dropped — taking the shells open in it
 along. That's the right answer for a restart and the wrong one for a forgotten
-terminal, so when you start one by hand and something is already up — the
-menu-bar app, the tray app, the systemd service, another window — the CLI says what it found
-and asks first:
+terminal. `switchboard up` therefore refuses to start when something is already
+up — the menu-bar app, the tray app, the systemd service, another window — and
+names the explicit override:
 
 ```
-! Switchboard is already running on this machine.
+! Switchboard is already running on this machine (the menu-bar app, pid 4821).
 
-    Started   2h 11m ago by the menu-bar app (pid 4821)
-    Serving   lfkdsk at https://shell.lfkdsk.org
+Refusing to start another daemon. Leave the running one alone, or explicitly override with:
 
-  Starting another one takes this machine's circuit over from it:
-  the relay hands the line to the newcomer, that daemon exits, and every
-  shell open in it closes with it.
-
-Take over? [y/N]
+  switchboard up --force
 ```
 
-The default is **no**: Enter leaves the running daemon alone and starts nothing.
-`--force` (or `SWITCHBOARD_FORCE=1`) skips the question, and a launch with no
-terminal to ask — the app, the unit, a script — logs the takeover and carries on
-as it always has. `switchboard login` asks before sending you to the browser, and
-`service install` asks before `enable --now` starts the unit.
+The default is **no**, including in scripts with no terminal: `up` exits nonzero
+and starts nothing. `--force` (or `SWITCHBOARD_FORCE=1`) is required to replace
+or join a running daemon. App and systemd supervisor restarts retain their
+intentional takeover behaviour. `switchboard login` still asks before sending
+you to the browser, and `service install` asks before `enable --now` starts the
+unit.
 
 Each daemon records itself in `~/.switchboard/daemons.json` (mode `0600`) and
 takes itself off again on the way out. It's a record, not a lock: entries are
 checked against the live process, so one left behind by a `kill -9` never blocks
-a start. Two daemons on *different* circuits — a signed-in one and a `--token`
-share — are legal, and the prompt says so rather than warning about a takeover
-that wouldn't happen.
+a start. Two daemons on *different* circuits — a signed-in one and an `up
+--token` share — remain possible with `--force`; they run side by side rather
+than replacing one another.
 
 <p align="center">
   <img src="docs/landing.png" alt="The Switchboard landing page: sign in with GitHub, or paste a one-off token" width="720">
@@ -373,7 +369,7 @@ ownership or an explicit live grant before it lets a peer connect. A host that
 should only ever be driven through a browser opts out:
 
 ```bash
-SWITCHBOARD_PEER=0 switchboard         # or: switchboard --no-peer
+SWITCHBOARD_PEER=0 switchboard up      # or: switchboard up --no-peer
 ```
 
 The target machine declares that on every connect and the **relay** enforces it,
@@ -492,10 +488,10 @@ with `--local` instead of `--remote`).
 ## CLI reference
 
 ```
+switchboard up [options]     Expose this machine's shell using saved credentials,
+                             or an anonymous one-off token if you're not signed in.
 switchboard login            Sign in via the browser, then expose this machine's
                              shell under your account — one step.
-switchboard                  Expose this shell using saved credentials, or an
-                             anonymous one-off token if you're not signed in.
 switchboard logout           Remove the stored account credential.
 switchboard service install  Linux: run in the background via systemd, starting
                              at boot. Also: uninstall, status.
@@ -518,13 +514,18 @@ switchboard shell <node>     Open an interactive shell on a reachable peer
                              machine. Ctrl-] detaches.
 ```
 
+Bare `switchboard`, and daemon flags such as `switchboard --token ...` without a
+subcommand, print a short command guide and exit nonzero without connecting or
+writing state. Use `switchboard up --token ...`. `--help`/`-h` and
+`--version` keep their normal zero-exit behaviour.
+
 | Option | Description |
 | --- | --- |
 | `-t, --token <token>` | Force anonymous mode with this token (min 24 chars). |
 | `-s, --server <url>`  | Relay origin. Default: `https://shell.lfkdsk.org`. |
 | `--shell <path>`      | Shell to spawn. Default: `$SHELL`, else `bash`/`powershell`. |
 | `--no-peer`           | Refuse `exec`/`shell` from peer machines. |
-| `--force`             | Start without asking, even if a daemon is already running here. |
+| `--force`             | Let `up` start even if a daemon is already running here. |
 | `-v, --version`       | Print version and exit. |
 | `-h, --help`          | Show help and exit. |
 | `nodes --json`        | Machine-readable node list. |

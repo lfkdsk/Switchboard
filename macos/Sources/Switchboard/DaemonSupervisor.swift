@@ -84,9 +84,9 @@ final class DaemonSupervisor: ObservableObject {
         if login {
             p.arguments = [rt.cli.path, "login"]
         } else if let oneOffToken {
-            p.arguments = [rt.cli.path, "--token", oneOffToken]
+            p.arguments = [rt.cli.path, "up", "--token", oneOffToken]
         } else {
-            p.arguments = [rt.cli.path]
+            p.arguments = [rt.cli.path, "up"]
         }
 
         var env = ProcessInfo.processInfo.environment

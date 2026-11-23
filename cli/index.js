@@ -12,7 +12,9 @@
  * developed together and protocol-level features (E2E, port-forwarding, …) can
  * be added on both sides at once.
  *
- * Options (flags override env vars):
+ * Start the daemon explicitly with `switchboard up`.
+ *
+ * Options for `up` (flags override env vars):
  *   -t, --token <token>   Use a specific token (min 24 chars). Default: random 256-bit.
  *   -s, --server <url>    Relay origin. Default: http://localhost:8787 (dev).
  *       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
@@ -68,6 +70,7 @@ const {
   wrapDaemonJson,
 } = require("./lib/account-sessions");
 const { shellCommandArgs, shellQuote, verifyUploadedFile } = require("./lib/peer-utils");
+const { childEnvironment, supervisorLauncher } = require("./lib/launcher");
 const pkg = require("./package.json");
 
 // ---- logging -------------------------------------------------------------
@@ -92,6 +95,9 @@ const logErr = (...a) => console.error(`[${ts()}]`, ...a);
 const STATUS_FILE = process.env.SWITCHBOARD_STATUS_FILE || null;
 const STATUS_FD = process.env.SWITCHBOARD_JSON_STATUS ? 3 : null;
 const STATUS_ON = !!(STATUS_FILE || STATUS_FD);
+const SUPERVISOR_LAUNCHER = supervisorLauncher();
+const SUPERVISED_LAUNCH = !!SUPERVISOR_LAUNCHER;
+const DAEMON_CHILD_ENV = childEnvironment();
 function emitStatus(ev, extra) {
   if (!STATUS_ON) return;
   const line = JSON.stringify({ ev, t: Date.now(), ...extra }) + "\n";
@@ -106,13 +112,13 @@ const MIN_TOKEN_LEN = 24; // reject weak custom tokens; the generated one is ~43
 
 // ---- CLI -----------------------------------------------------------------
 function printHelp() {
-  console.log(`Switchboard — expose this machine's shell to a Switchboard relay.
+  console.log(`Switchboard — reach your other machines, or explicitly expose this one.
 
 Usage:
+  switchboard up [options]     Expose this machine's shell to the relay. This is
+                               always explicit; bare \`switchboard\` starts nothing.
   switchboard login            Sign in via browser, then expose this machine's shell
                                under your account — one step.
-  switchboard [options]        Expose this shell using saved credentials, or an
-                               anonymous one-off token if not signed in.
   switchboard logout           Remove the stored account credential.
   switchboard service <verb>   Linux: run in the background via systemd, starting
                                at boot. Verbs: install, uninstall, status.
@@ -140,8 +146,8 @@ Options:
   -s, --server <url>    Relay origin. Default: ${DEFAULT_SERVER}
       --shell <path>    Shell to spawn. Default: $SHELL, or bash/powershell.
       --no-peer         Refuse commands from peer machines (see below).
-      --force           Start even if this machine already has a daemon running,
-                        without asking first (see below).
+      --force           Start even if this machine already has a daemon running;
+                        overrides \`up\`'s default refusal (see below).
   -v, --version         Print version and exit.
   -h, --help            Show this help and exit.
 
@@ -182,10 +188,26 @@ Notes:
   Logged in → this machine shows up in your dashboard; you may share it there.
   Anonymous → the token is the credential; anyone who has it gets a shell here.
   One daemon serves this machine at a time. If another one is already up — the
-  menu-bar app, the systemd service, another terminal — starting this one takes
-  its circuit over, so you're asked first. On Unix, detached shell holders keep
-  webshell sessions alive across that daemon handoff; Windows shells remain
-  owned by the daemon and close when it stops.`);
+  menu-bar app, the systemd service, another terminal — \`switchboard up\`
+  refuses to start another unless you pass --force. On Unix, detached shell
+  holders keep webshell sessions alive across that daemon handoff; Windows
+  shells remain owned by the daemon and close when it stops.`);
+}
+
+function printCommandRequired() {
+  console.error(`Switchboard needs a command; nothing was started.
+
+Common commands:
+  switchboard nodes                 List reachable machines
+  switchboard exec <node> <cmd...>  Run a command on another machine
+  switchboard shell <node>           Open an interactive remote shell
+  switchboard cp <src> <dst>         Copy one file to or from another machine
+
+To expose this machine, say so explicitly:
+  switchboard up [options]
+
+\`switchboard login\` signs in and then exposes this machine in one step.
+Run \`switchboard --help\` for all commands and options.`);
 }
 
 function parseArgs(argv) {
@@ -285,12 +307,18 @@ function parsePeerArgs(argv, command) {
 
 const rawArgs = process.argv.slice(2);
 const PEER_SUBS = ["nodes", "ls", "exec", "cp", "jobs", "logs", "history", "wait", "shell"];
-const sub = ["login", "logout", "service", ...PEER_SUBS].includes(rawArgs[0]) ? rawArgs.shift() : null;
+let sub = ["up", "login", "logout", "service", ...PEER_SUBS].includes(rawArgs[0]) ? rawArgs.shift() : null;
+// Old macOS/Windows Apps and generated systemd units launched index.js with no
+// subcommand (or only --token). Their direct-launch signals are deliberately
+// narrow in lib/launcher.js; preserve those deployed callers across a JS hot
+// update, while every ordinary bare invocation remains inert.
+if (sub === null && SUPERVISED_LAUNCH) sub = "up";
 // `service` takes a bare verb of its own before the usual flags.
 const serviceAction = sub === "service" && rawArgs[0] && !rawArgs[0].startsWith("-") ? rawArgs.shift() : null;
 const args = PEER_SUBS.includes(sub) ? parsePeerArgs(rawArgs, sub) : parseArgs(rawArgs);
 if (args.help) { printHelp(); process.exit(0); }
 if (args.version) { console.log(pkg.version); process.exit(0); }
+if (sub === null) { printCommandRequired(); process.exit(1); }
 
 const SERVER = (args.server || process.env.SWITCHBOARD_SERVER || process.env.WEBTERM_SERVER || DEFAULT_SERVER)
   .replace(/\/+$/, "");
@@ -504,7 +532,7 @@ Documentation=https://github.com/lfkdsk/Switchboard
 
 [Service]
 Type=simple
-ExecStart="${process.execPath}" "${CLI_PATH}"
+ExecStart="${process.execPath}" "${CLI_PATH}" up
 ${env.join("\n")}
 # Not Restart=always: when the relay hands this circuit to a newer daemon for the
 # same machine, this one exits 0 on purpose (see the 4001 close handler). Only
@@ -615,7 +643,8 @@ function doService(action) {
 // the menu-bar app, the systemd unit, the terminal in the next tab — is closed
 // with 4001, taking every shell open in it along. That's exactly right when you
 // meant it and a nasty surprise when you didn't, and the relay can't tell the
-// difference. So every daemon records itself here and the next one asks first.
+// difference. So every daemon records itself here and the next one can stop
+// before an unintended takeover.
 //
 // Records, not a lock: the daemon must still start when the file is stale (a
 // `kill -9` leaves an entry behind) or unwritable, so every entry read back is
@@ -628,12 +657,10 @@ const RUN_FILE = path.join(CONFIG_DIR, "daemons.json");
 const FORCE = !!args.force ||
   ["1", "true", "yes", "on"].includes((process.env.SWITCHBOARD_FORCE || "").toLowerCase());
 
-// Which of the three ways in was taken, so the prompt can name it. systemd
-// stamps INVOCATION_ID on every unit it starts; the macOS app (and any other
-// supervisor) is the reason the status sinks exist at all.
-const LAUNCHER = (process.env.INVOCATION_ID || process.env.JOURNAL_STREAM) ? "service"
-  : STATUS_ON ? "app"
-  : "cli";
+// Which of the three ways in was taken, so duplicate diagnostics can name it.
+// supervisorLauncher() validates the signal as belonging to this direct
+// process; inherited INVOCATION_ID or status variables alone are not enough.
+const LAUNCHER = SUPERVISOR_LAUNCHER || "cli";
 function launcherLabel(kind) {
   switch (kind) {
     case "service": return "the systemd user service";
@@ -705,7 +732,7 @@ function pidAlive(pid) {
 // Pids get recycled and a record outlives a `kill -9`, so a live pid alone
 // proves nothing. Where the OS hands over a command line cheaply, insist it
 // still looks like our daemon; where it won't answer, believe the record — a
-// question we didn't need to ask is cheaper than a takeover nobody saw coming.
+// conservative refusal/warning is cheaper than a takeover nobody saw coming.
 function pidIsDaemon(pid, rec) {
   const looks = (s) => !!s && ((rec.cli && s.includes(rec.cli)) || /switch-?board/i.test(s));
   try {
@@ -764,7 +791,9 @@ function ask(question) {
 // The gate itself. `circuit` is the line this run would take, when it's known
 // early enough to say whether the daemon already up would be replaced by it or
 // merely joined on the same host.
-async function confirmSoleDaemon(circuit, { ignoreService = false, intent = "start" } = {}) {
+async function confirmSoleDaemon(circuit, {
+  ignoreService = false, intent = "start", requireForce = false,
+} = {}) {
   const others = findRunningDaemons(ignoreService);
   if (!others.length) return;
   // Unknown on either side means we can't rule out a takeover — describe the
@@ -778,15 +807,34 @@ async function confirmSoleDaemon(circuit, { ignoreService = false, intent = "sta
     others.length > 1 ? `${others.length} running in all` : null].filter(Boolean).join(", ");
   emitStatus("duplicate", { pid: other.pid || null, launcher: other.launcher || null, takeover });
 
-  // Nobody is watching a supervised start — the app, the unit, a CI script —
-  // and a prompt into a closed stdin would just hang. Say what's happening and
-  // carry on: this is the behaviour those callers have always had.
-  if (FORCE || !(process.stdin.isTTY && process.stdout.isTTY)) {
+  const logProceeding = () => {
     logErr(`! Switchboard is already running on this machine (${who})` +
       (takeover ? (USE_PTY_HOLDER
         ? " — taking over its circuit; detached shells will be recovered."
         : " — taking over its circuit; the shells open in it will close.")
                 : " — on a different circuit; both will run."));
+  };
+
+  if (FORCE) {
+    logProceeding();
+    return;
+  }
+
+  // `up` is the explicit safety boundary: scripts and agents commonly have no
+  // TTY, so silence must never mean consent to a second daemon. A real App/unit
+  // restart takes the compatibility path below and retains its old behaviour.
+  if (requireForce) {
+    logErr(`! Switchboard is already running on this machine (${who}).`);
+    console.error("\nRefusing to start another daemon. Leave the running one alone, or explicitly override with:\n\n" +
+      "  switchboard up --force\n");
+    process.exit(1);
+  }
+
+  // Nobody is watching a supervised start — the app, the unit, a CI script —
+  // and a prompt into a closed stdin would just hang. Say what's happening and
+  // carry on: this is the behaviour those callers have always had.
+  if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+    logProceeding();
     return;
   }
 
@@ -1057,7 +1105,7 @@ function openInProcessSession(storageId, sid, ownerAccountId, legacy, accessExpi
     cols: cols > 0 ? cols : 80,
     rows: rows > 0 ? rows : 24,
     cwd: process.env.HOME || process.cwd(),
-    env: process.env,
+    env: DAEMON_CHILD_ENV,
   });
   let sessionRecorder = null;
   try {
@@ -1244,6 +1292,7 @@ async function openSession(principal, sid, cols, rows) {
     accessExpiresAt,
     shell: SHELL,
     cwd: process.env.HOME || process.cwd(),
+    env: DAEMON_CHILD_ENV,
     cols,
     rows,
     recording: RECORD_SESSIONS,
@@ -2182,7 +2231,7 @@ function startExec(msg, principal = null) {
   try {
     child = spawn(selectedShell, shellCommandArgs(cmd, login), {
       cwd,
-      env: process.env,
+      env: DAEMON_CHILD_ENV,
       // Its own process group, so a Ctrl-C on the far end can take down the
       // whole pipeline rather than just the shell that spawned it.
       detached: process.platform !== "win32",
@@ -2593,7 +2642,13 @@ function sendStats() {
     setupConnection();
   } else {
     setupConnection(); // resolves the circuit this run would take…
-    await confirmSoleDaemon(circuitId(BOUND, BOUND ? MACHINE : TOKEN)); // …so we can name it
+    await confirmSoleDaemon(circuitId(BOUND, BOUND ? MACHINE : TOKEN), {
+      // An explicit terminal/script `up` must opt in to replacement with
+      // --force. Direct App/systemd launches keep their historical restart
+      // behaviour, including old callers mapped to `up` by the compatibility
+      // branch above.
+      requireForce: !SUPERVISED_LAUNCH,
+    }); // …so we can name it
   }
   // We're going ahead: put this daemon on the record, and take it off again on
   // the way out. `exit` covers every path out of here — the signal handlers
